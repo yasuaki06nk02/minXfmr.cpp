@@ -22,6 +22,7 @@ static std::vector<std::string> g_vocab;
 static std::unordered_map<std::string,int> g_vid;
 static std::vector<float> g_vocab_scores;
 static std::vector<int>   g_vocab_types;
+static size_t g_max_token_len = 0;
 static const std::string kSpmMarker("\xE2\x96\x81");
 
 static std::string normalize_text_for_tokenizer(const std::string& s_in) {
@@ -102,7 +103,11 @@ static std::string normalize_text_for_tokenizer(const std::string& s_in) {
 bool tokenizer_load_from_list(const std::vector<std::string>& vocab) {
     g_vocab = vocab;
     g_vid.clear();
-    for (size_t i=0;i<g_vocab.size();++i) g_vid[g_vocab[i]] = (int)i;
+    g_max_token_len = 0;
+    for (size_t i=0;i<g_vocab.size();++i) {
+        g_vid[g_vocab[i]] = (int)i;
+        if (g_vocab[i].size() > g_max_token_len) g_max_token_len = g_vocab[i].size();
+    }
     return true;
 }
 
@@ -110,7 +115,11 @@ bool tokenizer_load_from_gguf(const GGUF_File& gf) {
     if (gf.vocab_tokens.empty()) return false;
     g_vocab = gf.vocab_tokens;
     g_vid.clear();
-    for (size_t i = 0; i < g_vocab.size(); ++i) g_vid[g_vocab[i]] = (int)i;
+    g_max_token_len = 0;
+    for (size_t i = 0; i < g_vocab.size(); ++i) {
+        g_vid[g_vocab[i]] = (int)i;
+        if (g_vocab[i].size() > g_max_token_len) g_max_token_len = g_vocab[i].size();
+    }
 
     // load optional scores
     g_vocab_scores.clear();
@@ -142,6 +151,7 @@ void tokenizer_add_special_tokens(const std::vector<std::string>& toks) {
         if (g_vid.find(t) != g_vid.end()) continue;
         g_vocab.push_back(t);
         g_vid[t] = (int)g_vocab.size() - 1;
+        if (t.size() > g_max_token_len) g_max_token_len = t.size();
     }
 }
 
@@ -162,19 +172,20 @@ std::vector<int> tokenizer_encode(const std::string& text) {
     const std::string norm_text = normalize_text_for_tokenizer(text);
 
     auto match_exact_prefix = [&](const std::string& src, size_t pos, size_t& matched_len) -> int {
-        int best_id = -1;
         matched_len = 0;
-        for (size_t i = 0; i < g_vocab.size(); ++i) {
-            const std::string& tok = g_vocab[i];
-            if (tok.empty()) continue;
-            if (pos + tok.size() <= src.size() && src.compare(pos, tok.size(), tok) == 0) {
-                if (tok.size() > matched_len) {
-                    best_id = (int)i;
-                    matched_len = tok.size();
-                }
+        if (g_vid.empty() || pos >= src.size() || g_max_token_len == 0) return -1;
+        size_t remaining = src.size() - pos;
+        size_t max_len = g_max_token_len < remaining ? g_max_token_len : remaining;
+        // scan from longest to shortest for longest-match first
+        for (size_t len = max_len; len > 0; --len) {
+            std::string sub = src.substr(pos, len);
+            auto it = g_vid.find(sub);
+            if (it != g_vid.end()) {
+                matched_len = len;
+                return it->second;
             }
         }
-        return best_id;
+        return -1;
     };
 
     auto push_unknown_or_byte = [&](unsigned char b) {
