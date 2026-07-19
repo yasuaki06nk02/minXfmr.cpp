@@ -27,6 +27,8 @@ struct Tensor {
 
 // allocate a float matrix (rows x cols)
 Tensor* tensor_create_f32(size_t rows, size_t cols);
+// Create a tensor view into externally managed float buffer (does not take ownership of buffer).
+Tensor* tensor_create_f32_view(size_t rows, size_t cols, float* buffer);
 void tensor_free(Tensor* t);
 float tensor_get_f32(const Tensor* t, size_t r, size_t c);
 void tensor_set_f32(Tensor* t, size_t r, size_t c, float v);

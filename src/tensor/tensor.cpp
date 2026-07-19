@@ -34,6 +34,19 @@ Tensor* tensor_create_f32(size_t rows, size_t cols) {
     return &impl->t;
 }
 
+Tensor* tensor_create_f32_view(size_t rows, size_t cols, float* buffer) {
+    if (rows == 0 || cols == 0 || buffer == nullptr) return nullptr;
+    TensorImpl* impl = new (std::nothrow) TensorImpl();
+    if (!impl) return nullptr;
+    impl->storage = nullptr; // we don't own the external buffer
+    impl->t.data = buffer;
+    impl->t.type = DataType::F32;
+    impl->t.rows = rows;
+    impl->t.cols = cols;
+    impl->t.bytes = rows * cols * sizeof(float);
+    return &impl->t;
+}
+
 void tensor_free(Tensor* t) {
     if (!t) return;
     TensorImpl* impl = (TensorImpl*)((char*)t - offsetof(TensorImpl, t));

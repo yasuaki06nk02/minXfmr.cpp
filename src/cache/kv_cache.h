@@ -6,8 +6,11 @@ struct KVCache {
     size_t layers;
     size_t seq_max;
     size_t dim;
-    std::vector<Tensor*> keys; // per-layer [seq_max x dim]
-    std::vector<Tensor*> vals; // per-layer [seq_max x dim]
+    std::vector<Tensor*> keys; // per-layer [seq_max x dim] (views into keys_buf)
+    std::vector<Tensor*> vals; // per-layer [seq_max x dim] (views into vals_buf)
+    // contiguous backing storage to avoid reallocations at append time
+    std::vector<float> keys_buf; // size = layers * seq_max * dim
+    std::vector<float> vals_buf; // size = layers * seq_max * dim
     std::vector<size_t> lengths; // current length per layer
 };
 

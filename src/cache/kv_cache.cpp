@@ -1,6 +1,7 @@
 #include "kv_cache.h"
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 KVCache* kvcache_create(size_t layers, size_t seq_max, size_t dim) {
     KVCache* c = new (std::nothrow) KVCache();
@@ -9,9 +10,23 @@ KVCache* kvcache_create(size_t layers, size_t seq_max, size_t dim) {
     c->keys.assign(layers, nullptr);
     c->vals.assign(layers, nullptr);
     c->lengths.assign(layers, 0);
-    for (size_t i=0;i<layers;++i) {
-        c->keys[i] = tensor_create_f32(seq_max, dim);
-        c->vals[i] = tensor_create_f32(seq_max, dim);
+
+    // allocate contiguous backing buffers to avoid repeated reallocations during append
+    size_t per_layer = seq_max * dim;
+    c->keys_buf.clear(); c->vals_buf.clear();
+    try {
+        c->keys_buf.resize(layers * per_layer);
+        c->vals_buf.resize(layers * per_layer);
+    } catch (...) {
+        kvcache_free(c); return nullptr;
+    }
+
+    // create tensor views pointing into the contiguous buffers
+    for (size_t i = 0; i < layers; ++i) {
+        float* kb = c->keys_buf.data() + i * per_layer;
+        float* vb = c->vals_buf.data() + i * per_layer;
+        c->keys[i] = tensor_create_f32_view(seq_max, dim, kb);
+        c->vals[i] = tensor_create_f32_view(seq_max, dim, vb);
         if (!c->keys[i] || !c->vals[i]) {
             kvcache_free(c); return nullptr;
         }
@@ -26,6 +41,8 @@ void kvcache_free(KVCache* c) {
         if (c->keys[i]) tensor_free(c->keys[i]);
         if (c->vals[i]) tensor_free(c->vals[i]);
     }
+    c->keys.clear(); c->vals.clear();
+    c->keys_buf.clear(); c->vals_buf.clear();
     delete c;
 }
 
