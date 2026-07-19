@@ -181,7 +181,7 @@ Sample `--try-all-templates` log fragment (from `--log-file chat_debug_try_all_t
 
 Controls whether square projection matrices are treated as transposed. The per-weight flags can be combined to search for the best orientation.
 
-Recommended defaults: the CLI now defaults to no-transpose for `wq`, `wk`, `wv`, and `wo` (mask=0), verified at 64 tokens on 2026-07-19. Use the `--transpose-*` / `--no-transpose-*` flags to override per-weight behavior.
+Recommended defaults: for GGUF models, transpose behavior is selected automatically from `general.architecture` metadata (llama/mistral/mixtral/qwen2/qwen2moe/gemma => square transpose on, gptneox/gpt2/falcon/bloom/mpt/phi* => off). At load time, attention and FFN linear weights are physically normalized to canonical orientation, so runtime transpose branching is minimized. Use `--transpose-*` / `--no-transpose-*` to explicitly override square-weight policy.
 
 Quick automated search
 

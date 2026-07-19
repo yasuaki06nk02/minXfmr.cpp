@@ -30,6 +30,7 @@ Tensor* tensor_create_f32(size_t rows, size_t cols) {
     impl->t.type = DataType::F32;
     impl->t.rows = rows;
     impl->t.cols = cols;
+    impl->t.bytes = bytes;
     return &impl->t;
 }
 

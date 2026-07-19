@@ -61,6 +61,7 @@ int main(int argc, char** argv) {
     bool transpose_wk = false;
     bool transpose_wv = false;
     bool transpose_wo = false;
+    bool transpose_user_override = false;
     bool try_all_templates = false;
     bool emit_vocab = false;
     if (argc > 1) model = argv[1];
@@ -108,26 +109,30 @@ int main(int argc, char** argv) {
             if (strcmp(argv[i], "--transpose-square")==0) {
                 transpose_square = true;
                 transpose_wq = transpose_wk = transpose_wv = transpose_wo = true;
+                transpose_user_override = true;
             }
             if (strcmp(argv[i], "--no-transpose-square")==0) {
                 transpose_square = false;
                 transpose_wq = transpose_wk = transpose_wv = transpose_wo = false;
+                transpose_user_override = true;
             }
-            if (strcmp(argv[i], "--transpose-wq")==0) transpose_wq = true;
-            if (strcmp(argv[i], "--no-transpose-wq")==0) transpose_wq = false;
-            if (strcmp(argv[i], "--transpose-wk")==0) transpose_wk = true;
-            if (strcmp(argv[i], "--no-transpose-wk")==0) transpose_wk = false;
-            if (strcmp(argv[i], "--transpose-wv")==0) transpose_wv = true;
-            if (strcmp(argv[i], "--no-transpose-wv")==0) transpose_wv = false;
-            if (strcmp(argv[i], "--transpose-wo")==0) transpose_wo = true;
-            if (strcmp(argv[i], "--no-transpose-wo")==0) transpose_wo = false;
+            if (strcmp(argv[i], "--transpose-wq")==0) { transpose_wq = true; transpose_user_override = true; }
+            if (strcmp(argv[i], "--no-transpose-wq")==0) { transpose_wq = false; transpose_user_override = true; }
+            if (strcmp(argv[i], "--transpose-wk")==0) { transpose_wk = true; transpose_user_override = true; }
+            if (strcmp(argv[i], "--no-transpose-wk")==0) { transpose_wk = false; transpose_user_override = true; }
+            if (strcmp(argv[i], "--transpose-wv")==0) { transpose_wv = true; transpose_user_override = true; }
+            if (strcmp(argv[i], "--no-transpose-wv")==0) { transpose_wv = false; transpose_user_override = true; }
+            if (strcmp(argv[i], "--transpose-wo")==0) { transpose_wo = true; transpose_user_override = true; }
+            if (strcmp(argv[i], "--no-transpose-wo")==0) { transpose_wo = false; transpose_user_override = true; }
             if (strcmp(argv[i], "--transpose-all")==0) {
                 transpose_square = true;
                 transpose_wq = transpose_wk = transpose_wv = transpose_wo = true;
+                transpose_user_override = true;
             }
             if (strcmp(argv[i], "--no-transpose-all")==0) {
                 transpose_square = false;
                 transpose_wq = transpose_wk = transpose_wv = transpose_wo = false;
+                transpose_user_override = true;
             }
             if (strcmp(argv[i], "--try-all-templates")==0) {
                 try_all_templates = true;
@@ -147,7 +152,9 @@ int main(int argc, char** argv) {
     // Ensure tokenizer has a baseline vocab even when selftest is off.
     tokenizer_load_from_list({"Hello","world","I","am","fine","today","how","are","you","?",".","<unk>"});
 
-    transformer_set_transpose_square_weights_for_all(transpose_wq, transpose_wk, transpose_wv, transpose_wo);
+    if (transpose_user_override) {
+        transformer_set_transpose_square_weights_for_all(transpose_wq, transpose_wk, transpose_wv, transpose_wo);
+    }
     if (max_gen_tokens < 1) max_gen_tokens = 1;
     if (max_gen_tokens > 256) max_gen_tokens = 256;
 #ifdef _WIN32
@@ -155,19 +162,41 @@ int main(int argc, char** argv) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%d", max_gen_tokens);
         _putenv_s("MINXFMR_MAX_GEN_TOKENS", buf);
+        _putenv_s("MINXFMR_TRANSPOSE_USER_OVERRIDE", transpose_user_override ? "1" : "");
+        _putenv_s("MINXFMR_TRANSPOSE_WQ", transpose_user_override ? (transpose_wq ? "1" : "0") : "");
+        _putenv_s("MINXFMR_TRANSPOSE_WK", transpose_user_override ? (transpose_wk ? "1" : "0") : "");
+        _putenv_s("MINXFMR_TRANSPOSE_WV", transpose_user_override ? (transpose_wv ? "1" : "0") : "");
+        _putenv_s("MINXFMR_TRANSPOSE_WO", transpose_user_override ? (transpose_wo ? "1" : "0") : "");
     }
 #else
     {
         char buf[16];
         snprintf(buf, sizeof(buf), "%d", max_gen_tokens);
         setenv("MINXFMR_MAX_GEN_TOKENS", buf, 1);
+        if (transpose_user_override) {
+            setenv("MINXFMR_TRANSPOSE_USER_OVERRIDE", "1", 1);
+            setenv("MINXFMR_TRANSPOSE_WQ", transpose_wq ? "1" : "0", 1);
+            setenv("MINXFMR_TRANSPOSE_WK", transpose_wk ? "1" : "0", 1);
+            setenv("MINXFMR_TRANSPOSE_WV", transpose_wv ? "1" : "0", 1);
+            setenv("MINXFMR_TRANSPOSE_WO", transpose_wo ? "1" : "0", 1);
+        } else {
+            unsetenv("MINXFMR_TRANSPOSE_USER_OVERRIDE");
+            unsetenv("MINXFMR_TRANSPOSE_WQ");
+            unsetenv("MINXFMR_TRANSPOSE_WK");
+            unsetenv("MINXFMR_TRANSPOSE_WV");
+            unsetenv("MINXFMR_TRANSPOSE_WO");
+        }
     }
 #endif
-    fprintf(stderr, "[main] square-weight transpose mode: wq=%s wk=%s wv=%s wo=%s\n",
-        transpose_wq ? "on" : "off",
-        transpose_wk ? "on" : "off",
-        transpose_wv ? "on" : "off",
-        transpose_wo ? "on" : "off");
+    if (transpose_user_override) {
+        fprintf(stderr, "[main] square-weight transpose mode (user): wq=%s wk=%s wv=%s wo=%s\n",
+            transpose_wq ? "on" : "off",
+            transpose_wk ? "on" : "off",
+            transpose_wv ? "on" : "off",
+            transpose_wo ? "on" : "off");
+    } else {
+        fprintf(stderr, "[main] square-weight transpose mode: auto (by model architecture)\n");
+    }
 
     minxfmr_context* ctx = minxfmr_open_with_layer(model, projection_layer);
     if (!ctx) return 1;

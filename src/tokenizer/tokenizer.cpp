@@ -1,4 +1,5 @@
 #include "tokenizer/tokenizer.h"
+#include "../../third_party/gguf/gguf_reader.h"
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -19,6 +20,8 @@
 
 static std::vector<std::string> g_vocab;
 static std::unordered_map<std::string,int> g_vid;
+static std::vector<float> g_vocab_scores;
+static std::vector<int>   g_vocab_types;
 static const std::string kSpmMarker("\xE2\x96\x81");
 
 static std::string normalize_text_for_tokenizer(const std::string& s_in) {
@@ -100,6 +103,35 @@ bool tokenizer_load_from_list(const std::vector<std::string>& vocab) {
     g_vocab = vocab;
     g_vid.clear();
     for (size_t i=0;i<g_vocab.size();++i) g_vid[g_vocab[i]] = (int)i;
+    return true;
+}
+
+bool tokenizer_load_from_gguf(const GGUF_File& gf) {
+    if (gf.vocab_tokens.empty()) return false;
+    g_vocab = gf.vocab_tokens;
+    g_vid.clear();
+    for (size_t i = 0; i < g_vocab.size(); ++i) g_vid[g_vocab[i]] = (int)i;
+
+    // load optional scores
+    g_vocab_scores.clear();
+    if (!gf.vocab_scores.empty()) {
+        g_vocab_scores = gf.vocab_scores;
+        if (g_vocab_scores.size() < g_vocab.size()) g_vocab_scores.resize(g_vocab.size(), 0.0f);
+        else if (g_vocab_scores.size() > g_vocab.size()) g_vocab_scores.resize(g_vocab.size());
+    } else {
+        g_vocab_scores.assign(g_vocab.size(), 0.0f);
+    }
+
+    // load optional token types
+    g_vocab_types.clear();
+    if (!gf.vocab_types.empty()) {
+        g_vocab_types = gf.vocab_types;
+        if (g_vocab_types.size() < g_vocab.size()) g_vocab_types.resize(g_vocab.size(), 0);
+        else if (g_vocab_types.size() > g_vocab.size()) g_vocab_types.resize(g_vocab.size());
+    } else {
+        g_vocab_types.assign(g_vocab.size(), 0);
+    }
+
     return true;
 }
 

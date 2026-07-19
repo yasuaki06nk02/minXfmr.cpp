@@ -142,6 +142,7 @@ bool gguf_open(const char* path, GGUF_File& out) {
     out.n_embd = 0;
     out.n_head = 0;
     out.n_head_kv = 0;
+    out.architecture.clear();
 
     size_t p = 0;
     if (out.data.size() < 24) return false;
@@ -193,7 +194,7 @@ bool gguf_open(const char* path, GGUF_File& out) {
         if (!rd_u32(out.data, p, t)) return false;
         size_t before = p;
 
-        // Special-case tokenizer vocabulary array.
+        // Special-case tokenizer vocabulary array and related metadata.
         if (t == 9) {
             uint32_t elem_t = 0;
             uint64_t n = 0;
@@ -206,6 +207,72 @@ bool gguf_open(const char* path, GGUF_File& out) {
                     std::string tok;
                     if (!rd_str(out.data, p, tok)) return false;
                     out.vocab_tokens.push_back(tok);
+                }
+            } else if (key == "tokenizer.ggml.scores" && (elem_t == 6 || elem_t == 12)) {
+                out.vocab_scores.clear();
+                out.vocab_scores.reserve((size_t)n);
+                for (uint64_t k = 0; k < n; ++k) {
+                    if (elem_t == 6) {
+                        if (p + 4 > out.data.size()) return false;
+                        float v;
+                        memcpy(&v, out.data.data() + p, 4);
+                        p += 4;
+                        out.vocab_scores.push_back(v);
+                    } else {
+                        if (p + 8 > out.data.size()) return false;
+                        double dv;
+                        memcpy(&dv, out.data.data() + p, 8);
+                        p += 8;
+                        out.vocab_scores.push_back((float)dv);
+                    }
+                }
+            } else if (key == "tokenizer.ggml.token_type" && (elem_t == 0 || elem_t == 1 || elem_t == 2 || elem_t == 3 || elem_t == 4 || elem_t == 5 || elem_t == 10 || elem_t == 11)) {
+                out.vocab_types.clear();
+                out.vocab_types.reserve((size_t)n);
+                for (uint64_t k = 0; k < n; ++k) {
+                    if (elem_t == 0) {
+                        if (p + 1 > out.data.size()) return false;
+                        uint8_t v = out.data[p];
+                        p += 1;
+                        out.vocab_types.push_back((int)v);
+                    } else if (elem_t == 1) {
+                        if (p + 1 > out.data.size()) return false;
+                        int8_t sv = (int8_t)out.data[p];
+                        p += 1;
+                        out.vocab_types.push_back((int)sv);
+                    } else if (elem_t == 2) {
+                        if (p + 2 > out.data.size()) return false;
+                        uint16_t v = (uint16_t)out.data[p] | ((uint16_t)out.data[p+1] << 8);
+                        p += 2;
+                        out.vocab_types.push_back((int)v);
+                    } else if (elem_t == 3) {
+                        if (p + 2 > out.data.size()) return false;
+                        int16_t sv = (int16_t)((uint16_t)out.data[p] | ((uint16_t)out.data[p+1] << 8));
+                        p += 2;
+                        out.vocab_types.push_back((int)sv);
+                    } else if (elem_t == 4) {
+                        if (p + 4 > out.data.size()) return false;
+                        uint32_t v = (uint32_t)out.data[p] | ((uint32_t)out.data[p+1] << 8) | ((uint32_t)out.data[p+2] << 16) | ((uint32_t)out.data[p+3] << 24);
+                        p += 4;
+                        out.vocab_types.push_back((int)v);
+                    } else if (elem_t == 5) {
+                        if (p + 4 > out.data.size()) return false;
+                        int32_t sv = (int32_t)((uint32_t)out.data[p] | ((uint32_t)out.data[p+1] << 8) | ((uint32_t)out.data[p+2] << 16) | ((uint32_t)out.data[p+3] << 24));
+                        p += 4;
+                        out.vocab_types.push_back((int)sv);
+                    } else if (elem_t == 10) {
+                        if (p + 8 > out.data.size()) return false;
+                        uint64_t v = 0;
+                        for (int b = 0; b < 8; ++b) v |= ((uint64_t)out.data[p+b]) << (8*b);
+                        p += 8;
+                        out.vocab_types.push_back((int)v);
+                    } else if (elem_t == 11) {
+                        if (p + 8 > out.data.size()) return false;
+                        int64_t sv = 0;
+                        for (int b = 0; b < 8; ++b) sv |= ((int64_t)out.data[p+b]) << (8*b);
+                        p += 8;
+                        out.vocab_types.push_back((int)sv);
+                    }
                 }
             } else if ((key == "special_tokens" || key == "tokenizer.special_tokens") && elem_t == 8) {
                 out.special_tokens.clear();
@@ -226,11 +293,22 @@ bool gguf_open(const char* path, GGUF_File& out) {
 
         uint64_t mv = 0;
         if (read_meta_u64(t, before, mv)) {
-            if (key == "llama.block_count") out.n_layer = mv;
-            else if (key == "llama.context_length") out.n_ctx = mv;
-            else if (key == "llama.embedding_length") out.n_embd = mv;
-            else if (key == "llama.attention.head_count") out.n_head = mv;
-            else if (key == "llama.attention.head_count_kv") out.n_head_kv = mv;
+            // support multiple common metadata key names for portability
+            if (key == "llama.block_count" || key == "num_layers" || key == "model.num_layers") {
+                out.n_layer = mv;
+            } else if (key == "llama.context_length" || key == "context_length") {
+                out.n_ctx = mv;
+            } else if (key == "llama.embedding_length" || key == "hidden_size") {
+                out.n_embd = mv;
+            } else if (key == "llama.attention.head_count" || key == "num_heads") {
+                out.n_head = mv;
+            } else if (key == "llama.attention.head_count_kv" || key == "num_heads_kv") {
+                out.n_head_kv = mv;
+            } else if (key == "llama.feed_forward_length" || key == "intermediate_size" || key == "feed_forward_length" || key == "ffn_size") {
+                out.n_intermediate = mv;
+            } else if (key == "vocab_size" || key == "tokenizer.vocab_size") {
+                out.vocab_size = mv;
+            }
         }
 
         if (key == "general.alignment") {
@@ -251,6 +329,13 @@ bool gguf_open(const char* path, GGUF_File& out) {
             std::string tmp;
             if (rd_str(out.data, tmp_p, tmp)) {
                 out.chat_template = tmp;
+            }
+        }
+        if ((key == "general.architecture" || key == "architecture" || key == "model.architecture") && t == 8) {
+            size_t tmp_p = before;
+            std::string tmp;
+            if (rd_str(out.data, tmp_p, tmp)) {
+                out.architecture = tmp;
             }
         }
     }
@@ -312,24 +397,45 @@ bool gguf_open(const char* path, GGUF_File& out) {
         if (ti.offset < out.data.size()) out.tensors.push_back(ti);
     }
 
+    // if vocab array was present, prefer its length as vocab_size
+    if (out.vocab_size == 0 && !out.vocab_tokens.empty()) {
+        out.vocab_size = out.vocab_tokens.size();
+    }
+
     return true;
 }
 
 void gguf_close(GGUF_File& f) {
     f.data.clear(); f.tensors.clear(); f.path.clear();
     f.n_layer = f.n_ctx = f.n_embd = f.n_head = f.n_head_kv = 0;
+    f.architecture.clear();
+    f.n_intermediate = 0;
+    f.vocab_size = 0;
     f.vocab_tokens.clear();
+    f.vocab_scores.clear();
+    f.vocab_types.clear();
+    f.chat_template.clear();
+    f.special_tokens.clear();
 }
 
 bool gguf_read_model_config(const char* path, GGUF_ModelConfig& out) {
     out = GGUF_ModelConfig{};
     GGUF_File f;
     if (!gguf_open(path, f)) return false;
+    // canonical fields
     out.n_layer = f.n_layer;
     out.n_ctx = f.n_ctx;
     out.n_embd = f.n_embd;
     out.n_head = f.n_head;
     out.n_head_kv = f.n_head_kv;
+
+    // populate synonym fields for downstream tooling
+    out.context_length = f.n_ctx;
+    out.hidden_size = f.n_embd;
+    out.num_layers = f.n_layer;
+    out.intermediate_size = f.n_intermediate;
+    out.num_heads = f.n_head;
+    out.vocab_size = f.vocab_size;
     gguf_close(f);
     return true;
 }
@@ -341,6 +447,15 @@ bool gguf_read_vocab(const char* path, std::vector<std::string>& out_tokens) {
     out_tokens = f.vocab_tokens;
     gguf_close(f);
     return !out_tokens.empty();
+}
+
+bool gguf_read_architecture(const char* path, std::string& out_architecture) {
+    out_architecture.clear();
+    GGUF_File f;
+    if (!gguf_open(path, f)) return false;
+    out_architecture = f.architecture;
+    gguf_close(f);
+    return !out_architecture.empty();
 }
 
 bool gguf_find_tensor(const GGUF_File& f, const char* name, GGUF_TensorInfo& out) {
@@ -553,6 +668,18 @@ bool gguf_dequant_q6_k(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*&
     }
 
     return true;
+}
+
+bool gguf_read_tensor(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out) {
+    out = nullptr;
+    // Try direct f32/f16 read
+    if (gguf_read_f32_tensor(f, info, out)) return true;
+    // Try known dequant paths
+    if (gguf_dequant_q4_k_m(f, info, out)) return true;
+    if (gguf_dequant_q6_k(f, info, out)) return true;
+    // Unsupported type
+    out = nullptr;
+    return false;
 }
 
 void gguf_tensor_stats(const Tensor* t, float& minv, float& maxv, double& mean) {

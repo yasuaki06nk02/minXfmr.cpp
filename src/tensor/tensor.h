@@ -10,6 +10,7 @@ struct Tensor {
     DataType type;
     size_t rows;
     size_t cols;
+    size_t bytes;
     size_t elem_count() const { return rows * cols; }
 };
 

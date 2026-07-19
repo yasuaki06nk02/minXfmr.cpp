@@ -19,6 +19,7 @@ bool gguf_try_load_attn_out_for_layer(const char* path, int layer, Tensor*& outW
 bool gguf_try_load_norms_for_layer(const char* path, int layer, Tensor*& outAttnNorm, Tensor*& outFfnNorm);
 bool gguf_try_load_ffn_for_layer(const char* path, int layer, Tensor*& outWgate, Tensor*& outWup, Tensor*& outWdown);
 bool gguf_try_read_model_config(const char* path, GGUFLoaderModelConfig& out);
+bool gguf_try_read_architecture(const char* path, std::string& out_architecture);
 bool gguf_try_load_token_embedding(const char* path, Tensor*& outWemb);
 bool gguf_try_load_final_norm(const char* path, Tensor*& outWnorm);
 bool gguf_try_load_lm_head(const char* path, Tensor*& outWout);

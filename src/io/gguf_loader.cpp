@@ -61,30 +61,12 @@ bool gguf_try_load_projections_for_layer(const char* path, int layer, Tensor*& o
         GGUF_TensorInfo info;
         if (!gguf_find_tensor_any(gf, cands.data(), cands.size(), info)) return;
         Tensor* t = nullptr;
-        if (gguf_read_f32_tensor(gf, info, t)) {
+        if (gguf_read_tensor(gf, info, t)) {
             if (strcmp(tag, "Wq")==0) { gguf_last_name_Wq = info.name; gguf_last_rows_Wq = info.rows; gguf_last_cols_Wq = info.cols; }
             if (strcmp(tag, "Wk")==0) { gguf_last_name_Wk = info.name; gguf_last_rows_Wk = info.rows; gguf_last_cols_Wk = info.cols; }
             if (strcmp(tag, "Wv")==0) { gguf_last_name_Wv = info.name; gguf_last_rows_Wv = info.rows; gguf_last_cols_Wv = info.cols; }
             float minv,maxv; double mean; gguf_tensor_stats(t,minv,maxv,mean);
             fprintf(stderr, "[gguf] loaded %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n", tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
-            out = t;
-            return;
-        }
-        if (gguf_dequant_q4_k_m(gf, info, t)) {
-            if (strcmp(tag, "Wq")==0) { gguf_last_name_Wq = info.name; gguf_last_rows_Wq = info.rows; gguf_last_cols_Wq = info.cols; }
-            if (strcmp(tag, "Wk")==0) { gguf_last_name_Wk = info.name; gguf_last_rows_Wk = info.rows; gguf_last_cols_Wk = info.cols; }
-            if (strcmp(tag, "Wv")==0) { gguf_last_name_Wv = info.name; gguf_last_rows_Wv = info.rows; gguf_last_cols_Wv = info.cols; }
-            float minv,maxv; double mean; gguf_tensor_stats(t,minv,maxv,mean);
-            fprintf(stderr, "[gguf] dequantized %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n", tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
-            out = t;
-            return;
-        }
-        if (gguf_dequant_q6_k(gf, info, t)) {
-            if (strcmp(tag, "Wq")==0) { gguf_last_name_Wq = info.name; gguf_last_rows_Wq = info.rows; gguf_last_cols_Wq = info.cols; }
-            if (strcmp(tag, "Wk")==0) { gguf_last_name_Wk = info.name; gguf_last_rows_Wk = info.rows; gguf_last_cols_Wk = info.cols; }
-            if (strcmp(tag, "Wv")==0) { gguf_last_name_Wv = info.name; gguf_last_rows_Wv = info.rows; gguf_last_cols_Wv = info.cols; }
-            float minv,maxv; double mean; gguf_tensor_stats(t,minv,maxv,mean);
-            fprintf(stderr, "[gguf] dequantized %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n", tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
             out = t;
             return;
         }
@@ -153,17 +135,16 @@ bool gguf_try_load_attn_out_for_layer(const char* path, int layer, Tensor*& outW
     }
 
     Tensor* t = nullptr;
-    bool ok = gguf_read_f32_tensor(gf, info, t) || gguf_dequant_q4_k_m(gf, info, t) || gguf_dequant_q6_k(gf, info, t);
-    if (ok) {
+    if (gguf_read_tensor(gf, info, t)) {
         float minv, maxv;
         double mean;
-        gguf_tensor_stats(t, minv, maxv, mean);
+        gguf_tensor_stats(t, minv, maxv,mean);
         fprintf(stderr, "[gguf] loaded Wo from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
             info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
         outWo = t;
     }
     gguf_close(gf);
-    return ok;
+    return (outWo != nullptr);
 }
 
 bool gguf_try_load_norms_for_layer(const char* path, int layer, Tensor*& outAttnNorm, Tensor*& outFfnNorm) {
@@ -180,7 +161,7 @@ bool gguf_try_load_norms_for_layer(const char* path, int layer, Tensor*& outAttn
         if (!gguf_find_tensor_any(gf, cands.data(), cands.size(), info)) return;
 
         Tensor* t = nullptr;
-        if (gguf_read_f32_tensor(gf, info, t) || gguf_dequant_q4_k_m(gf, info, t) || gguf_dequant_q6_k(gf, info, t)) {
+        if (gguf_read_tensor(gf, info, t)) {
             float minv, maxv;
             double mean;
             gguf_tensor_stats(t, minv, maxv, mean);
@@ -227,7 +208,7 @@ bool gguf_try_load_ffn_for_layer(const char* path, int layer, Tensor*& outWgate,
         if (!gguf_find_tensor_any(gf, cands.data(), cands.size(), info)) return;
 
         Tensor* t = nullptr;
-        if (gguf_read_f32_tensor(gf, info, t) || gguf_dequant_q4_k_m(gf, info, t) || gguf_dequant_q6_k(gf, info, t)) {
+        if (gguf_read_tensor(gf, info, t)) {
             float minv, maxv;
             double mean;
             gguf_tensor_stats(t, minv, maxv, mean);
@@ -291,6 +272,11 @@ bool gguf_try_read_model_config(const char* path, GGUFLoaderModelConfig& out) {
     return true;
 }
 
+bool gguf_try_read_architecture(const char* path, std::string& out_architecture) {
+    out_architecture.clear();
+    return gguf_read_architecture(path, out_architecture);
+}
+
 bool gguf_try_load_token_embedding(const char* path, Tensor*& outWemb) {
     outWemb = nullptr;
     GGUF_File gf;
@@ -311,8 +297,7 @@ bool gguf_try_load_token_embedding(const char* path, Tensor*& outWemb) {
     }
 
     Tensor* t = nullptr;
-    bool ok = gguf_read_f32_tensor(gf, info, t) || gguf_dequant_q4_k_m(gf, info, t) || gguf_dequant_q6_k(gf, info, t);
-    if (ok) {
+    if (gguf_read_tensor(gf, info, t)) {
         float minv, maxv;
         double mean;
         gguf_tensor_stats(t, minv, maxv, mean);
@@ -321,7 +306,7 @@ bool gguf_try_load_token_embedding(const char* path, Tensor*& outWemb) {
         outWemb = t;
     }
     gguf_close(gf);
-    return ok;
+    return (outWemb != nullptr);
 }
 
 bool gguf_try_read_vocab(const char* path, std::vector<std::string>& out_tokens) {
@@ -366,8 +351,7 @@ bool gguf_try_load_final_norm(const char* path, Tensor*& outWnorm) {
     }
 
     Tensor* t = nullptr;
-    bool ok = gguf_read_f32_tensor(gf, info, t) || gguf_dequant_q4_k_m(gf, info, t) || gguf_dequant_q6_k(gf, info, t);
-    if (ok) {
+    if (gguf_read_tensor(gf, info, t)) {
         float minv, maxv;
         double mean;
         gguf_tensor_stats(t, minv, maxv, mean);
@@ -376,7 +360,7 @@ bool gguf_try_load_final_norm(const char* path, Tensor*& outWnorm) {
         outWnorm = t;
     }
     gguf_close(gf);
-    return ok;
+    return (outWnorm != nullptr);
 }
 
 bool gguf_try_load_lm_head(const char* path, Tensor*& outWout) {
@@ -398,8 +382,7 @@ bool gguf_try_load_lm_head(const char* path, Tensor*& outWout) {
     }
 
     Tensor* t = nullptr;
-    bool ok = gguf_read_f32_tensor(gf, info, t) || gguf_dequant_q4_k_m(gf, info, t) || gguf_dequant_q6_k(gf, info, t);
-    if (ok) {
+    if (gguf_read_tensor(gf, info, t)) {
         float minv, maxv;
         double mean;
         gguf_tensor_stats(t, minv, maxv, mean);
@@ -408,7 +391,7 @@ bool gguf_try_load_lm_head(const char* path, Tensor*& outWout) {
         outWout = t;
     }
     gguf_close(gf);
-    return ok;
+    return (outWout != nullptr);
 }
 
 const char* gguf_last_tensor_name(const char* tag) {

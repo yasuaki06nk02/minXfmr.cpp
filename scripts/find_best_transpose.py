@@ -76,6 +76,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow running more than 4 masks in one command.",
     )
+    parser.add_argument(
+        "--test-all-masks",
+        action="store_true",
+        help="Run all masks 0..15 (overrides safety clamp).",
+    )
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--chat-mode",
@@ -269,10 +274,14 @@ def main() -> int:
         return 2
 
     safe_max = args.max_masks
-    if safe_max > 4 and not args.allow_high_load:
-        logging.warning("[safety] max-masks > 4 requires --allow-high-load. Clamping to 4.")
-        safe_max = 4
-    safe_max = min(safe_max, 16 - args.start_mask)
+    if args.test_all_masks:
+        logging.info("[override] --test-all-masks set: running all masks 0..15 starting at %d", args.start_mask)
+        safe_max = 16 - args.start_mask
+    else:
+        if safe_max > 4 and not args.allow_high_load:
+            logging.warning("[safety] max-masks > 4 requires --allow-high-load. Clamping to 4.")
+            safe_max = 4
+        safe_max = min(safe_max, 16 - args.start_mask)
 
     env = os.environ.copy()
     if args.cpu_threads > 0:
@@ -331,34 +340,8 @@ def main() -> int:
         if idx > 0 and args.cooldown_sec > 0:
             time.sleep(args.cooldown_sec)
 
-        # build base command
-        base_cmd = [
-            str(cli),
-            str(model),
-            "--temp",
-            "0",
-            "--top_k",
-            "1",
-            "--max-gen-tokens",
-            str(args.max_gen_tokens),
-        ]
-        if args.chat_mode:
-            base_cmd.append("--chat")
-        else:
-            base_cmd.extend(["--prompt", args.prompt])
-        for i, name in enumerate(flags):
-            if (mask >> i) & 1:
-                base_cmd.append(f"--transpose-{name}")
-            else:
-                base_cmd.append(f"--no-transpose-{name}")
-
-        run_attempts = []
-        for attempt in range(1, args.retries + 1):
-            stamp = int(time.time() * 1000)
-            logfile = logdir / f"result_{mask}_{stamp}_try{attempt}.log"
-            cmd = list(base_cmd)
-            logging.info("Running mask=%d attempt=%d -> %s", mask, attempt, shlex.join(cmd))
-
+        
+            
             if args.dry_run:
                 logging.info("dry-run: would write %s", logfile)
                 run_attempts.append({"attempt": attempt, "dry_run": True})

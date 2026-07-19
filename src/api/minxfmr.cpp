@@ -11,8 +11,10 @@
 #include "../transformer/rmsnorm.h"
 #include "../transformer/transformer.h"
 #include "../io/gguf_loader.h"
+#include "../../third_party/gguf/gguf_reader.h"
 #include <sstream>
 #include <iomanip>
+#include <cctype>
 
 struct minxfmr_context {
     KVCache* cache;
@@ -102,6 +104,70 @@ static Tensor* token_embedding_row(const minxfmr_context* ctx, int token_id) {
     for (size_t r = 0; r < emb->rows; ++r) dst[r] = src[r * emb->cols + (size_t)token_id];
     (void)dim;
     return row;
+}
+
+static bool env_enabled(const char* key) {
+    const char* v = std::getenv(key);
+    if (!v || v[0] == '\0') return false;
+    return v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T';
+}
+
+static bool transpose_square_inplace(Tensor*& t) {
+    if (!t || t->type != DataType::F32) return true;
+    if (t->rows != t->cols) return true;
+    Tensor* tr = tensor_transpose_f32(t);
+    if (!tr) return false;
+    tensor_free(t);
+    t = tr;
+    return true;
+}
+
+static bool normalize_linear_inplace(Tensor*& t, size_t in_dim, bool transpose_square, bool& transposed) {
+    transposed = false;
+    if (!t || t->type != DataType::F32) return false;
+    if (in_dim == 0) return false;
+
+    if (t->rows == in_dim && t->cols == in_dim) {
+        if (!transpose_square) return true;
+        Tensor* tr = tensor_transpose_f32(t);
+        if (!tr) return false;
+        tensor_free(t);
+        t = tr;
+        transposed = true;
+        return true;
+    }
+
+    if (t->rows == in_dim) return true;
+    if (t->cols == in_dim) {
+        Tensor* tr = tensor_transpose_f32(t);
+        if (!tr) return false;
+        tensor_free(t);
+        t = tr;
+        transposed = true;
+        return true;
+    }
+    return false;
+}
+
+static bool arch_uses_square_transpose(const std::string& arch_lc) {
+    // Architectures whose exported square attention matrices are commonly laid out
+    // in the opposite orientation for this runtime.
+    if (arch_lc == "llama") return true;
+    if (arch_lc == "mistral") return true;
+    if (arch_lc == "mixtral") return true;
+    if (arch_lc == "qwen2") return true;
+    if (arch_lc == "qwen2moe") return true;
+    if (arch_lc == "gemma") return true;
+    // Explicitly-known non-LLAMA families (keep square transpose off by default).
+    if (arch_lc == "gptneox") return false;
+    if (arch_lc == "gpt2") return false;
+    if (arch_lc == "falcon") return false;
+    if (arch_lc == "bloom") return false;
+    if (arch_lc == "mpt") return false;
+    if (arch_lc == "phi") return false;
+    if (arch_lc == "phi2") return false;
+    if (arch_lc == "phi3") return false;
+    return false;
 }
 
 static bool apply_norm_scale_local(Tensor* x, const Tensor* w) {
@@ -256,6 +322,12 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     const char* ext = strrchr(model_path, '.');
     const bool looks_gguf = (ext != nullptr) && (_stricmp(ext, ".gguf") == 0);
 
+    bool desired_transpose_wq = false;
+    bool desired_transpose_wk = false;
+    bool desired_transpose_wv = false;
+    bool desired_transpose_wo = false;
+    bool desired_transpose_ffn_square = false;
+
     if (!looks_gguf) {
         FILE* f = fopen(model_path, "r");
         if (f) {
@@ -311,6 +383,44 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
             if (cfg.n_head_kv > 0) ctx->n_head_kv = (size_t)cfg.n_head_kv;
             fprintf(stderr, "[minxfmr] gguf meta layers=%zu ctx=%zu embd=%zu head=%zu head_kv=%zu\n",
                 ctx->n_layer, ctx->seq_max, ctx->model_dim, (size_t)cfg.n_head, (size_t)cfg.n_head_kv);
+        }
+
+        // llama.cpp-like behavior: default layout policy from model architecture metadata.
+        // Explicit CLI transpose flags still win (MINXFMR_TRANSPOSE_USER_OVERRIDE).
+        {
+            const bool user_override = env_enabled("MINXFMR_TRANSPOSE_USER_OVERRIDE");
+            if (user_override) {
+                desired_transpose_wq = env_enabled("MINXFMR_TRANSPOSE_WQ");
+                desired_transpose_wk = env_enabled("MINXFMR_TRANSPOSE_WK");
+                desired_transpose_wv = env_enabled("MINXFMR_TRANSPOSE_WV");
+                desired_transpose_wo = env_enabled("MINXFMR_TRANSPOSE_WO");
+                desired_transpose_ffn_square = desired_transpose_wq || desired_transpose_wk || desired_transpose_wv || desired_transpose_wo;
+                fprintf(stderr,
+                    "[minxfmr] manual orientation: wq=%s wk=%s wv=%s wo=%s\n",
+                    desired_transpose_wq ? "on" : "off",
+                    desired_transpose_wk ? "on" : "off",
+                    desired_transpose_wv ? "on" : "off",
+                    desired_transpose_wo ? "on" : "off");
+            } else {
+                std::string arch;
+                if (gguf_try_read_architecture(model_path, arch)) {
+                    std::string arch_lc = arch;
+                    for (char& ch : arch_lc) ch = (char)std::tolower((unsigned char)ch);
+
+                    const bool needs_square_transpose = arch_uses_square_transpose(arch_lc);
+                    desired_transpose_wq = needs_square_transpose;
+                    desired_transpose_wk = needs_square_transpose;
+                    desired_transpose_wv = needs_square_transpose;
+                    desired_transpose_wo = needs_square_transpose;
+                    desired_transpose_ffn_square = needs_square_transpose;
+                    fprintf(stderr,
+                        "[minxfmr] auto orientation from gguf architecture='%s': square_transpose=%s\n",
+                        arch.c_str(),
+                        needs_square_transpose ? "on" : "off");
+                } else {
+                    fprintf(stderr, "[minxfmr] auto orientation: architecture metadata missing, default square_transpose=off\n");
+                }
+            }
         }
 
         Tensor* wemb = nullptr;
@@ -402,11 +512,23 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         }
 
         std::vector<std::string> vocab;
-        if (gguf_try_read_vocab(model_path, vocab)) {
-            tokenizer_load_from_list(vocab);
-            fprintf(stderr, "[minxfmr] loaded tokenizer vocab from gguf size=%zu\n", vocab.size());
-            log_vocab_specials(vocab);
-        }
+            // Prefer loading tokenizer vocabulary + metadata directly from GGUF when available.
+            {
+                GGUF_File gf;
+                if (gguf_open(model_path, gf)) {
+                    if (!gf.vocab_tokens.empty()) {
+                        if (tokenizer_load_from_gguf(gf)) {
+                            fprintf(stderr, "[minxfmr] loaded tokenizer vocab+meta from gguf size=%zu\n", gf.vocab_tokens.size());
+                            log_vocab_specials(gf.vocab_tokens);
+                        } else {
+                            tokenizer_load_from_list(gf.vocab_tokens);
+                            fprintf(stderr, "[minxfmr] loaded tokenizer vocab from gguf size=%zu\n", gf.vocab_tokens.size());
+                            log_vocab_specials(gf.vocab_tokens);
+                        }
+                    }
+                    gguf_close(gf);
+                }
+            }
 
         Tensor* wout = nullptr;
         if (gguf_try_load_lm_head(model_path, wout)) {
@@ -442,6 +564,102 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     if (ctx->kv_dim == 0) ctx->kv_dim = ctx->model_dim;
     if (ctx->n_head == 0) ctx->n_head = 1;
     if (ctx->n_head_kv == 0) ctx->n_head_kv = 1;
+
+    // Physical normalization: apply square-matrix transposes once at load time.
+    // After this, runtime projection path can use non-transpose behavior.
+    {
+        size_t n_wq = 0, n_wk = 0, n_wv = 0, n_wo = 0;
+        size_t n_ffn_gate = 0, n_ffn_up = 0, n_ffn_down = 0;
+        size_t bad_attn = 0, bad_ffn = 0;
+
+        for (size_t l = 0; l < ctx->n_layer; ++l) {
+            bool tr = false;
+            Tensor*& wq = ctx->Wq_layers[l];
+            if (wq) {
+                if (normalize_linear_inplace(wq, ctx->model_dim, desired_transpose_wq, tr)) {
+                    if (tr) ++n_wq;
+                } else {
+                    ++bad_attn;
+                }
+            }
+
+            Tensor*& wk = ctx->Wk_layers[l];
+            if (wk) {
+                if (normalize_linear_inplace(wk, ctx->model_dim, desired_transpose_wk, tr)) {
+                    if (tr) ++n_wk;
+                } else {
+                    ++bad_attn;
+                }
+            }
+
+            Tensor*& wv = ctx->Wv_layers[l];
+            if (wv) {
+                if (normalize_linear_inplace(wv, ctx->model_dim, desired_transpose_wv, tr)) {
+                    if (tr) ++n_wv;
+                } else {
+                    ++bad_attn;
+                }
+            }
+
+            Tensor*& wo = ctx->Wo_layers[l];
+            if (wo) {
+                if (normalize_linear_inplace(wo, ctx->model_dim, desired_transpose_wo, tr)) {
+                    if (tr) ++n_wo;
+                } else {
+                    ++bad_attn;
+                }
+            }
+
+            Tensor*& wfg = ctx->Wffn_gate_layers[l];
+            Tensor*& wfu = ctx->Wffn_up_layers[l];
+            Tensor*& wfd = ctx->Wffn_down_layers[l];
+
+            size_t ffn_hidden = 0;
+            if (wfg) {
+                if (normalize_linear_inplace(wfg, ctx->model_dim, desired_transpose_ffn_square, tr)) {
+                    if (tr) ++n_ffn_gate;
+                    if (wfg->rows == ctx->model_dim) ffn_hidden = wfg->cols;
+                } else {
+                    ++bad_ffn;
+                }
+            }
+
+            if (wfu) {
+                if (normalize_linear_inplace(wfu, ctx->model_dim, desired_transpose_ffn_square, tr)) {
+                    if (tr) ++n_ffn_up;
+                    if (ffn_hidden == 0 && wfu->rows == ctx->model_dim) ffn_hidden = wfu->cols;
+                } else {
+                    ++bad_ffn;
+                }
+            }
+
+            if (wfd) {
+                if (ffn_hidden > 0) {
+                    if (normalize_linear_inplace(wfd, ffn_hidden, desired_transpose_ffn_square, tr)) {
+                        if (tr) ++n_ffn_down;
+                    } else {
+                        ++bad_ffn;
+                    }
+                } else {
+                    ++bad_ffn;
+                }
+            }
+        }
+
+        bool tr = false;
+        if (ctx->Wq && normalize_linear_inplace(ctx->Wq, ctx->model_dim, desired_transpose_wq, tr) && tr) ++n_wq;
+        if (ctx->Wk && normalize_linear_inplace(ctx->Wk, ctx->model_dim, desired_transpose_wk, tr) && tr) ++n_wk;
+        if (ctx->Wv && normalize_linear_inplace(ctx->Wv, ctx->model_dim, desired_transpose_wv, tr) && tr) ++n_wv;
+
+        fprintf(stderr,
+            "[minxfmr] normalized attention weights at load: Wq=%zu Wk=%zu Wv=%zu Wo=%zu bad=%zu\n",
+            n_wq, n_wk, n_wv, n_wo, bad_attn);
+        fprintf(stderr,
+            "[minxfmr] normalized ffn weights at load: gate=%zu up=%zu down=%zu bad=%zu\n",
+            n_ffn_gate, n_ffn_up, n_ffn_down, bad_ffn);
+
+        transformer_set_transpose_square_weights_for_all(false, false, false, false);
+    }
 
     // optional chat metadata
     ctx->chat_template = std::string();
