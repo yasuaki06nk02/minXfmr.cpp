@@ -6,11 +6,22 @@ enum class DataType {
 };
 
 struct Tensor {
-    void* data;
-    DataType type;
-    size_t rows;
-    size_t cols;
-    size_t bytes;
+    void* data = nullptr;
+    DataType type = DataType::F32;
+    size_t rows = 0;
+    size_t cols = 0;
+    size_t bytes = 0;
+
+    Tensor() noexcept = default;
+    ~Tensor() noexcept = default;
+
+    // Make Tensor move-only to prevent accidental expensive copies.
+    Tensor(const Tensor&) = delete;
+    Tensor& operator=(const Tensor&) = delete;
+
+    Tensor(Tensor&&) noexcept = default;
+    Tensor& operator=(Tensor&&) noexcept = default;
+
     size_t elem_count() const { return rows * cols; }
 };
 

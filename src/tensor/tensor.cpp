@@ -13,16 +13,16 @@ struct TensorImpl {
 
 Tensor* tensor_create_f32(size_t rows, size_t cols) {
     if (rows == 0 || cols == 0) return nullptr;
-    TensorImpl* impl = (TensorImpl*)std::malloc(sizeof(TensorImpl));
+    TensorImpl* impl = new (std::nothrow) TensorImpl();
     if (!impl) return nullptr;
     size_t bytes = rows * cols * sizeof(float);
 #ifdef _WIN32
     impl->storage = (float*)_aligned_malloc(bytes, 64);
-    if (!impl->storage) { std::free(impl); return nullptr; }
+    if (!impl->storage) { delete impl; return nullptr; }
     std::memset(impl->storage, 0, bytes);
 #else
     void* p = nullptr;
-    if (posix_memalign(&p, 64, bytes) != 0) { std::free(impl); return nullptr; }
+    if (posix_memalign(&p, 64, bytes) != 0) { delete impl; return nullptr; }
     impl->storage = (float*)p;
     std::memset(impl->storage, 0, bytes);
 #endif
@@ -44,7 +44,7 @@ void tensor_free(Tensor* t) {
         std::free(impl->storage);
 #endif
     }
-    std::free(impl);
+    delete impl;
 }
 
 float tensor_get_f32(const Tensor* t, size_t r, size_t c) {
