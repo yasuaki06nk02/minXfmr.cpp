@@ -1,0 +1,780 @@
+#include <cstring>
+#include <cstdio>
+#include <random>
+#include <algorithm>
+#include <vector>
+#include <cmath>
+#include <string>
+#include "minxfmr.h"
+#include "../tokenizer/tokenizer.h"
+#include "../cache/kv_cache.h"
+#include "../transformer/rmsnorm.h"
+#include "../transformer/transformer.h"
+#include "../io/gguf_loader.h"
+#include <sstream>
+#include <iomanip>
+
+struct minxfmr_context {
+    KVCache* cache;
+    Tensor* Wemb;
+    Tensor* Wq;
+    Tensor* Wk;
+    Tensor* Wv;
+    Tensor* Wout;
+    Tensor* Wnorm;
+    std::vector<Tensor*> Wq_layers;
+    std::vector<Tensor*> Wk_layers;
+    std::vector<Tensor*> Wv_layers;
+    std::vector<Tensor*> Wo_layers;
+    std::vector<Tensor*> Wattn_norm_layers;
+    std::vector<Tensor*> Wffn_norm_layers;
+    std::vector<Tensor*> Wffn_gate_layers;
+    std::vector<Tensor*> Wffn_up_layers;
+    std::vector<Tensor*> Wffn_down_layers;
+    size_t model_dim;
+    size_t kv_dim;
+    size_t n_layer;
+    size_t n_head;
+    size_t n_head_kv;
+    size_t seq_max;
+    int dummy;
+    // optional metadata
+    std::string chat_template;
+    std::vector<std::string> special_tokens;
+};
+
+static std::string render_token_piece(const std::string& piece) {
+    if (piece.empty()) return piece;
+    // Drop byte-fallback pieces like <0xE3>.
+    if (piece.size() == 6 && piece.rfind("<0x", 0) == 0 && piece[5] == '>') return std::string();
+
+    std::string out;
+    out.reserve(piece.size() + 1);
+    const std::string spm = "\xE2\x96\x81"; // U+2581
+    size_t i = 0;
+    while (i < piece.size()) {
+        if (i + spm.size() <= piece.size() && piece.compare(i, spm.size(), spm) == 0) {
+            out.push_back(' ');
+            i += spm.size();
+            continue;
+        }
+        out.push_back(piece[i]);
+        i += 1;
+    }
+    return out;
+}
+
+static size_t infer_kv_dim_from_weight(const Tensor* w, size_t model_dim) {
+    if (!w) return 0;
+    if (model_dim > 0) {
+        if (w->rows == model_dim) return w->cols;
+        if (w->cols == model_dim) return w->rows;
+    }
+    return std::min(w->rows, w->cols);
+}
+
+static Tensor* tensor_clone_f32_local(const Tensor* in) {
+    if (!in || in->type != DataType::F32) return nullptr;
+    Tensor* out = tensor_create_f32(in->rows, in->cols);
+    if (!out) return nullptr;
+    memcpy(out->data, in->data, sizeof(float) * in->rows * in->cols);
+    return out;
+}
+
+static Tensor* token_embedding_row(const minxfmr_context* ctx, int token_id) {
+    if (!ctx || !ctx->Wemb || ctx->Wemb->type != DataType::F32 || token_id < 0) return nullptr;
+    const Tensor* emb = ctx->Wemb;
+    const size_t dim = ctx->model_dim > 0 ? ctx->model_dim : ((emb->rows > emb->cols) ? emb->cols : emb->rows);
+
+    if (emb->rows >= emb->cols) {
+        if ((size_t)token_id >= emb->rows) token_id = (int)((size_t)token_id % emb->rows);
+        Tensor* row = tensor_create_f32(1, emb->cols);
+        if (!row) return nullptr;
+        memcpy(row->data, (const float*)emb->data + (size_t)token_id * emb->cols, sizeof(float) * emb->cols);
+        return row;
+    }
+
+    if ((size_t)token_id >= emb->cols) token_id = (int)((size_t)token_id % emb->cols);
+    Tensor* row = tensor_create_f32(1, emb->rows);
+    if (!row) return nullptr;
+    float* dst = (float*)row->data;
+    const float* src = (const float*)emb->data;
+    for (size_t r = 0; r < emb->rows; ++r) dst[r] = src[r * emb->cols + (size_t)token_id];
+    (void)dim;
+    return row;
+}
+
+static bool apply_norm_scale_local(Tensor* x, const Tensor* w) {
+    if (!x || !w || x->type != DataType::F32 || w->type != DataType::F32) return false;
+    size_t d = x->cols;
+    const float* wd = (const float*)w->data;
+    float* xd = (float*)x->data;
+
+    if (w->rows == 1 && w->cols == d) {
+        for (size_t r = 0; r < x->rows; ++r) {
+            for (size_t c = 0; c < d; ++c) xd[r * d + c] *= wd[c];
+        }
+        return true;
+    }
+    if (w->cols == 1 && w->rows == d) {
+        for (size_t r = 0; r < x->rows; ++r) {
+            for (size_t c = 0; c < d; ++c) xd[r * d + c] *= wd[c];
+        }
+        return true;
+    }
+    if (w->rows == d && w->cols == d) {
+        for (size_t r = 0; r < x->rows; ++r) {
+            for (size_t c = 0; c < d; ++c) xd[r * d + c] *= wd[c * d + c];
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool apply_final_norm_inplace(Tensor* x, const Tensor* wnorm) {
+    if (!x) return false;
+    Tensor* tmp = tensor_create_f32(x->rows, x->cols);
+    if (!tmp) return false;
+    bool ok = rmsnorm_forward(x, tmp);
+    if (ok && wnorm) ok = apply_norm_scale_local(tmp, wnorm);
+    if (ok) memcpy(x->data, tmp->data, sizeof(float) * x->rows * x->cols);
+    tensor_free(tmp);
+    return ok;
+}
+static void log_vocab_specials(const std::vector<std::string>& vocab) {
+    size_t shown = 0;
+    for (size_t i = 0; i < vocab.size() && shown < 40; ++i) {
+        const std::string& tok = vocab[i];
+        if (tok.find('<') != std::string::npos || tok.find('[') != std::string::npos || tok.find(']') != std::string::npos) {
+            fprintf(stderr, "[minxfmr] vocab[%zu]=%s\n", i, tok.c_str());
+            ++shown;
+        }
+    }
+}
+
+static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor* output) {
+    if (!ctx || !input || !output) return false;
+    if (input->type != DataType::F32 || output->type != DataType::F32) return false;
+
+    Tensor* cur = tensor_clone_f32_local(input);
+    if (!cur) return false;
+
+    size_t layers_to_run = 1;
+    if (!ctx->Wq_layers.empty() && ctx->Wq_layers.size() == ctx->Wk_layers.size() && ctx->Wq_layers.size() == ctx->Wv_layers.size()) {
+        layers_to_run = ctx->Wq_layers.size();
+    }
+    if (ctx->cache && layers_to_run > ctx->cache->layers) layers_to_run = ctx->cache->layers;
+
+    for (size_t l = 0; l < layers_to_run; ++l) {
+        Tensor* nxt = tensor_create_f32(cur->rows, cur->cols);
+        if (!nxt) {
+            tensor_free(cur);
+            return false;
+        }
+
+        const Tensor* Wq = ctx->Wq;
+        const Tensor* Wk = ctx->Wk;
+        const Tensor* Wv = ctx->Wv;
+        const Tensor* Wo = nullptr;
+        const Tensor* WattnNorm = nullptr;
+        const Tensor* WffnNorm = nullptr;
+        if (!ctx->Wq_layers.empty()) {
+            if (ctx->Wq_layers[l]) Wq = ctx->Wq_layers[l];
+            if (ctx->Wk_layers[l]) Wk = ctx->Wk_layers[l];
+            if (ctx->Wv_layers[l]) Wv = ctx->Wv_layers[l];
+            if (!ctx->Wo_layers.empty()) Wo = ctx->Wo_layers[l];
+            if (!ctx->Wattn_norm_layers.empty()) WattnNorm = ctx->Wattn_norm_layers[l];
+            if (!ctx->Wffn_norm_layers.empty()) WffnNorm = ctx->Wffn_norm_layers[l];
+        }
+
+        const Tensor* Wfg = nullptr;
+        const Tensor* Wfu = nullptr;
+        const Tensor* Wfd = nullptr;
+        if (!ctx->Wffn_gate_layers.empty()) {
+            Wfg = ctx->Wffn_gate_layers[l];
+            Wfu = ctx->Wffn_up_layers[l];
+            Wfd = ctx->Wffn_down_layers[l];
+        }
+
+        bool ok = transformer_forward_single_layer(cur, nxt, ctx->cache, l, ctx->n_head, ctx->n_head_kv, Wq, Wk, Wv, Wo, WattnNorm, WffnNorm, Wfg, Wfu, Wfd);
+        tensor_free(cur);
+        if (!ok) {
+            tensor_free(nxt);
+            return false;
+        }
+        cur = nxt;
+    }
+
+    if (output->rows != cur->rows || output->cols != cur->cols) {
+        tensor_free(cur);
+        return false;
+    }
+    memcpy(output->data, cur->data, sizeof(float) * cur->rows * cur->cols);
+    tensor_free(cur);
+    return true;
+}
+
+static void free_layer_weights(std::vector<Tensor*>& vec) {
+    for (Tensor* t : vec) if (t) tensor_free(t);
+    vec.clear();
+}
+
+minxfmr_context* minxfmr_open(const char* model_path) {
+    return minxfmr_open_with_layer(model_path, 0);
+}
+
+minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_layer) {
+    if (!model_path) return nullptr;
+
+    minxfmr_context* ctx = new (std::nothrow) minxfmr_context();
+    if (!ctx) return nullptr;
+
+    ctx->dummy = 0;
+    ctx->cache = nullptr;
+    ctx->Wemb = nullptr;
+    ctx->Wq = nullptr;
+    ctx->Wk = nullptr;
+    ctx->Wv = nullptr;
+    ctx->Wout = nullptr;
+    ctx->Wnorm = nullptr;
+    ctx->Wq_layers.clear();
+    ctx->Wk_layers.clear();
+    ctx->Wv_layers.clear();
+    ctx->Wo_layers.clear();
+    ctx->Wattn_norm_layers.clear();
+    ctx->Wffn_norm_layers.clear();
+    ctx->Wffn_gate_layers.clear();
+    ctx->Wffn_up_layers.clear();
+    ctx->Wffn_down_layers.clear();
+    ctx->model_dim = 4;
+    ctx->kv_dim = 4;
+    ctx->n_layer = 1;
+    ctx->n_head = 1;
+    ctx->n_head_kv = 1;
+    ctx->seq_max = 128;
+
+    const char* ext = strrchr(model_path, '.');
+    const bool looks_gguf = (ext != nullptr) && (_stricmp(ext, ".gguf") == 0);
+
+    if (!looks_gguf) {
+        FILE* f = fopen(model_path, "r");
+        if (f) {
+            int d = 0;
+            if (fscanf(f, "%d", &d) == 1 && d > 0) {
+                size_t need = (size_t)3 * (size_t)d * (size_t)d;
+                std::vector<float> buf;
+                buf.reserve(need);
+                for (size_t i = 0; i < need; ++i) {
+                    float v;
+                    if (fscanf(f, "%f", &v) == 1) buf.push_back(v);
+                    else break;
+                }
+                if (buf.size() == need) {
+                    Tensor* TWq = tensor_create_f32((size_t)d, (size_t)d);
+                    Tensor* TWk = tensor_create_f32((size_t)d, (size_t)d);
+                    Tensor* TWv = tensor_create_f32((size_t)d, (size_t)d);
+                    if (TWq && TWk && TWv) {
+                        size_t off = 0;
+                        for (int i = 0; i < d * d; ++i) tensor_set_f32(TWq, (size_t)(i / d), (size_t)(i % d), buf[off++]);
+                        for (int i = 0; i < d * d; ++i) tensor_set_f32(TWk, (size_t)(i / d), (size_t)(i % d), buf[off++]);
+                        for (int i = 0; i < d * d; ++i) tensor_set_f32(TWv, (size_t)(i / d), (size_t)(i % d), buf[off++]);
+                        ctx->Wq = TWq;
+                        ctx->Wk = TWk;
+                        ctx->Wv = TWv;
+                        ctx->model_dim = (size_t)d;
+                        ctx->kv_dim = (size_t)d;
+                        fprintf(stderr, "[minxfmr] loaded weights from %s dim=%d\n", model_path, d);
+                    } else {
+                        tensor_free(TWq);
+                        tensor_free(TWk);
+                        tensor_free(TWv);
+                    }
+                } else {
+                    fprintf(stderr, "[minxfmr] weight file %s malformed: expected %zu floats, got %zu\n", model_path, need, buf.size());
+                }
+            } else {
+                fprintf(stderr, "[minxfmr] could not read dim from %s\n", model_path);
+            }
+            fclose(f);
+        } else {
+            fprintf(stderr, "[minxfmr] weight file %s not found, proceeding without projections\n", model_path);
+        }
+    }
+
+    if (looks_gguf) {
+        GGUFLoaderModelConfig cfg{0, 0, 0, 0, 0};
+        if (gguf_try_read_model_config(model_path, cfg)) {
+            if (cfg.n_layer > 0) ctx->n_layer = (size_t)cfg.n_layer;
+            if (cfg.n_ctx > 0) ctx->seq_max = (size_t)cfg.n_ctx;
+            if (cfg.n_embd > 0) ctx->model_dim = (size_t)cfg.n_embd;
+            if (cfg.n_head > 0) ctx->n_head = (size_t)cfg.n_head;
+            if (cfg.n_head_kv > 0) ctx->n_head_kv = (size_t)cfg.n_head_kv;
+            fprintf(stderr, "[minxfmr] gguf meta layers=%zu ctx=%zu embd=%zu head=%zu head_kv=%zu\n",
+                ctx->n_layer, ctx->seq_max, ctx->model_dim, (size_t)cfg.n_head, (size_t)cfg.n_head_kv);
+        }
+
+        Tensor* wemb = nullptr;
+        if (gguf_try_load_token_embedding(model_path, wemb)) {
+            ctx->Wemb = wemb;
+            fprintf(stderr, "[minxfmr] loaded token embedding rows=%zu cols=%zu\n", wemb->rows, wemb->cols);
+        }
+
+        ctx->Wq_layers.resize(ctx->n_layer, nullptr);
+        ctx->Wk_layers.resize(ctx->n_layer, nullptr);
+        ctx->Wv_layers.resize(ctx->n_layer, nullptr);
+        ctx->Wo_layers.resize(ctx->n_layer, nullptr);
+        ctx->Wattn_norm_layers.resize(ctx->n_layer, nullptr);
+        ctx->Wffn_norm_layers.resize(ctx->n_layer, nullptr);
+        ctx->Wffn_gate_layers.resize(ctx->n_layer, nullptr);
+        ctx->Wffn_up_layers.resize(ctx->n_layer, nullptr);
+        ctx->Wffn_down_layers.resize(ctx->n_layer, nullptr);
+
+        size_t loaded_attn_layers = 0;
+        size_t loaded_wo_layers = 0;
+        size_t loaded_norm_layers = 0;
+        size_t loaded_ffn_layers = 0;
+        for (size_t l = 0; l < ctx->n_layer; ++l) {
+            Tensor* lq = nullptr;
+            Tensor* lk = nullptr;
+            Tensor* lv = nullptr;
+            if (gguf_try_load_projections_for_layer(model_path, (int)l, lq, lk, lv)) {
+                ctx->Wq_layers[l] = lq;
+                ctx->Wk_layers[l] = lk;
+                ctx->Wv_layers[l] = lv;
+                loaded_attn_layers++;
+            }
+
+            Tensor* wo = nullptr;
+            if (gguf_try_load_attn_out_for_layer(model_path, (int)l, wo)) {
+                ctx->Wo_layers[l] = wo;
+                loaded_wo_layers++;
+            }
+
+            Tensor* an = nullptr;
+            Tensor* fn = nullptr;
+            if (gguf_try_load_norms_for_layer(model_path, (int)l, an, fn)) {
+                ctx->Wattn_norm_layers[l] = an;
+                ctx->Wffn_norm_layers[l] = fn;
+                loaded_norm_layers++;
+            }
+
+            Tensor* fg = nullptr;
+            Tensor* fu = nullptr;
+            Tensor* fd = nullptr;
+            if (gguf_try_load_ffn_for_layer(model_path, (int)l, fg, fu, fd)) {
+                ctx->Wffn_gate_layers[l] = fg;
+                ctx->Wffn_up_layers[l] = fu;
+                ctx->Wffn_down_layers[l] = fd;
+                loaded_ffn_layers++;
+            }
+        }
+        if (loaded_attn_layers > 0) {
+            fprintf(stderr, "[minxfmr] loaded per-layer projections: %zu/%zu layers\n", loaded_attn_layers, ctx->n_layer);
+            for (size_t i = 0; i < ctx->Wq_layers.size(); ++i) {
+                if (ctx->Wq_layers[i] && ctx->Wk_layers[i] && ctx->Wv_layers[i]) {
+                    ctx->Wq = tensor_clone_f32_local(ctx->Wq_layers[i]);
+                    ctx->Wk = tensor_clone_f32_local(ctx->Wk_layers[i]);
+                    ctx->Wv = tensor_clone_f32_local(ctx->Wv_layers[i]);
+                    break;
+                }
+            }
+        }
+        if (loaded_ffn_layers > 0) {
+            fprintf(stderr, "[minxfmr] loaded per-layer ffn weights: %zu/%zu layers\n", loaded_ffn_layers, ctx->n_layer);
+        }
+        if (loaded_wo_layers > 0) {
+            fprintf(stderr, "[minxfmr] loaded per-layer Wo weights: %zu/%zu layers\n", loaded_wo_layers, ctx->n_layer);
+        }
+        if (loaded_norm_layers > 0) {
+            fprintf(stderr, "[minxfmr] loaded per-layer norm weights: %zu/%zu layers\n", loaded_norm_layers, ctx->n_layer);
+        }
+
+        if (!ctx->Wq) {
+            Tensor* gWq = nullptr;
+            Tensor* gWk = nullptr;
+            Tensor* gWv = nullptr;
+            if (gguf_try_load_projections_for_layer(model_path, projection_layer, gWq, gWk, gWv)) {
+                ctx->Wq = gWq;
+                ctx->Wk = gWk;
+                ctx->Wv = gWv;
+                fprintf(stderr, "[minxfmr] loaded projections from gguf %s layer=%d dim=%zux%zu\n", model_path, projection_layer, ctx->Wq->rows, ctx->Wq->cols);
+            }
+        }
+
+        std::vector<std::string> vocab;
+        if (gguf_try_read_vocab(model_path, vocab)) {
+            tokenizer_load_from_list(vocab);
+            fprintf(stderr, "[minxfmr] loaded tokenizer vocab from gguf size=%zu\n", vocab.size());
+            log_vocab_specials(vocab);
+        }
+
+        Tensor* wout = nullptr;
+        if (gguf_try_load_lm_head(model_path, wout)) {
+            ctx->Wout = wout;
+            fprintf(stderr, "[minxfmr] loaded output head rows=%zu cols=%zu\n", wout->rows, wout->cols);
+        }
+
+        Tensor* wnorm = nullptr;
+        if (gguf_try_load_final_norm(model_path, wnorm)) {
+            ctx->Wnorm = wnorm;
+            fprintf(stderr, "[minxfmr] loaded final norm rows=%zu cols=%zu\n", wnorm->rows, wnorm->cols);
+        }
+    }
+
+    if (ctx->Wq) {
+        if (ctx->model_dim == 0) {
+            ctx->model_dim = (ctx->Wq->rows == ctx->Wq->cols) ? ctx->Wq->rows : std::max(ctx->Wq->rows, ctx->Wq->cols);
+        }
+        size_t kv = infer_kv_dim_from_weight(ctx->Wk, ctx->model_dim);
+        size_t vv = infer_kv_dim_from_weight(ctx->Wv, ctx->model_dim);
+        if (kv == 0) kv = ctx->model_dim;
+        if (vv > 0) kv = std::min(kv, vv);
+        ctx->kv_dim = kv;
+    }
+    if (ctx->Wemb && ctx->model_dim == 0) {
+        ctx->model_dim = (ctx->Wemb->rows >= ctx->Wemb->cols) ? ctx->Wemb->cols : ctx->Wemb->rows;
+    }
+
+    if (ctx->n_layer == 0) ctx->n_layer = 1;
+    if (ctx->seq_max < 16) ctx->seq_max = 16;
+    if (ctx->seq_max > 8192) ctx->seq_max = 8192;
+    if (ctx->model_dim == 0) ctx->model_dim = 4;
+    if (ctx->kv_dim == 0) ctx->kv_dim = ctx->model_dim;
+    if (ctx->n_head == 0) ctx->n_head = 1;
+    if (ctx->n_head_kv == 0) ctx->n_head_kv = 1;
+
+    // optional chat metadata
+    ctx->chat_template = std::string();
+    ctx->special_tokens.clear();
+
+    // try to read optional metadata from gguf
+    std::string tmp_template;
+    if (gguf_try_read_chat_template(model_path, tmp_template)) {
+        ctx->chat_template = tmp_template;
+        fprintf(stderr, "[minxfmr] loaded chat template from gguf length=%zu\n", ctx->chat_template.size());
+    }
+    std::vector<std::string> tmp_specials;
+    if (gguf_try_read_special_tokens(model_path, tmp_specials)) {
+        ctx->special_tokens = tmp_specials;
+        fprintf(stderr, "[minxfmr] loaded %zu special tokens from gguf\n", ctx->special_tokens.size());
+    }
+
+    ctx->cache = kvcache_create(ctx->n_layer, ctx->seq_max, ctx->kv_dim);
+    if (!ctx->cache) {
+        fprintf(stderr, "[minxfmr] failed to create kvcache with layers=%zu seq=%zu dim=%zu\n", ctx->n_layer, ctx->seq_max, ctx->kv_dim);
+    }
+
+    fprintf(stderr, "[minxfmr] runtime config model_dim=%zu kv_dim=%zu layers=%zu seq_max=%zu\n",
+        ctx->model_dim, ctx->kv_dim, ctx->n_layer, ctx->seq_max);
+    fprintf(stderr, "minxfmr: opened model %s\n", model_path);
+    return ctx;
+}
+
+int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(const char* token), double temperature, int top_k) {
+    if (!ctx || !prompt) return -1;
+
+    std::vector<int> ids = tokenizer_encode(prompt);
+    // debug: log prompt token ids and decoded prompt
+    if (!ids.empty()) {
+        fprintf(stderr, "[minxfmr] prompt token count=%zu\n", ids.size());
+        fprintf(stderr, "[minxfmr] prompt ids:");
+        for (size_t i=0;i<ids.size();++i) fprintf(stderr, " %d", ids[i]);
+        fprintf(stderr, "\n");
+        std::string dbg = tokenizer_decode(ids);
+        fprintf(stderr, "[minxfmr] prompt decoded: %s\n", dbg.c_str());
+    }
+    size_t vocab_size_base = tokenizer_vocab_size();
+    if (vocab_size_base == 0) vocab_size_base = 16;
+
+    KVCache* cache = ctx->cache;
+    if (!cache) return -2;
+
+    // Each generation call rebuilds the full prompt, so the cache must start clean.
+    // Otherwise chat turns duplicate prior context and quickly degrade into garbage.
+    kvcache_reset(cache);
+
+    const size_t dim = ctx->model_dim > 0 ? ctx->model_dim : cache->dim;
+
+    Tensor* last_out_prefill = nullptr;
+    int last = ids.empty() ? 0 : ids.back();
+    for (int id : ids) {
+        Tensor* in = token_embedding_row(ctx, id);
+        Tensor* out = tensor_create_f32(1, dim);
+        if (!in || !out) {
+            tensor_free(in);
+            tensor_free(out);
+            continue;
+        }
+        run_stack_forward(ctx, in, out);
+        tensor_free(in);
+        if (id == last) {
+            last_out_prefill = tensor_clone_f32_local(out);
+        }
+        tensor_free(out);
+    }
+    if (temperature <= 0.0) temperature = 1.0;
+    if (top_k <= 0) top_k = 1;
+    static std::mt19937 rng((unsigned)std::random_device{}());
+
+    int max_steps = 24;
+    if (const char* env_steps = std::getenv("MINXFMR_MAX_GEN_TOKENS")) {
+        int parsed = atoi(env_steps);
+        if (parsed >= 1 && parsed <= 256) max_steps = parsed;
+    }
+
+    std::vector<int> recent_tokens;
+    recent_tokens.reserve(64);
+
+    // If requested via environment, emit a single-line JSON object to stdout with
+    // the generated token ids, token strings and base64-encoded decoded text.
+    bool emit_json = false;
+    if (const char* env_json = std::getenv("MINXFMR_EMIT_JSON")) {
+        if (env_json && env_json[0] != '\0') emit_json = true;
+    }
+    std::vector<int> gen_ids;
+    std::vector<std::string> gen_token_strs;
+    for (int t = 0; t < max_steps; ++t) {
+        Tensor* in = nullptr;
+        Tensor* out = nullptr;
+        int next = 0;
+
+        if (t == 0 && last_out_prefill) {
+            out = tensor_clone_f32_local(last_out_prefill);
+        } else {
+            in = token_embedding_row(ctx, last);
+            out = tensor_create_f32(1, dim);
+            if (in && out) run_stack_forward(ctx, in, out);
+        }
+
+        if (!out) break;
+
+        if (ctx->Wnorm) apply_final_norm_inplace(out, ctx->Wnorm);
+
+        size_t vocab_size = vocab_size_base;
+        std::vector<double> logits(vocab_size, 0.0);
+        const float* od = (const float*)out->data;
+
+        if (ctx->Wout && ctx->Wout->type == DataType::F32) {
+            const float* wd = (const float*)ctx->Wout->data;
+            if (ctx->Wout->rows == dim) {
+                size_t out_vocab = ctx->Wout->cols;
+                size_t use_vocab = std::min(vocab_size, out_vocab);
+                logits.assign(use_vocab, 0.0);
+                for (size_t j = 0; j < use_vocab; ++j) {
+                    double s = 0.0;
+                    for (size_t i = 0; i < dim; ++i) s += (double)od[i] * (double)wd[i * out_vocab + j];
+                    logits[j] = s;
+                }
+                vocab_size = use_vocab;
+            } else if (ctx->Wout->cols == dim) {
+                size_t out_vocab = ctx->Wout->rows;
+                size_t use_vocab = std::min(vocab_size, out_vocab);
+                logits.assign(use_vocab, 0.0);
+                for (size_t j = 0; j < use_vocab; ++j) {
+                    double s = 0.0;
+                    for (size_t i = 0; i < dim; ++i) s += (double)od[i] * (double)wd[j * dim + i];
+                    logits[j] = s;
+                }
+                vocab_size = use_vocab;
+            } else {
+                for (size_t i = 0; i < vocab_size; ++i) {
+                    size_t idx = (dim == 0) ? 0 : (i % dim);
+                    logits[i] = (double)od[idx];
+                }
+            }
+        } else {
+            for (size_t i = 0; i < vocab_size; ++i) {
+                size_t idx = (dim == 0) ? 0 : (i % dim);
+                logits[i] = (double)od[idx];
+            }
+        }
+
+        for (size_t i = 0; i < recent_tokens.size(); ++i) {
+            int rid = recent_tokens[i];
+            if (rid >= 0 && (size_t)rid < logits.size()) logits[(size_t)rid] -= 0.75;
+        }
+
+        int k_use = top_k;
+        if (k_use <= 0) k_use = 1;
+        if ((size_t)k_use > vocab_size) k_use = (int)vocab_size;
+
+        std::vector<int> order(vocab_size);
+        for (size_t i = 0; i < vocab_size; ++i) order[i] = (int)i;
+        std::partial_sort(order.begin(), order.begin() + k_use, order.end(),
+            [&](int a, int b) { return logits[(size_t)a] > logits[(size_t)b]; });
+
+        std::vector<double> probs;
+        probs.reserve((size_t)k_use);
+        double maxs = logits[(size_t)order[0]];
+        double sum = 0.0;
+        for (int i = 0; i < k_use; ++i) {
+            double p = exp((logits[(size_t)order[(size_t)i]] - maxs) / temperature);
+            probs.push_back(p);
+            sum += p;
+        }
+        if (sum <= 0.0) {
+            next = order[0];
+        } else {
+            for (double& p : probs) p /= sum;
+            std::discrete_distribution<int> dist(probs.begin(), probs.end());
+            int pick = dist(rng);
+            next = order[(size_t)pick];
+        }
+
+        std::string raw_tok = tokenizer_id_to_token(next);
+        std::string tok = render_token_piece(raw_tok);
+        if (tok.empty()) tok = " ";
+        if (emit_json) {
+            gen_ids.push_back(next);
+            gen_token_strs.push_back(raw_tok);
+        } else {
+            if (callback) callback(tok.c_str());
+        }
+
+        recent_tokens.push_back(next);
+        if (recent_tokens.size() > 48) recent_tokens.erase(recent_tokens.begin());
+
+        if (t >= 6 && (tok.find('.') != std::string::npos || tok.find('!') != std::string::npos || tok.find('?') != std::string::npos)) {
+            if (in) tensor_free(in);
+            if (out) tensor_free(out);
+            break;
+        }
+
+        if (in) tensor_free(in);
+        if (out) tensor_free(out);
+        last = next;
+    }
+
+    if (last_out_prefill) tensor_free(last_out_prefill);
+
+    // If emitting JSON, build object and write to stdout.
+    if (emit_json) {
+        // helper: base64 encode decoded text
+        auto base64_encode = [](const std::string& in) {
+            static const char* b64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+            std::string out;
+            int val=0, valb=-6;
+            for (unsigned char c : in) {
+                val = (val<<8) + c;
+                valb += 8;
+                while (valb>=0) {
+                    out.push_back(b64[(val>>valb)&0x3F]);
+                    valb-=6;
+                }
+            }
+            if (valb>-6) out.push_back(b64[((val<<8)>>(valb+8))&0x3F]);
+            while (out.size()%4) out.push_back('=');
+            return out;
+        };
+
+        auto json_escape = [](const std::string& s) {
+            std::string o;
+            o.reserve(s.size()*2);
+            for (unsigned char c : s) {
+                if (c == '"') { o += "\\\""; }
+                else if (c == '\\') { o += "\\\\"; }
+                else if (c >= 0x20 && c <= 0x7E) { o.push_back((char)c); }
+                else {
+                    // non-printable / non-ascii -> emit as \u00XX
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04X", (unsigned int)c);
+                    o += buf;
+                }
+            }
+            return o;
+        };
+
+        std::string decoded = tokenizer_decode(gen_ids);
+        std::string b64 = base64_encode(decoded);
+
+        std::ostringstream js;
+        js << "{";
+        js << "\"token_ids\": [";
+        for (size_t i = 0; i < gen_ids.size(); ++i) {
+            if (i) js << ", ";
+            js << gen_ids[i];
+        }
+        js << "], ";
+        js << "\"tokens\": [";
+        for (size_t i = 0; i < gen_token_strs.size(); ++i) {
+            if (i) js << ", ";
+            js << '"' << json_escape(gen_token_strs[i]) << '"';
+        }
+        js << "], ";
+        js << "\"text_b64\": \"" << b64 << "\"";
+        js << "}";
+        std::string out = js.str();
+        // print single-line JSON to stdout
+        fprintf(stdout, "%s\n", out.c_str());
+        fflush(stdout);
+    }
+
+    return 0;
+}
+
+void minxfmr_reset(minxfmr_context* ctx) {
+    if (!ctx) return;
+    if (ctx->cache) kvcache_reset(ctx->cache);
+    ctx->dummy = 0;
+}
+
+void minxfmr_close(minxfmr_context* ctx) {
+    if (!ctx) return;
+    if (ctx->cache) kvcache_free(ctx->cache);
+    if (ctx->Wemb) tensor_free(ctx->Wemb);
+    if (ctx->Wnorm) tensor_free(ctx->Wnorm);
+    if (ctx->Wq) tensor_free(ctx->Wq);
+    if (ctx->Wk) tensor_free(ctx->Wk);
+    if (ctx->Wv) tensor_free(ctx->Wv);
+    if (ctx->Wout) tensor_free(ctx->Wout);
+    free_layer_weights(ctx->Wq_layers);
+    free_layer_weights(ctx->Wk_layers);
+    free_layer_weights(ctx->Wv_layers);
+    free_layer_weights(ctx->Wo_layers);
+    free_layer_weights(ctx->Wattn_norm_layers);
+    free_layer_weights(ctx->Wffn_norm_layers);
+    free_layer_weights(ctx->Wffn_gate_layers);
+    free_layer_weights(ctx->Wffn_up_layers);
+    free_layer_weights(ctx->Wffn_down_layers);
+    delete ctx;
+}
+
+void minxfmr_print_weights(minxfmr_context* ctx) {
+    if (!ctx) {
+        fprintf(stderr, "[minxfmr] no context\n");
+        return;
+    }
+    if (ctx->Wq && ctx->Wk && ctx->Wv) {
+        fprintf(stderr, "[minxfmr] Wq dim=%zux%zu sample00=%f\n", ctx->Wq->rows, ctx->Wq->cols, tensor_get_f32(ctx->Wq, 0, 0));
+        fprintf(stderr, "[minxfmr] Wk dim=%zux%zu sample00=%f\n", ctx->Wk->rows, ctx->Wk->cols, tensor_get_f32(ctx->Wk, 0, 0));
+        fprintf(stderr, "[minxfmr] Wv dim=%zux%zu sample00=%f\n", ctx->Wv->rows, ctx->Wv->cols, tensor_get_f32(ctx->Wv, 0, 0));
+    } else {
+        fprintf(stderr, "[minxfmr] no projection weights loaded\n");
+    }
+    if (!ctx->Wq_layers.empty()) {
+        fprintf(stderr, "[minxfmr] per-layer projections loaded for %zu layers\n", ctx->Wq_layers.size());
+    }
+    if (!ctx->Wffn_gate_layers.empty()) {
+        fprintf(stderr, "[minxfmr] per-layer ffn loaded for %zu layers\n", ctx->Wffn_gate_layers.size());
+    }
+    if (!ctx->Wo_layers.empty()) {
+        fprintf(stderr, "[minxfmr] per-layer Wo loaded for %zu layers\n", ctx->Wo_layers.size());
+    }
+}
+
+const char* minxfmr_get_chat_template(minxfmr_context* ctx) {
+    if (!ctx) return nullptr;
+    if (ctx->chat_template.empty()) return nullptr;
+    return ctx->chat_template.c_str();
+}
+
+size_t minxfmr_get_special_tokens_count(minxfmr_context* ctx) {
+    if (!ctx) return 0;
+    return ctx->special_tokens.size();
+}
+
+const char* minxfmr_get_special_token(minxfmr_context* ctx, size_t idx) {
+    if (!ctx) return nullptr;
+    if (idx >= ctx->special_tokens.size()) return nullptr;
+    return ctx->special_tokens[idx].c_str();
+}

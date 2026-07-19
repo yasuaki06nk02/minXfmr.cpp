@@ -1,0 +1,99 @@
+2026-07-19 19:32:32,786 INFO  start_mask=0 max_masks=4 timeout=60s cooldown=3.0s priority=below_normal
+2026-07-19 19:32:32,787 INFO  Running mask=0 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 19:32:32,787 INFO  dry-run: would write scripts\transpose_search_logs\result_0_1784457152786_try1.log
+2026-07-19 19:32:35,787 INFO  Running mask=1 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 19:32:35,789 INFO  dry-run: would write scripts\transpose_search_logs\result_1_1784457155787_try1.log
+2026-07-19 19:32:38,789 INFO  Running mask=2 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --no-transpose-wq --transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 19:32:38,789 INFO  dry-run: would write scripts\transpose_search_logs\result_2_1784457158789_try1.log
+2026-07-19 19:32:41,790 INFO  Running mask=3 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --transpose-wq --transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 19:32:41,790 INFO  dry-run: would write scripts\transpose_search_logs\result_3_1784457161790_try1.log
+2026-07-19 19:32:41,792 INFO  Wrote summary to C:\Users\admin\Documents\minXfmr.cpp\scripts\transpose_search_logs\summary.json
+2026-07-19 19:32:41,792 INFO  Best candidate: {'score': -1, 'mask': None, 'log': None, 'cmd': None}
+2026-07-19 19:35:21,302 INFO  start_mask=1 max_masks=1 timeout=180s cooldown=1.0s priority=idle
+2026-07-19 19:35:21,302 INFO  cpu thread limits set to 4
+2026-07-19 19:35:21,302 INFO  Running mask=1 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 24 --prompt hello --transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 19:36:12,129 INFO  mask=1 attempt=1 score=600 timed_out=False rc=0
+2026-07-19 19:36:12,131 INFO  Wrote summary to C:\Users\admin\Documents\minXfmr.cpp\scripts\transpose_search_logs\summary.json
+2026-07-19 19:36:12,131 INFO  Verifying best mask=1 with 1 runs at 24 tokens
+2026-07-19 19:36:12,131 INFO  verify run 1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 24 --prompt hello --transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 19:37:03,630 INFO  Verification results appended to C:\Users\admin\Documents\minXfmr.cpp\scripts\transpose_search_logs\summary.json
+2026-07-19 19:37:03,630 INFO  Best candidate: {'score': 600, 'mask': 1, 'log': 'scripts\\transpose_search_logs\\result_1_1784457321302_try1.log', 'cmd': "'build\\src\\Release\\minxfmr_cli.exe' 'build\\src\\Release\\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 24 --prompt hello --transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo"}
+2026-07-19 19:56:45,991 INFO  start_mask=0 max_masks=4 timeout=60s cooldown=3.0s priority=below_normal
+2026-07-19 19:56:45,992 INFO  Fetching model vocab via CLI --emit-vocab
+2026-07-19 19:57:27,055 INFO  Loaded vocab size=32000
+2026-07-19 19:57:27,055 INFO  Running mask=0 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 19:57:27,056 INFO  dry-run: would write scripts\transpose_search_logs\result_0_1784458647055_try1.log
+2026-07-19 19:57:30,056 INFO  Running mask=1 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 19:57:30,057 INFO  dry-run: would write scripts\transpose_search_logs\result_1_1784458650056_try1.log
+2026-07-19 19:57:33,057 INFO  Running mask=2 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --no-transpose-wq --transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 19:57:33,058 INFO  dry-run: would write scripts\transpose_search_logs\result_2_1784458653057_try1.log
+2026-07-19 19:57:36,058 INFO  Running mask=3 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --transpose-wq --transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 19:57:36,059 INFO  dry-run: would write scripts\transpose_search_logs\result_3_1784458656058_try1.log
+2026-07-19 19:57:36,060 INFO  Wrote summary to C:\Users\admin\Documents\minXfmr.cpp\scripts\transpose_search_logs\summary.json
+2026-07-19 19:57:36,060 INFO  Best candidate: {'score': -1, 'mask': None, 'log': None, 'cmd': None}
+2026-07-19 19:58:13,492 INFO  start_mask=0 max_masks=16 timeout=240s cooldown=1.0s priority=idle
+2026-07-19 19:58:13,492 INFO  cpu thread limits set to 4
+2026-07-19 19:58:13,492 INFO  Fetching model vocab via CLI --emit-vocab
+2026-07-19 19:58:45,581 INFO  Loaded vocab size=32000
+2026-07-19 19:58:45,581 INFO  Running mask=0 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 19:59:29,621 INFO  mask=0 attempt=1 score=925 timed_out=False rc=0
+2026-07-19 19:59:30,622 INFO  Running mask=1 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 20:00:15,187 INFO  mask=1 attempt=1 score=925 timed_out=False rc=0
+2026-07-19 20:00:16,188 INFO  Running mask=2 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --no-transpose-wq --transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 20:01:01,120 INFO  mask=2 attempt=1 score=925 timed_out=False rc=0
+2026-07-19 20:01:02,121 INFO  Running mask=3 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --transpose-wq --transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 20:01:46,880 INFO  mask=3 attempt=1 score=925 timed_out=False rc=0
+2026-07-19 20:01:47,881 INFO  Running mask=4 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --no-transpose-wq --no-transpose-wk --transpose-wv --no-transpose-wo
+2026-07-19 20:02:31,747 INFO  mask=4 attempt=1 score=925 timed_out=False rc=0
+2026-07-19 20:02:32,747 INFO  Running mask=5 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --transpose-wq --no-transpose-wk --transpose-wv --no-transpose-wo
+2026-07-19 20:03:17,628 INFO  mask=5 attempt=1 score=925 timed_out=False rc=0
+2026-07-19 20:03:18,628 INFO  Running mask=6 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --no-transpose-wq --transpose-wk --transpose-wv --no-transpose-wo
+2026-07-19 20:04:02,923 INFO  mask=6 attempt=1 score=925 timed_out=False rc=0
+2026-07-19 20:04:03,924 INFO  Running mask=7 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --transpose-wq --transpose-wk --transpose-wv --no-transpose-wo
+2026-07-19 20:04:48,481 INFO  mask=7 attempt=1 score=925 timed_out=False rc=0
+2026-07-19 20:04:49,481 INFO  Running mask=8 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --transpose-wo
+2026-07-19 20:05:34,302 INFO  mask=8 attempt=1 score=775 timed_out=False rc=0
+2026-07-19 20:05:35,302 INFO  Running mask=9 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --transpose-wq --no-transpose-wk --no-transpose-wv --transpose-wo
+2026-07-19 20:06:20,184 INFO  mask=9 attempt=1 score=775 timed_out=False rc=0
+2026-07-19 20:06:21,184 INFO  Running mask=10 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --no-transpose-wq --transpose-wk --no-transpose-wv --transpose-wo
+2026-07-19 20:07:06,337 INFO  mask=10 attempt=1 score=775 timed_out=False rc=0
+2026-07-19 20:07:07,338 INFO  Running mask=11 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --transpose-wq --transpose-wk --no-transpose-wv --transpose-wo
+2026-07-19 20:07:51,823 INFO  mask=11 attempt=1 score=775 timed_out=False rc=0
+2026-07-19 20:07:52,824 INFO  Running mask=12 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --no-transpose-wq --no-transpose-wk --transpose-wv --transpose-wo
+2026-07-19 20:08:37,625 INFO  mask=12 attempt=1 score=775 timed_out=False rc=0
+2026-07-19 20:08:38,625 INFO  Running mask=13 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --transpose-wq --no-transpose-wk --transpose-wv --transpose-wo
+2026-07-19 20:09:23,507 INFO  mask=13 attempt=1 score=775 timed_out=False rc=0
+2026-07-19 20:09:24,508 INFO  Running mask=14 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --no-transpose-wq --transpose-wk --transpose-wv --transpose-wo
+2026-07-19 20:10:09,354 INFO  mask=14 attempt=1 score=775 timed_out=False rc=0
+2026-07-19 20:10:10,355 INFO  Running mask=15 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --transpose-wq --transpose-wk --transpose-wv --transpose-wo
+2026-07-19 20:10:55,070 INFO  mask=15 attempt=1 score=775 timed_out=False rc=0
+2026-07-19 20:10:55,071 INFO  Wrote summary to C:\Users\admin\Documents\minXfmr.cpp\scripts\transpose_search_logs\summary.json
+2026-07-19 20:10:55,071 INFO  Verifying best mask=0 with 1 runs at 24 tokens
+2026-07-19 20:10:55,072 INFO  verify run 1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 24 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 20:11:46,040 INFO  Verification results appended to C:\Users\admin\Documents\minXfmr.cpp\scripts\transpose_search_logs\summary.json
+2026-07-19 20:11:46,041 INFO  Best candidate: {'score': 925, 'mask': 0, 'log': 'scripts\\transpose_search_logs\\result_0_1784458725581_try1.log', 'cmd': "'build\\src\\Release\\minxfmr_cli.exe' 'build\\src\\Release\\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 16 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo"}
+2026-07-19 20:20:59,987 INFO  start_mask=0 max_masks=1 timeout=600s cooldown=1.0s priority=idle
+2026-07-19 20:20:59,987 INFO  cpu thread limits set to 4
+2026-07-19 20:20:59,987 INFO  Fetching model vocab via CLI --emit-vocab
+2026-07-19 20:21:32,343 INFO  Loaded vocab size=32000
+2026-07-19 20:21:32,343 INFO  Running mask=0 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 64 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 20:22:54,008 INFO  mask=0 attempt=1 score=928 timed_out=False rc=0
+2026-07-19 20:22:54,010 INFO  Wrote summary to C:\Users\admin\Documents\minXfmr.cpp\scripts\transpose_search_logs\summary.json
+2026-07-19 20:22:54,010 INFO  Verifying best mask=0 with 3 runs at 64 tokens
+2026-07-19 20:22:54,010 INFO  verify run 1 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 64 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 20:24:15,375 INFO  verify run 2 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 64 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 20:25:37,040 INFO  verify run 3 -> 'build\src\Release\minxfmr_cli.exe' 'build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 64 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 20:26:58,618 INFO  Verification results appended to C:\Users\admin\Documents\minXfmr.cpp\scripts\transpose_search_logs\summary.json
+2026-07-19 20:26:58,618 INFO  Best candidate: {'score': 928, 'mask': 0, 'log': 'scripts\\transpose_search_logs\\result_0_1784460092343_try1.log', 'cmd': "'build\\src\\Release\\minxfmr_cli.exe' 'build\\src\\Release\\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 64 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo"}
+2026-07-19 20:53:54,020 INFO  start_mask=0 max_masks=4 timeout=240s cooldown=3.0s priority=below_normal
+2026-07-19 20:53:54,020 INFO  cpu thread limits set to 4
+2026-07-19 20:53:54,020 INFO  Running mask=0 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'C:\Users\admin\Documents\minXfmr.cpp\build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 20:54:32,944 INFO  mask=0 attempt=1 score=600 timed_out=False rc=0
+2026-07-19 20:54:35,945 INFO  Running mask=1 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'C:\Users\admin\Documents\minXfmr.cpp\build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 20:55:14,743 INFO  mask=1 attempt=1 score=600 timed_out=False rc=0
+2026-07-19 20:55:17,744 INFO  Running mask=2 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'C:\Users\admin\Documents\minXfmr.cpp\build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --no-transpose-wq --transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 20:55:56,842 INFO  mask=2 attempt=1 score=600 timed_out=False rc=0
+2026-07-19 20:55:59,843 INFO  Running mask=3 attempt=1 -> 'build\src\Release\minxfmr_cli.exe' 'C:\Users\admin\Documents\minXfmr.cpp\build\src\Release\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --transpose-wq --transpose-wk --no-transpose-wv --no-transpose-wo
+2026-07-19 20:56:40,031 INFO  mask=3 attempt=1 score=600 timed_out=False rc=0
+2026-07-19 20:56:40,033 INFO  Wrote summary to C:\Users\admin\Documents\minXfmr.cpp\scripts\transpose_search_logs\summary.json
+2026-07-19 20:56:40,033 INFO  Best candidate: {'score': 600, 'mask': 0, 'log': 'scripts\\transpose_search_logs\\result_0_1784462034020_try1.log', 'cmd': "'build\\src\\Release\\minxfmr_cli.exe' 'C:\\Users\\admin\\Documents\\minXfmr.cpp\\build\\src\\Release\\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo"}

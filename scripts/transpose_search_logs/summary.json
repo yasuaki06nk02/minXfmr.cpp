@@ -1,0 +1,86 @@
+{
+  "runs": [
+    {
+      "mask": 0,
+      "attempts": [
+        {
+          "attempt": 1,
+          "log": "scripts\\transpose_search_logs\\result_0_1784462034020_try1.log",
+          "score": 600,
+          "timed_out": false,
+          "returncode": 0
+        }
+      ],
+      "best_attempt": {
+        "attempt": 1,
+        "log": "scripts\\transpose_search_logs\\result_0_1784462034020_try1.log",
+        "score": 600,
+        "timed_out": false,
+        "returncode": 0
+      }
+    },
+    {
+      "mask": 1,
+      "attempts": [
+        {
+          "attempt": 1,
+          "log": "scripts\\transpose_search_logs\\result_1_1784462075945_try1.log",
+          "score": 600,
+          "timed_out": false,
+          "returncode": 0
+        }
+      ],
+      "best_attempt": {
+        "attempt": 1,
+        "log": "scripts\\transpose_search_logs\\result_1_1784462075945_try1.log",
+        "score": 600,
+        "timed_out": false,
+        "returncode": 0
+      }
+    },
+    {
+      "mask": 2,
+      "attempts": [
+        {
+          "attempt": 1,
+          "log": "scripts\\transpose_search_logs\\result_2_1784462117744_try1.log",
+          "score": 600,
+          "timed_out": false,
+          "returncode": 0
+        }
+      ],
+      "best_attempt": {
+        "attempt": 1,
+        "log": "scripts\\transpose_search_logs\\result_2_1784462117744_try1.log",
+        "score": 600,
+        "timed_out": false,
+        "returncode": 0
+      }
+    },
+    {
+      "mask": 3,
+      "attempts": [
+        {
+          "attempt": 1,
+          "log": "scripts\\transpose_search_logs\\result_3_1784462159843_try1.log",
+          "score": 600,
+          "timed_out": false,
+          "returncode": 0
+        }
+      ],
+      "best_attempt": {
+        "attempt": 1,
+        "log": "scripts\\transpose_search_logs\\result_3_1784462159843_try1.log",
+        "score": 600,
+        "timed_out": false,
+        "returncode": 0
+      }
+    }
+  ],
+  "best": {
+    "score": 600,
+    "mask": 0,
+    "log": "scripts\\transpose_search_logs\\result_0_1784462034020_try1.log",
+    "cmd": "'build\\src\\Release\\minxfmr_cli.exe' 'C:\\Users\\admin\\Documents\\minXfmr.cpp\\build\\src\\Release\\tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf' --temp 0 --top_k 1 --max-gen-tokens 8 --prompt hello --no-transpose-wq --no-transpose-wk --no-transpose-wv --no-transpose-wo"
+  }
+}

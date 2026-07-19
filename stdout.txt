@@ -1,0 +1,2 @@
+Entering chat mode. Type 'reset' to clear history, 'exit' to quit.
+you> assistant> 
