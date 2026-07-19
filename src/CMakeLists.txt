@@ -5,6 +5,7 @@ add_library(minxfmr STATIC
     transformer/rmsnorm.cpp
     transformer/rope.cpp
     transformer/attention.cpp
+    transformer/softmax.cpp
     transformer/feed_forward.cpp
     transformer/transformer.cpp
     tokenizer/tokenizer.cpp

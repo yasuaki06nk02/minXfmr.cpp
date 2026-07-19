@@ -5,6 +5,7 @@
 #include <vector>
 #include <cmath>
 #include <string>
+#include <cassert>
 #include "minxfmr.h"
 #include "../tokenizer/tokenizer.h"
 #include "../cache/kv_cache.h"
@@ -88,14 +89,16 @@ static Tensor* token_embedding_row(const minxfmr_context* ctx, int token_id) {
     const Tensor* emb = ctx->Wemb;
     const size_t dim = ctx->model_dim > 0 ? ctx->model_dim : ((emb->rows > emb->cols) ? emb->cols : emb->rows);
 
+    // If embeddings are stored as rows (rows >= cols) we can return a lightweight
+    // view into the backing storage instead of copying the row.
     if (emb->rows >= emb->cols) {
         if ((size_t)token_id >= emb->rows) token_id = (int)((size_t)token_id % emb->rows);
-        Tensor* row = tensor_create_f32(1, emb->cols);
-        if (!row) return nullptr;
-        memcpy(row->data, (const float*)emb->data + (size_t)token_id * emb->cols, sizeof(float) * emb->cols);
-        return row;
+        float* ptr = (float*)emb->data + (size_t)token_id * emb->cols;
+        Tensor* view = tensor_create_f32_view(1, emb->cols, ptr);
+        return view;
     }
 
+    // Otherwise the token vectors are laid out in columns; fall back to copying.
     if ((size_t)token_id >= emb->cols) token_id = (int)((size_t)token_id % emb->cols);
     Tensor* row = tensor_create_f32(1, emb->rows);
     if (!row) return nullptr;
@@ -221,6 +224,8 @@ static void log_vocab_specials(const std::vector<std::string>& vocab) {
 static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor* output) {
     if (!ctx || !input || !output) return false;
     if (input->type != DataType::F32 || output->type != DataType::F32) return false;
+    // Transformer hidden size must match the model config when available.
+    if (ctx->model_dim > 0) assert(input->cols == ctx->model_dim);
 
     Tensor* cur = tensor_clone_f32_local(input);
     if (!cur) return false;

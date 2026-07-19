@@ -10,6 +10,7 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
+#include <cassert>
 
 static bool g_transpose_square_wq = false;
 static bool g_transpose_square_wk = false;
@@ -185,6 +186,13 @@ bool transformer_forward_single_layer(
     size_t d = input->cols;
     if (output->rows != seq || output->cols != d) return false;
 
+    // If caller provided projection weights, they must be compatible with the
+    // input hidden dimension `d` (either rows==d or cols==d depending on layout).
+    if (Wq_in) assert(Wq_in->rows == d || Wq_in->cols == d);
+    if (Wk_in) assert(Wk_in->rows == d || Wk_in->cols == d);
+    if (Wv_in) assert(Wv_in->rows == d || Wv_in->cols == d);
+    if (Wo_in) assert(Wo_in->rows == d || Wo_in->cols == d);
+
     // Allocate temporaries
     Tensor* norm = tensor_create_f32(seq, d);
     if (!norm) return false;
@@ -220,6 +228,10 @@ bool transformer_forward_single_layer(
         tensor_free(norm);
         return false;
     }
+
+    // Attention head size checks: hidden size must be divisible by number of heads.
+    if (n_head > 0) assert(model_dim % n_head == 0);
+    if (n_head_kv > 0) assert(kv_dim % n_head_kv == 0);
 
     size_t use_n_head = n_head;
     size_t use_n_head_kv = n_head_kv;
@@ -365,6 +377,8 @@ bool transformer_forward_single_layer(
             bool g_ok = project_with_weight(ffn_norm, Wffn_gate_in, gate, false);
             bool u_ok = project_with_weight(ffn_norm, Wffn_up_in, up, false);
             if (g_ok && u_ok && gate && up && gate->rows == up->rows && gate->cols == up->cols) {
+                // Ensure gate and up projections have identical shapes.
+                assert(gate->rows == up->rows && gate->cols == up->cols);
                 fused = tensor_create_f32(gate->rows, gate->cols);
                 if (fused) {
                     float* fd = (float*)fused->data;
