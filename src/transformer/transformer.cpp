@@ -5,6 +5,7 @@
 #include "../cache/kv_cache.h"
 #include "feed_forward.h"
 #include "../backend/cpu/cpu_backend.h"
+#include "softmax.h"
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
@@ -133,21 +134,7 @@ static inline float silu_f32(float x) {
     return x / (1.0f + expf(-x));
 }
 
-static void softmax_row(float* row, size_t len) {
-    if (!row || len == 0) return;
-    float maxv = row[0];
-    for (size_t i = 1; i < len; ++i) {
-        if (row[i] > maxv) maxv = row[i];
-    }
-    double sum = 0.0;
-    for (size_t i = 0; i < len; ++i) {
-        row[i] = expf(row[i] - maxv);
-        sum += row[i];
-    }
-    if (sum <= 0.0) return;
-    const float inv = (float)(1.0 / sum);
-    for (size_t i = 0; i < len; ++i) row[i] *= inv;
-}
+// softmax_row is provided by src/transformer/softmax.cpp
 
 static bool apply_norm_scale(Tensor* x, const Tensor* w) {
     if (!x || !w || x->type != DataType::F32 || w->type != DataType::F32) return false;

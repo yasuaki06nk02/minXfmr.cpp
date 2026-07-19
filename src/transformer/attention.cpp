@@ -5,6 +5,7 @@
 #include "../cache/kv_cache.h"
 #include "../io/gguf_loader.h"
 #include "../backend/cpu/cpu_backend.h"
+#include "softmax.h"
 
 static bool attention_debug_once = false;
 
@@ -33,14 +34,7 @@ bool attention_qk(const Tensor* Q, const Tensor* K, Tensor* out) {
     return true;
 }
 
-static void softmax_row(float* row, size_t len) {
-    double m = -1e300;
-    for (size_t i=0;i<len;++i) if (row[i] > m) m = row[i];
-    double s = 0.0;
-    for (size_t i=0;i<len;++i) { row[i] = (float)exp(row[i]-m); s += row[i]; }
-    if (s == 0.0) return;
-    for (size_t i=0;i<len;++i) row[i] = (float)(row[i]/s);
-}
+// softmax_row provided by src/transformer/softmax.cpp
 
 bool attention_apply_with_cache(const Tensor* Q, const struct KVCache* cache, size_t layer, Tensor* out) {
     if (!Q || !cache || !out) return false;
