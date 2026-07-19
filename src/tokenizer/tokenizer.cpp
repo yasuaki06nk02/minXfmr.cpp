@@ -25,6 +25,43 @@ static std::vector<int>   g_vocab_types;
 static size_t g_max_token_len = 0;
 static const std::string kSpmMarker("\xE2\x96\x81");
 
+struct TrieNode {
+    int token_id;
+    std::unordered_map<unsigned char,int> children;
+    TrieNode() : token_id(-1), children() {}
+};
+
+static std::vector<TrieNode> g_trie;
+
+static void trie_clear() {
+    g_trie.clear();
+    g_trie.emplace_back(); // root
+}
+
+static void trie_insert(const std::string &tok, int id) {
+    if (tok.empty()) return;
+    int node = 0;
+    for (unsigned char uc : tok) {
+        auto it = g_trie[node].children.find(uc);
+        if (it == g_trie[node].children.end()) {
+            int nxt = (int)g_trie.size();
+            g_trie[node].children[uc] = nxt;
+            g_trie.emplace_back();
+            node = nxt;
+        } else {
+            node = it->second;
+        }
+    }
+    g_trie[node].token_id = id;
+}
+
+static void trie_build_from_vocab() {
+    trie_clear();
+    for (size_t i = 0; i < g_vocab.size(); ++i) {
+        trie_insert(g_vocab[i], (int)i);
+    }
+}
+
 static std::string normalize_text_for_tokenizer(const std::string& s_in) {
 #if defined(_WIN32) && defined(MINXFMR_HAS_NORMALIZ)
     // Use Windows Normaliz API to normalize to NFKC where available
@@ -108,6 +145,7 @@ bool tokenizer_load_from_list(const std::vector<std::string>& vocab) {
         g_vid[g_vocab[i]] = (int)i;
         if (g_vocab[i].size() > g_max_token_len) g_max_token_len = g_vocab[i].size();
     }
+    trie_build_from_vocab();
     return true;
 }
 
@@ -120,6 +158,7 @@ bool tokenizer_load_from_gguf(const GGUF_File& gf) {
         g_vid[g_vocab[i]] = (int)i;
         if (g_vocab[i].size() > g_max_token_len) g_max_token_len = g_vocab[i].size();
     }
+    trie_build_from_vocab();
 
     // load optional scores
     g_vocab_scores.clear();
@@ -152,6 +191,7 @@ void tokenizer_add_special_tokens(const std::vector<std::string>& toks) {
         g_vocab.push_back(t);
         g_vid[t] = (int)g_vocab.size() - 1;
         if (t.size() > g_max_token_len) g_max_token_len = t.size();
+        trie_insert(t, g_vid[t]);
     }
 }
 
@@ -173,19 +213,25 @@ std::vector<int> tokenizer_encode(const std::string& text) {
 
     auto match_exact_prefix = [&](const std::string& src, size_t pos, size_t& matched_len) -> int {
         matched_len = 0;
-        if (g_vid.empty() || pos >= src.size() || g_max_token_len == 0) return -1;
-        size_t remaining = src.size() - pos;
-        size_t max_len = g_max_token_len < remaining ? g_max_token_len : remaining;
-        // scan from longest to shortest for longest-match first
-        for (size_t len = max_len; len > 0; --len) {
-            std::string sub = src.substr(pos, len);
-            auto it = g_vid.find(sub);
-            if (it != g_vid.end()) {
-                matched_len = len;
-                return it->second;
+        if (g_trie.empty() || pos >= src.size()) return -1;
+        int node = 0;
+        int best_id = -1;
+        size_t best_len = 0;
+        size_t i = pos;
+        while (i < src.size()) {
+            unsigned char uc = (unsigned char)src[i];
+            auto it = g_trie[node].children.find(uc);
+            if (it == g_trie[node].children.end()) break;
+            node = it->second;
+            ++i;
+            if (g_trie[node].token_id >= 0) {
+                best_id = g_trie[node].token_id;
+                best_len = i - pos;
+                if (best_len == g_max_token_len) break;
             }
         }
-        return -1;
+        matched_len = best_len;
+        return best_id;
     };
 
     auto push_unknown_or_byte = [&](unsigned char b) {
