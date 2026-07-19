@@ -91,3 +91,9 @@ desktop.ini
 *.key
 
 # Keep .gitattributes tracked (do not ignore)
+
+# Ignore .out artifacts produced by scripts/tests
+*.out
+
+# Ignore result mask JSON logs generated during experiments
+result_mask*.json
