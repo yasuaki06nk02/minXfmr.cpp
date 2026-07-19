@@ -4,6 +4,7 @@
 #include <vector>
 #include "../cache/kv_cache.h"
 #include "../io/gguf_loader.h"
+#include "../backend/cpu/cpu_backend.h"
 
 static bool attention_debug_once = false;
 
@@ -56,7 +57,7 @@ bool attention_apply_with_cache(const Tensor* Q, const struct KVCache* cache, si
     const float* v = (const float*)V->data;
     float* o = (float*)out->data;
     // temp scores per q row
-    std::vector<float> scores(k_rows);
+    float* scores = cpu_workspace(k_rows);
     if (attention_debug_once) {
         const char* wkname = gguf_last_tensor_name("Wk");
         const char* wvname = gguf_last_tensor_name("Wv");
@@ -79,7 +80,7 @@ bool attention_apply_with_cache(const Tensor* Q, const struct KVCache* cache, si
             for (size_t t=0;t<d;++t) s += (double)q[i*d + t] * (double)k[j*d + t];
             scores[j] = (float)s;
         }
-        softmax_row(scores.data(), k_rows);
+        softmax_row(scores, k_rows);
         if (k_rows > 0 && q_rows <= 2) {
             fprintf(stderr, "[attention] scores for q=%zu:", i);
             for (size_t jj=0;jj<std::min((size_t)4,k_rows);++jj) fprintf(stderr, " %0.3f", scores[jj]);
@@ -106,7 +107,7 @@ bool attention_apply_direct(const Tensor* Q, const Tensor* K, const Tensor* V, T
     const float* k = (const float*)K->data;
     const float* v = (const float*)V->data;
     float* o = (float*)out->data;
-    std::vector<float> scores(k_rows);
+    float* scores = cpu_workspace(k_rows);
     for (size_t i=0;i<q_rows;++i) {
         // K is expected row-major k_rows x d
         for (size_t j=0;j<k_rows;++j) {
@@ -114,7 +115,7 @@ bool attention_apply_direct(const Tensor* Q, const Tensor* K, const Tensor* V, T
             for (size_t t=0;t<d;++t) s += (double)q[i*d + t] * (double)k[j*d + t];
             scores[j] = (float)s;
         }
-        softmax_row(scores.data(), k_rows);
+        softmax_row(scores, k_rows);
         for (size_t t=0;t<d;++t) {
             double acc = 0.0;
             for (size_t j=0;j<k_rows;++j) acc += (double)scores[j] * (double)v[j*d + t];

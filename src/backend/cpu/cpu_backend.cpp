@@ -94,3 +94,9 @@ bool cpu_add(const Tensor* a, const Tensor* b, Tensor* out) {
     for (size_t i = 0; i < elems; ++i) od[i] = ad[i] + bd[i];
     return true;
 }
+
+float* cpu_workspace(size_t n) {
+    thread_local std::vector<float> s_workspace;
+    if (s_workspace.size() < n) s_workspace.resize(n);
+    return s_workspace.data();
+}

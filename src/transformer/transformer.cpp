@@ -304,7 +304,7 @@ bool transformer_forward_single_layer(
     const float* kd = (const float*)Kconcat->data;
     const float* vd = (const float*)Vconcat->data;
     float* od = (float*)attn_out->data;
-    std::vector<float> scores(cached_rows + seq);
+    float* scores = cpu_workspace(cached_rows + seq);
     const size_t group = use_n_head / use_n_head_kv;
     const float score_scale = 1.0f / sqrtf((float)head_dim);
 
@@ -321,7 +321,7 @@ bool transformer_forward_single_layer(
                 }
                 scores[j] = (float)s * score_scale;
             }
-            softmax_row(scores.data(), cached_rows + seq);
+            softmax_row(scores, cached_rows + seq);
             for (size_t t = 0; t < head_dim; ++t) {
                 double acc = 0.0;
                 for (size_t j = 0; j < cached_rows + seq; ++j) {
