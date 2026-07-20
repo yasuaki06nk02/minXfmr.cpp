@@ -330,6 +330,10 @@ bool transformer_forward_single_layer(
                 return false;
             }
             for (size_t j = 0; j < J; ++j) scores[j] *= score_scale;
+
+            const size_t q_pos = cached_rows + qi;
+            for (size_t j = q_pos + 1; j < J; ++j) scores[j] = -1e30f;
+
             softmax_row(scores, J);
 
             // outvec = scores^T * V_submatrix  (produces head_dim values)

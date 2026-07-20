@@ -258,6 +258,7 @@ int main(int argc, char** argv) {
         tensor_free(t);
     }
 
+
     // Phase2: CPU backend test (matrix multiply)
     Tensor* A = tensor_create_f32(2,2);
     Tensor* B = tensor_create_f32(2,2);
@@ -350,6 +351,63 @@ int main(int argc, char** argv) {
     }
     }
 
+    auto sanitize_assistant_text = [](const std::string& text) {
+        static const std::vector<std::string> markers = {
+            "<s>", "</s>", "[INST]", "[/INST]", "<|assistant|>", "<|user|>",
+            "<assistant>", "<user>", "[/ASSISTANT]", "[/USER]", "<<SYS>>", "<</SYS>>", "speaker"
+        };
+        std::string out;
+        out.reserve(text.size());
+        for (size_t i = 0; i < text.size(); ) {
+            bool matched = false;
+            for (const std::string& marker : markers) {
+                if (text.compare(i, marker.size(), marker) == 0) {
+                    i += marker.size();
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) out.push_back(text[i++]);
+        }
+        return out;
+    };
+
+    auto is_suspicious_assistant_text = [](const std::string& text) {
+        static const std::vector<std::string> markers = {
+            "<s>", "</s>", "[INST]", "[/INST]", "<|assistant|>", "<|user|>",
+            "<assistant>", "<user>", "[/ASSISTANT]", "[/USER]", "<<SYS>>", "<</SYS>>",
+            "speaker", "SYSTEMMODULE", "INST", "USER", "ASSISTANT", "SYS"
+        };
+        for (const std::string& marker : markers) {
+            if (text.find(marker) != std::string::npos) return true;
+        }
+        return false;
+    };
+
+    auto should_store_assistant_text = [](const std::string& text) {
+        if (text.empty()) return false;
+        if (text.find("```") != std::string::npos) return false;
+        if (text.find("Explanation:") != std::string::npos) return false;
+        if (text.find("String.") != std::string::npos) return false;
+        if (text.find("|>") != std::string::npos) return false;
+        if (text.find("[|") != std::string::npos) return false;
+
+        size_t line_count = 1;
+        size_t non_space = 0;
+        size_t alpha_num = 0;
+        for (unsigned char c : text) {
+            if (c == '\n') ++line_count;
+            if (c != ' ' && c != '\t' && c != '\r' && c != '\n') ++non_space;
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+                ++alpha_num;
+            }
+        }
+        if (non_space == 0) return false;
+        if (line_count > 4) return false;
+        if (alpha_num * 2 < non_space) return false;
+        return true;
+    };
+
             if (run_once && !chat_mode) {
                 if (debug_attn_once) attention_set_debug_once(true);
                 minxfmr_generate(ctx, prompt, print_callback, temperature, top_k);
@@ -366,6 +424,10 @@ int main(int argc, char** argv) {
                 if (strcmp(line, "exit") == 0) break;
                 if (strcmp(line, "reset") == 0) { history.clear(); minxfmr_reset(ctx); printf("history reset\n"); continue; }
                 if (strlen(line) == 0) continue;
+                if ((history.size() % 2) != 0) {
+                    fprintf(stderr, "[main] dropping stray history entry to preserve user/assistant pairing\n");
+                    history.pop_back();
+                }
                 std::string assembled;
                 if (model_chat_template && model_chat_template[0] != '\0') {
                     // build history blob
@@ -420,7 +482,7 @@ int main(int argc, char** argv) {
                 // Optional debug mode can still run all candidate templates.
                 if (!(model_chat_template && model_chat_template[0] != '\0') && try_all_templates) {
                     std::vector<std::string> candidates = {
-                        "<s>[INST] {{SYSTEM}}\n{{HISTORY}}{{USER}} [/INST]",
+                        "<s>[INST] <<SYS>>\n{{SYSTEM}}\n<</SYS>>\n\n{{HISTORY}}{{USER}} [/INST]",
                         "[INST]{{SYSTEM}}\n{{HISTORY}}{{USER}}[/INST]",
                         "<s>{{SYSTEM}}\n{{HISTORY}}User: {{USER}}\nAssistant:\n",
                         "<s>[INST] {{USER}} [/INST]",
@@ -446,22 +508,34 @@ int main(int argc, char** argv) {
                         // run generation for this template
                         gen_outbuf_global.clear();
                         printf("assistant(template %zu)> ", ci);
+                        minxfmr_reset(ctx);
                         minxfmr_generate(ctx, tpl.c_str(), gen_collect_callback, temperature, top_k);
                         printf("\n");
                         fprintf(stderr, "[main] tpl %zu output: %s\n", ci, gen_outbuf_global.c_str());
                     }
                     // push only the raw line into history as before
-                    history.push_back(line);
-                    history.push_back(gen_outbuf_global);
+                    std::string sanitized = sanitize_assistant_text(gen_outbuf_global);
+                    if (!sanitized.empty() && !is_suspicious_assistant_text(sanitized) && should_store_assistant_text(sanitized)) {
+                        history.push_back(line);
+                        history.push_back(sanitized);
+                    } else {
+                        fprintf(stderr, "[main] skipping history store for template reply due to suspicious/empty assistant text\n");
+                    }
                     continue;
                 }
                 gen_outbuf_global.clear();
                 printf("assistant> ");
                 if (debug_attn_once) attention_set_debug_once(true);
+                minxfmr_reset(ctx);
                 minxfmr_generate(ctx, assembled.c_str(), gen_collect_callback, temperature, top_k);
                 printf("\n");
-                history.push_back(line);
-                history.push_back(gen_outbuf_global);
+                std::string sanitized = sanitize_assistant_text(gen_outbuf_global);
+                if (!sanitized.empty() && !is_suspicious_assistant_text(sanitized) && should_store_assistant_text(sanitized)) {
+                    history.push_back(line);
+                    history.push_back(sanitized);
+                } else {
+                    fprintf(stderr, "[main] skipping history store due to suspicious/empty assistant text\n");
+                }
                 
             }
         } else {

@@ -41,6 +41,7 @@ struct minxfmr_context {
     size_t n_head;
     size_t n_head_kv;
     size_t seq_max;
+    std::vector<float> scores_workspace;
     int dummy;
     // optional metadata
     std::string chat_template;
@@ -55,11 +56,17 @@ static std::string render_token_piece(const std::string& piece) {
     std::string out;
     out.reserve(piece.size() + 1);
     const std::string spm = "\xE2\x96\x81"; // U+2581
+    const std::string spm2 = "\xC4\xA0"; // U+0120 (Latin capital G with dot)
     size_t i = 0;
     while (i < piece.size()) {
         if (i + spm.size() <= piece.size() && piece.compare(i, spm.size(), spm) == 0) {
             out.push_back(' ');
             i += spm.size();
+            continue;
+        }
+        if (i + spm2.size() <= piece.size() && piece.compare(i, spm2.size(), spm2) == 0) {
+            out.push_back(' ');
+            i += spm2.size();
             continue;
         }
         out.push_back(piece[i]);
@@ -237,19 +244,6 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
     }
     if (ctx->cache && layers_to_run > ctx->cache->layers) layers_to_run = ctx->cache->layers;
 
-    // Preallocate a single contiguous workspace for attention score buffers
-    // across all layers to avoid repeated allocator resizes.
-    size_t total_scores_needed = 0;
-    for (size_t ll = 0; ll < layers_to_run; ++ll) {
-        size_t cached = 0;
-        if (ctx->cache && ctx->cache->keys.size() > ll && ctx->cache->keys[ll] != nullptr) cached = ctx->cache->lengths[ll];
-        total_scores_needed += cached + cur->rows;
-    }
-    float* all_scores_workspace = nullptr;
-    if (total_scores_needed > 0) all_scores_workspace = cpu_request_workspace(total_scores_needed);
-
-    size_t scores_off = 0;
-
     for (size_t l = 0; l < layers_to_run; ++l) {
         Tensor* nxt = tensor_create_f32(cur->rows, cur->cols);
         if (!nxt) {
@@ -281,16 +275,8 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
             Wfd = ctx->Wffn_down_layers[l];
         }
 
-        size_t cached_rows = 0;
-        if (ctx->cache && ctx->cache->keys.size() > l && ctx->cache->keys[l] != nullptr) cached_rows = ctx->cache->lengths[l];
-        size_t J = cached_rows + cur->rows;
-        float* scores_buf = nullptr;
-        size_t scores_len = 0;
-        if (all_scores_workspace && J > 0) {
-            scores_buf = all_scores_workspace + scores_off;
-            scores_len = J;
-            scores_off += J;
-        }
+        float* scores_buf = ctx->scores_workspace.data();
+        size_t scores_len = ctx->scores_workspace.size();
 
         bool ok = transformer_forward_single_layer(cur, nxt, ctx->cache, l, ctx->n_head, ctx->n_head_kv, Wq, Wk, Wv, Wo, WattnNorm, WffnNorm, Wfg, Wfu, Wfd, scores_buf, scores_len);
         tensor_free(cur);
@@ -714,6 +700,11 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
 
     fprintf(stderr, "[minxfmr] runtime config model_dim=%zu kv_dim=%zu layers=%zu seq_max=%zu\n",
         ctx->model_dim, ctx->kv_dim, ctx->n_layer, ctx->seq_max);
+
+    // Preallocate scores workspace for attention.
+    // Length J = cached_rows + seq. Max value is approx seq_max.
+    ctx->scores_workspace.assign(ctx->seq_max + 128, 0.0f);
+
     fprintf(stderr, "minxfmr: opened model %s\n", model_path);
     return ctx;
 }
@@ -773,7 +764,10 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         return s == "</s>" || s == "<|endoftext|>" || s == "<|pad|>";
     };
     auto is_role_token = [](const std::string &s) {
-        return s == "<s>" || s == "[INST]" || s == "[/INST]" || s == "<|assistant|>" || s == "<|user|>" || s == "<<SYS>>" || s == "<</SYS>>";
+        return s == "<s>" || s == "</s>" || s == "[INST]" || s == "[/INST]" ||
+               s == "<|assistant|>" || s == "<|user|>" || s == "<assistant>" || s == "<user>" ||
+               s == "[/ASSISTANT]" || s == "[/USER]" || s == "speaker" || s == "<speaker>" ||
+               s == "<<SYS>>" || s == "<</SYS>>";
     };
     if (top_k <= 0) top_k = 1;
     static std::mt19937 rng((unsigned)std::random_device{}());
@@ -795,6 +789,12 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     }
     std::vector<int> gen_ids;
     std::vector<std::string> gen_token_strs;
+    // Buffer for consecutive byte-fallback tokens like <0xE3><0x81>...
+    std::vector<unsigned char> pending_bytes;
+    // Buffer for recently-seen token fragments that may form a role/template
+    // marker split across several token ids (e.g. '[', 'INST', ']'). Each
+    // entry holds the token id and its raw token string.
+    std::vector<std::pair<int,std::string>> pending_token_buf;
     // Preallocate a reusable workspace for logits chunking to avoid repeated
     // cpu_request_workspace calls inside the token loop.
     const size_t OUT_CHUNK = 4096;
@@ -810,7 +810,11 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     int t = 0;
     std::string gen_break_reason = "none";
     int gen_tokens_emitted = 0;
+    std::string last_emitted_raw_tok;
+    int repeat_run = 0;
     for (t = 0; t < max_steps; ++t) {
+        fprintf(stderr, "[minxfmr] gen loop step=%d last=%d emitted=%d\n", t, last, gen_tokens_emitted);
+        fflush(stderr);
         Tensor* in = nullptr;
         Tensor* out = nullptr;
         int next = 0;
@@ -823,7 +827,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             if (in && out) run_stack_forward(ctx, in, out);
         }
 
-        if (!out) { gen_break_reason = "no_out"; break; }
+        if (!out) { fprintf(stderr, "[minxfmr] no output tensor at step=%d last=%d\n", t, last); fflush(stderr); gen_break_reason = "no_out"; break; }
 
         if (ctx->Wnorm) apply_final_norm_inplace(out, ctx->Wnorm);
 
@@ -932,10 +936,57 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         }
 
         std::string raw_tok = tokenizer_id_to_token(next);
+        double chosen_logit = 0.0;
+        if (next >= 0 && (size_t)next < logits.size()) chosen_logit = logits[(size_t)next];
+        std::string preview = render_token_piece(raw_tok);
+
+        auto is_visible_piece = [](const std::string& s) {
+            if (s.empty()) return false;
+            for (unsigned char c : s) {
+                if (c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != '\v' && c != '\f') return true;
+            }
+            return false;
+        };
+
+        if (gen_tokens_emitted == 0 && (!is_visible_piece(preview) || is_eos_token(raw_tok) || is_role_token(raw_tok))) {
+            for (int i = 1; i < k_use; ++i) {
+                int alt = order[(size_t)i];
+                std::string alt_raw = tokenizer_id_to_token(alt);
+                std::string alt_preview = render_token_piece(alt_raw);
+                if (is_visible_piece(alt_preview) && !is_eos_token(alt_raw) && !is_role_token(alt_raw)) {
+                    next = alt;
+                    raw_tok = alt_raw;
+                    if (next >= 0 && (size_t)next < logits.size()) chosen_logit = logits[(size_t)next];
+                    preview = alt_preview;
+                    fprintf(stderr, "[minxfmr] avoided empty first token, switched to id=%d raw='%s'\n", next, raw_tok.c_str());
+                    break;
+                }
+            }
+        }
+
+        fprintf(stderr, "[minxfmr] step=%d selected id=%d logit=%f sampler=%s k=%d raw_tok='%s' preview='%s' pending_bytes=%zu pending_fragments=%zu\n",
+            t, next, chosen_logit, sampler_greedy ? "greedy" : "sample", k_use, raw_tok.c_str(), preview.c_str(), pending_bytes.size(), pending_token_buf.size());
+        fflush(stderr);
+
+        if (!raw_tok.empty() && raw_tok == last_emitted_raw_tok) {
+            ++repeat_run;
+        } else {
+            last_emitted_raw_tok = raw_tok;
+            repeat_run = 1;
+        }
+        if (repeat_run >= 16) {
+            fprintf(stderr, "[minxfmr] stopping on repetition token='%s' run=%d\n", raw_tok.c_str(), repeat_run);
+            fflush(stderr);
+            gen_break_reason = "repeat";
+            if (in) tensor_free(in);
+            if (out) tensor_free(out);
+            break;
+        }
 
         // If model emits an explicit EOS token, stop generation immediately.
         if (is_eos_token(raw_tok)) {
             fprintf(stderr, "[minxfmr] stopping on EOS token id=%d raw='%s'\n", next, raw_tok.c_str());
+            fflush(stderr);
             gen_break_reason = "eos";
             if (in) tensor_free(in);
             if (out) tensor_free(out);
@@ -947,19 +998,95 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         // continue the generation loop normally so resources are freed.
         bool skip_role = is_role_token(raw_tok);
 
-        std::string tok;
+        // Helper: detect byte-fallback token like <0xE3>
+        auto is_byte_fallback = [](const std::string &s) {
+            return s.size() == 6 && s.rfind("<0x", 0) == 0 && s[5] == '>';
+        };
+
         if (!skip_role) {
-            tok = render_token_piece(raw_tok);
-            if (tok.empty()) tok = " ";
-            if (emit_json) {
-                gen_ids.push_back(next);
-                gen_token_strs.push_back(raw_tok);
+            if (is_byte_fallback(raw_tok)) {
+                // decode hex and accumulate
+                auto hex_to_nibble = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+                    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+                    return -1;
+                };
+                int hi = hex_to_nibble(raw_tok[3]);
+                int lo = hex_to_nibble(raw_tok[4]);
+                if (hi >= 0 && lo >= 0) {
+                    unsigned char b = (unsigned char)((hi << 4) | lo);
+                    pending_bytes.push_back(b);
+                }
+                if (emit_json) {
+                    gen_ids.push_back(next);
+                    gen_token_strs.push_back(raw_tok);
+                }
+                ++gen_tokens_emitted;
             } else {
-                if (callback) callback(tok.c_str());
+                // Append token fragment to the pending fragment buffer
+                pending_token_buf.emplace_back(next, raw_tok);
+
+                // Build concatenated fragment and check against known role markers
+                std::string concat;
+                concat.reserve(pending_token_buf.size() * 8);
+                for (auto &pp : pending_token_buf) concat += pp.second;
+
+                static const std::vector<std::string> role_markers = {
+                    "<s>", "[INST]", "[/INST]", "<|assistant|>", "<|user|>", "<<SYS>>", "<</SYS>>"
+                };
+
+                bool is_prefix = false;
+                bool is_exact = false;
+                for (const std::string &m : role_markers) {
+                    if (m.rfind(concat, 0) == 0) {
+                        is_prefix = true;
+                        if (m == concat) { is_exact = true; break; }
+                    }
+                }
+
+                if (is_exact) {
+                    // Suppress the complete marker sequence
+                    fprintf(stderr, "[minxfmr] suppressed role/template marker seq='%s'\n", concat.c_str());
+                    fflush(stderr);
+                    pending_token_buf.clear();
+                } else if (is_prefix) {
+                    // Wait for more fragments before deciding; do nothing now.
+                } else {
+                    // Not a role marker: flush any pending raw bytes first
+                    if (!pending_bytes.empty()) {
+                        std::string pb;
+                        pb.reserve(pending_bytes.size());
+                        for (unsigned char c : pending_bytes) pb.push_back((char)c);
+                        if (callback) callback(pb.c_str());
+                        pending_bytes.clear();
+                    }
+
+                    // Flush accumulated fragments as normal tokens
+                    for (auto &pp : pending_token_buf) {
+                        int id_flush = pp.first;
+                        const std::string &raw_flush = pp.second;
+                        std::string tok = render_token_piece(raw_flush);
+                        if (tok.empty()) tok = " ";
+                        if (emit_json) {
+                            gen_ids.push_back(id_flush);
+                            gen_token_strs.push_back(raw_flush);
+                        } else {
+                            if (callback) callback(tok.c_str());
+                        }
+                        ++gen_tokens_emitted;
+                        recent_tokens.push_back(id_flush);
+                        if (recent_tokens.size() > 48) recent_tokens.erase(recent_tokens.begin());
+                    }
+                    pending_token_buf.clear();
+                }
             }
-            ++gen_tokens_emitted;
         } else {
+            // If the token itself is already a complete role marker string,
+            // just log and skip it. This path handles cases where tokenizer
+            // returns the full marker in one token.
             fprintf(stderr, "[minxfmr] suppressed role/template token id=%d raw='%s'\n", next, raw_tok.c_str());
+            fflush(stderr);
         }
 
         if (!skip_role) recent_tokens.push_back(next);
@@ -977,9 +1104,40 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
 
     if (last_out_prefill) tensor_free(last_out_prefill);
 
+    // Flush any pending byte-fallbacks accumulated during streaming.
+    if (!pending_bytes.empty()) {
+        std::string pb;
+        pb.reserve(pending_bytes.size());
+        for (unsigned char c : pending_bytes) pb.push_back((char)c);
+        if (callback) callback(pb.c_str());
+        pending_bytes.clear();
+    }
+
+    // Flush any pending token fragments that were not part of suppressed
+    // role/template markers (e.g. a lone '[' that didn't become '[INST]').
+    if (!pending_token_buf.empty()) {
+        for (auto &pp : pending_token_buf) {
+            int id_flush = pp.first;
+            const std::string &raw_flush = pp.second;
+            std::string tok = render_token_piece(raw_flush);
+            if (tok.empty()) tok = " ";
+            if (emit_json) {
+                gen_ids.push_back(id_flush);
+                gen_token_strs.push_back(raw_flush);
+            } else {
+                if (callback) callback(tok.c_str());
+            }
+            ++gen_tokens_emitted;
+            recent_tokens.push_back(id_flush);
+            if (recent_tokens.size() > 48) recent_tokens.erase(recent_tokens.begin());
+        }
+        pending_token_buf.clear();
+    }
+
     if (gen_break_reason == "none") gen_break_reason = "max_steps";
     fprintf(stderr, "[minxfmr] generation finished: emitted=%d last=%d reason=%s steps=%d max=%d\n",
         gen_tokens_emitted, last, gen_break_reason.c_str(), t, max_steps);
+    fflush(stderr);
 
     // If emitting JSON, build object and write to stdout.
     if (emit_json) {
