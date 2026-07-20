@@ -95,8 +95,68 @@ bool cpu_add(const Tensor* a, const Tensor* b, Tensor* out) {
     return true;
 }
 
+// Per-thread workspace with offset-based allocation.
+struct Workspace { std::vector<float> buf; size_t offset; };
+static thread_local Workspace g_workspace{std::vector<float>(), 0};
+
 float* cpu_workspace(size_t n) {
-    thread_local std::vector<float> s_workspace;
-    if (s_workspace.size() < n) s_workspace.resize(n);
-    return s_workspace.data();
+    if (n == 0) return nullptr;
+    size_t need = g_workspace.offset + n;
+    if (g_workspace.buf.size() < need) g_workspace.buf.resize(need);
+    float* p = g_workspace.buf.data() + g_workspace.offset;
+    g_workspace.offset += n;
+    return p;
+}
+
+void cpu_workspace_reset() {
+    g_workspace.offset = 0;
+}
+
+bool cpu_matvec(const float* vec, const float* mat, float* out, size_t K, size_t N) {
+    if (!vec || !mat || !out) return false;
+    // mat is K x N with row-major stride N
+    return cpu_matvec_strided(vec, mat, out, K, N, N);
+}
+
+bool cpu_matvec_strided(const float* vec, const float* mat, float* out, size_t K, size_t N, size_t mat_row_stride) {
+    if (!vec || !mat || !out) return false;
+    if (K == 0 || N == 0) return false;
+    for (size_t n = 0; n < N; ++n) {
+        double acc = 0.0;
+        const float* col = mat + n; // start at offset n, step by mat_row_stride
+        for (size_t k = 0; k < K; ++k) {
+            acc += (double)vec[k] * (double)col[k * mat_row_stride];
+        }
+        out[n] = (float)acc;
+    }
+    return true;
+}
+
+float* cpu_request_workspace(size_t n) {
+    return cpu_workspace(n);
+}
+
+bool cpu_vec_dot_rows(const float* vec, const float* mat_rows, float* out, size_t K, size_t Nrows, size_t row_stride) {
+    if (!vec || !mat_rows || !out) return false;
+    if (K == 0 || Nrows == 0) return false;
+    for (size_t j = 0; j < Nrows; ++j) {
+        const float* row = mat_rows + j * row_stride;
+        double acc = 0.0;
+        for (size_t k = 0; k < K; ++k) acc += (double)vec[k] * (double)row[k];
+        out[j] = (float)acc;
+    }
+    return true;
+}
+
+bool cpu_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* out, size_t Nrows, size_t Ncols, size_t row_stride) {
+    if (!vec || !mat_rows || !out) return false;
+    if (Nrows == 0 || Ncols == 0) return false;
+    for (size_t col = 0; col < Ncols; ++col) {
+        double acc = 0.0;
+        for (size_t row = 0; row < Nrows; ++row) {
+            acc += (double)vec[row] * (double)mat_rows[row * row_stride + col];
+        }
+        out[col] = (float)acc;
+    }
+    return true;
 }

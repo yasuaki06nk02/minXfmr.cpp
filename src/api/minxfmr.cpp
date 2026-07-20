@@ -697,6 +697,9 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
 int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(const char* token), double temperature, int top_k) {
     if (!ctx || !prompt) return -1;
 
+    // Reset per-thread CPU workspace allocations for this generation call.
+    cpu_workspace_reset();
+
     std::vector<int> ids = tokenizer_encode(prompt);
     // debug: log prompt token ids and decoded prompt
     if (!ids.empty()) {
