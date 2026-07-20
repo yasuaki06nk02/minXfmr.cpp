@@ -253,14 +253,15 @@ bool transformer_forward_single_layer(
     size_t use_n_head = n_head;
     size_t use_n_head_kv = n_head_kv;
     if (use_n_head == 0 || use_n_head_kv == 0) {
-        // best-effort inference; prefer 4 kv heads for 256 kv dim / 64 head_dim layouts.
-        if (model_dim % 64 == 0 && kv_dim % 64 == 0) {
-            use_n_head = model_dim / 64;
-            use_n_head_kv = kv_dim / 64;
-        } else {
-            use_n_head = 1;
-            use_n_head_kv = 1;
-        }
+        fprintf(stderr,
+            "[transformer] head metadata missing: n_head=%zu n_head_kv=%zu (model_dim=%zu kv_dim=%zu)\n",
+            n_head,
+            n_head_kv,
+            model_dim,
+            kv_dim);
+        tensor_free(Qraw); tensor_free(Kraw); tensor_free(Vraw);
+        tensor_free(norm);
+        return false;
     }
     if (use_n_head == 0 || use_n_head_kv == 0 || model_dim % use_n_head != 0 || kv_dim % use_n_head_kv != 0) {
         tensor_free(Qraw); tensor_free(Kraw); tensor_free(Vraw);

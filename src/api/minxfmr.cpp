@@ -399,6 +399,11 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
             if (cfg.n_head_kv > 0) ctx->n_head_kv = (size_t)cfg.n_head_kv;
             fprintf(stderr, "[minxfmr] gguf meta layers=%zu ctx=%zu embd=%zu head=%zu head_kv=%zu\n",
                 ctx->n_layer, ctx->seq_max, ctx->model_dim, (size_t)cfg.n_head, (size_t)cfg.n_head_kv);
+            if (cfg.n_head == 0 || cfg.n_head_kv == 0) {
+                fprintf(stderr,
+                    "[minxfmr] warning: gguf head metadata missing (llama.attention.head_count / llama.attention.head_count_kv). "
+                    "defaults may be incorrect for non-LLaMA architectures.\n");
+            }
         }
 
         // llama.cpp-like behavior: default layout policy from model architecture metadata.
