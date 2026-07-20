@@ -765,6 +765,16 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     }
     // When temperature <= 0, use greedy sampling (deterministic argmax).
     bool sampler_greedy = (temperature <= 0.0);
+
+    // Helper predicates for token-level control: treat explicit EOS tokens
+    // as generation terminators and skip role/template markers when
+    // streaming/pushing history to avoid template leakage.
+    auto is_eos_token = [](const std::string &s) {
+        return s == "</s>" || s == "<|endoftext|>" || s == "<|pad|>";
+    };
+    auto is_role_token = [](const std::string &s) {
+        return s == "<s>" || s == "[INST]" || s == "[/INST]" || s == "<|assistant|>" || s == "<|user|>" || s == "<<SYS>>" || s == "<</SYS>>";
+    };
     if (top_k <= 0) top_k = 1;
     static std::mt19937 rng((unsigned)std::random_device{}());
 
@@ -919,16 +929,32 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         }
 
         std::string raw_tok = tokenizer_id_to_token(next);
-        std::string tok = render_token_piece(raw_tok);
-        if (tok.empty()) tok = " ";
-        if (emit_json) {
-            gen_ids.push_back(next);
-            gen_token_strs.push_back(raw_tok);
-        } else {
-            if (callback) callback(tok.c_str());
+
+        // If model emits an explicit EOS token, stop generation immediately.
+        if (is_eos_token(raw_tok)) {
+            if (in) tensor_free(in);
+            if (out) tensor_free(out);
+            break;
         }
 
-        recent_tokens.push_back(next);
+        // If this is a role/template marker, skip emitting it to the user
+        // and do not add it to recent token penalties or history. Still
+        // continue the generation loop normally so resources are freed.
+        bool skip_role = is_role_token(raw_tok);
+
+        std::string tok;
+        if (!skip_role) {
+            tok = render_token_piece(raw_tok);
+            if (tok.empty()) tok = " ";
+            if (emit_json) {
+                gen_ids.push_back(next);
+                gen_token_strs.push_back(raw_tok);
+            } else {
+                if (callback) callback(tok.c_str());
+            }
+        }
+
+        if (!skip_role) recent_tokens.push_back(next);
         if (recent_tokens.size() > 48) recent_tokens.erase(recent_tokens.begin());
 
         if (t >= 6 && (tok.find('.') != std::string::npos || tok.find('!') != std::string::npos || tok.find('?') != std::string::npos)) {
