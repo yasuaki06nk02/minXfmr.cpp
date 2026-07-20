@@ -801,7 +801,8 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     // entry holds the token id and its raw token string.
     std::vector<std::pair<int,std::string>> pending_token_buf;
     // Preallocate a reusable workspace for logits chunking to avoid repeated
-    // cpu_request_workspace calls inside the token loop.
+    // allocations inside the token loop. This buffer is intentionally separate
+    // from cpu_workspace because run_stack_forward may grow/reset that workspace.
     const size_t OUT_CHUNK = 4096;
     size_t global_out_vocab = 0;
     if (ctx->Wout && ctx->Wout->type == DataType::F32) {
@@ -809,8 +810,8 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         else if (ctx->Wout->cols == dim) global_out_vocab = ctx->Wout->rows;
     }
     size_t global_chunk_size = (global_out_vocab > 0) ? std::min(OUT_CHUNK, global_out_vocab) : 0;
-    float* global_chunk_workspace = nullptr;
-    if (global_chunk_size > 0) global_chunk_workspace = cpu_request_workspace(global_chunk_size);
+    std::vector<float> logits_chunk_buffer;
+    if (global_chunk_size > 0) logits_chunk_buffer.resize(global_chunk_size);
 
     int t = 0;
     std::string gen_break_reason = "none";
@@ -847,9 +848,9 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                 size_t out_vocab = ctx->Wout->cols;
                 size_t use_vocab = std::min(vocab_size, out_vocab);
                 const size_t CHUNK = OUT_CHUNK;
-                float* ltmp = (global_chunk_workspace && global_chunk_size > 0) ? global_chunk_workspace : cpu_request_workspace(std::min(CHUNK, use_vocab));
                 for (size_t off = 0; off < use_vocab; off += CHUNK) {
                     size_t cur = std::min(CHUNK, use_vocab - off);
+                    float* ltmp = logits_chunk_buffer.empty() ? nullptr : logits_chunk_buffer.data();
                     bool ok = false;
                     if (ltmp) ok = cpu_matvec_strided(od, wd + off, ltmp, dim, cur, out_vocab);
                     if (ok) {
@@ -871,9 +872,9 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                 size_t out_vocab = ctx->Wout->rows;
                 size_t use_vocab = std::min(vocab_size, out_vocab);
                 const size_t CHUNK = OUT_CHUNK;
-                float* ltmp = (global_chunk_workspace && global_chunk_size > 0) ? global_chunk_workspace : cpu_request_workspace(std::min(CHUNK, use_vocab));
                 for (size_t off = 0; off < use_vocab; off += CHUNK) {
                     size_t cur = std::min(CHUNK, use_vocab - off);
+                    float* ltmp = logits_chunk_buffer.empty() ? nullptr : logits_chunk_buffer.data();
                     const float* rowptr = wd + off * ctx->Wout->cols; // each row has length dim
                     bool ok = false;
                     if (ltmp) ok = cpu_vec_dot_rows(od, rowptr, ltmp, dim, cur, ctx->Wout->cols);
