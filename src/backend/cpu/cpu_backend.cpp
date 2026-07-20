@@ -145,6 +145,25 @@ bool cpu_vec_dot_rows(const float* vec, const float* mat_rows, float* out, size_
     for (size_t j = 0; j < Nrows; ++j) {
         const float* row = mat_rows + j * row_stride;
         double acc = 0.0;
+#if defined(_OPENMP)
+        #pragma omp simd reduction(+:acc)
+#endif
+        for (size_t k = 0; k < K; ++k) acc += (double)vec[k] * (double)row[k];
+        out[j] = (float)acc;
+    }
+    return true;
+}
+
+bool cpu_vec_dot_rows_ring(const float* vec, const float* ring, size_t head, size_t seq_max, size_t len, size_t K, size_t row_stride, float* out) {
+    if (!vec || !ring || !out) return false;
+    if (K == 0 || len == 0 || seq_max == 0) return false;
+    for (size_t j = 0; j < len; ++j) {
+        size_t phys = (head + j) % seq_max;
+        const float* row = ring + phys * row_stride;
+        double acc = 0.0;
+#if defined(_OPENMP)
+        #pragma omp simd reduction(+:acc)
+#endif
         for (size_t k = 0; k < K; ++k) acc += (double)vec[k] * (double)row[k];
         out[j] = (float)acc;
     }
@@ -156,6 +175,9 @@ bool cpu_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* out, 
     if (Nrows == 0 || Ncols == 0) return false;
     for (size_t col = 0; col < Ncols; ++col) {
         double acc = 0.0;
+#if defined(_OPENMP)
+        #pragma omp simd reduction(+:acc)
+#endif
         for (size_t row = 0; row < Nrows; ++row) {
             acc += (double)vec[row] * (double)mat_rows[row * row_stride + col];
         }

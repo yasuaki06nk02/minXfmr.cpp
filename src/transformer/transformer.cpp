@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <cstddef>
 #include <algorithm>
 
 static bool g_transpose_square_wq = false;
@@ -39,19 +40,6 @@ static Tensor* tensor_clone_f32(const Tensor* in) {
     return out;
 }
 
-static Tensor* tensor_slice_cols_f32(const Tensor* in, size_t out_cols) {
-    if (!in || in->type != DataType::F32 || out_cols == 0 || out_cols > in->cols) return nullptr;
-    if (out_cols == in->cols) return tensor_clone_f32(in);
-    Tensor* out = tensor_create_f32(in->rows, out_cols);
-    if (!out) return nullptr;
-    const float* src = (const float*)in->data;
-    float* dst = (float*)out->data;
-    for (size_t r = 0; r < in->rows; ++r) {
-        memcpy(dst + r * out_cols, src + r * in->cols, sizeof(float) * out_cols);
-    }
-    return out;
-}
-
 // Compute out = A * B^T without materializing B^T.
 // A: [m x k], B: [n x k], out: [m x n]
 static bool cpu_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out) {
@@ -67,10 +55,13 @@ static bool cpu_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* 
     const float* bd = (const float*)B->data;
     float* od = (float*)out->data;
 
-    for (size_t i = 0; i < m; ++i) {
-        const float* arow = ad + i * k;
-        for (size_t j = 0; j < n; ++j) {
-            const float* brow = bd + j * k;
+    #if defined(_OPENMP)
+    #pragma omp parallel for collapse(2)
+    #endif
+    for (ptrdiff_t i = 0; i < (ptrdiff_t)m; ++i) {
+        for (ptrdiff_t j = 0; j < (ptrdiff_t)n; ++j) {
+            const float* arow = ad + (size_t)i * k;
+            const float* brow = bd + (size_t)j * k;
             float s = 0.0f;
 #if defined(_OPENMP)
             #pragma omp simd reduction(+:s)
@@ -78,7 +69,7 @@ static bool cpu_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* 
             for (size_t kk = 0; kk < k; ++kk) {
                 s += arow[kk] * brow[kk];
             }
-            od[i * n + j] = s;
+            od[(size_t)i * n + (size_t)j] = s;
         }
     }
     return true;
@@ -292,50 +283,26 @@ bool transformer_forward_single_layer(
     Tensor* K = Kraw;
     Tensor* V = Vraw;
 
-    // Build concatenated K/V (cache rows + current K/V)
-    Tensor* Kconcat = nullptr;
-    Tensor* Vconcat = nullptr;
     size_t cached_rows = 0;
-    if (cache != nullptr && cache->keys.size() > layer && cache->keys[layer] != nullptr) {
+    size_t cache_head = 0;
+    const float* cache_kd = nullptr;
+    const float* cache_vd = nullptr;
+    if (cache != nullptr && cache->keys.size() > layer && cache->keys[layer] != nullptr && cache->vals[layer] != nullptr && cache->dim == kv_dim) {
         cached_rows = cache->lengths[layer];
-        size_t head = cache->heads[layer];
-        size_t sm = cache->seq_max;
-        Kconcat = tensor_create_f32(cached_rows + seq, kv_dim);
-        Vconcat = tensor_create_f32(cached_rows + seq, kv_dim);
-        if (Kconcat && Vconcat) {
-            if (cached_rows > 0) {
-                // With ring buffer, logical [0, cached_rows) maps to physical [head, head + cached_rows) mod seq_max
-                size_t p1 = std::min(cached_rows, sm - head);
-                memcpy(Kconcat->data, (float*)cache->keys[layer]->data + head * kv_dim, sizeof(float) * p1 * kv_dim);
-                memcpy(Vconcat->data, (float*)cache->vals[layer]->data + head * kv_dim, sizeof(float) * p1 * kv_dim);
-                if (p1 < cached_rows) {
-                    size_t p2 = cached_rows - p1;
-                    memcpy((float*)Kconcat->data + p1 * kv_dim, cache->keys[layer]->data, sizeof(float) * p2 * kv_dim);
-                    memcpy((float*)Vconcat->data + p1 * kv_dim, cache->vals[layer]->data, sizeof(float) * p2 * kv_dim);
-                }
-            }
-            memcpy((float*)Kconcat->data + cached_rows * kv_dim, K->data, sizeof(float) * seq * kv_dim);
-            memcpy((float*)Vconcat->data + cached_rows * kv_dim, V->data, sizeof(float) * seq * kv_dim);
-        }
-    } else {
-        Kconcat = tensor_clone_f32(K);
-        Vconcat = tensor_clone_f32(V);
-    }
-
-    if (!Kconcat || !Vconcat) {
-        tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(Kconcat); tensor_free(Vconcat);
-        return false;
+        cache_head = cache->heads[layer];
+        cache_kd = (const float*)cache->keys[layer]->data;
+        cache_vd = (const float*)cache->vals[layer]->data;
     }
 
     Tensor* attn_out = tensor_create_f32(seq, model_dim);
     if (!attn_out) {
-        tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(Kconcat); tensor_free(Vconcat);
+        tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V);
         return false;
     }
 
     const float* qd = (const float*)Q->data;
-    const float* kd = (const float*)Kconcat->data;
-    const float* vd = (const float*)Vconcat->data;
+    const float* kd = (const float*)K->data;
+    const float* vd = (const float*)V->data;
     float* od = (float*)attn_out->data;
     const size_t J = cached_rows + seq;
     float* scores = nullptr;
@@ -354,13 +321,24 @@ bool transformer_forward_single_layer(
             const size_t kv_off = kv_h * kv_head_dim;
 
             const float* qptr = qd + qi * model_dim + q_off;
-            const float* kbase = kd + kv_off;
 
-            // scores = dot(qptr, K_submatrix_rows) for each cached/j row
-            if (!cpu_vec_dot_rows(qptr, kbase, scores, head_dim, J, kv_dim)) {
-                tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(Kconcat); tensor_free(Vconcat); tensor_free(attn_out);
-                return false;
+            // scores for cached rows from ring buffer
+            if (cached_rows > 0) {
+                const float* k_ring_base = cache_kd + kv_off;
+                if (!cpu_vec_dot_rows_ring(qptr, k_ring_base, cache_head, cache->seq_max, cached_rows, head_dim, kv_dim, scores)) {
+                    tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(attn_out);
+                    return false;
+                }
             }
+            // scores for current rows from contiguous current-K
+            if (seq > 0) {
+                const float* k_cur_base = kd + kv_off;
+                if (!cpu_vec_dot_rows(qptr, k_cur_base, scores + cached_rows, head_dim, seq, kv_dim)) {
+                    tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(attn_out);
+                    return false;
+                }
+            }
+
             for (size_t j = 0; j < J; ++j) scores[j] *= score_scale;
 
             const size_t q_pos = cached_rows + qi;
@@ -368,12 +346,41 @@ bool transformer_forward_single_layer(
 
             softmax_row(scores, J);
 
-            // outvec = scores^T * V_submatrix  (produces head_dim values)
+            // outvec = scores^T * V_submatrix, with cached-ring part + current-contiguous part.
             float* outvec = od + qi * model_dim + q_off;
-            const float* vbase = vd + kv_off;
-            if (!cpu_vec_mul_rows_cols(scores, vbase, outvec, J, head_dim, kv_dim)) {
-                tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(Kconcat); tensor_free(Vconcat); tensor_free(attn_out);
-                return false;
+            std::memset(outvec, 0, sizeof(float) * head_dim);
+
+            if (cached_rows > 0) {
+                for (size_t j = 0; j < cached_rows; ++j) {
+                    size_t phys = (cache_head + j) % cache->seq_max;
+                    const float w = scores[j];
+                    const float* vrow = cache_vd + phys * kv_dim + kv_off;
+#if defined(_OPENMP)
+                    #pragma omp simd
+#endif
+                    for (size_t t = 0; t < head_dim; ++t) {
+                        outvec[t] += w * vrow[t];
+                    }
+                }
+            }
+
+            if (seq > 0) {
+                float* outvec_cur = cpu_request_workspace(head_dim);
+                if (!outvec_cur) {
+                    tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(attn_out);
+                    return false;
+                }
+                const float* v_cur_base = vd + kv_off;
+                if (!cpu_vec_mul_rows_cols(scores + cached_rows, v_cur_base, outvec_cur, seq, head_dim, kv_dim)) {
+                    tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(attn_out);
+                    return false;
+                }
+#if defined(_OPENMP)
+                #pragma omp simd
+#endif
+                for (size_t t = 0; t < head_dim; ++t) {
+                    outvec[t] += outvec_cur[t];
+                }
             }
         }
     }
@@ -462,9 +469,9 @@ bool transformer_forward_single_layer(
 
     // now append current K/V rows to cache if present
     if (cache != nullptr && cache->keys.size() > layer && cache->keys[layer] != nullptr && cache->dim == kv_dim) {
-        const float* kd = (const float*)K->data;
-        const float* vd = (const float*)V->data;
-        for (size_t i=0;i<seq;++i) kvcache_append(cache, layer, &kd[i*kv_dim], &vd[i*kv_dim]);
+        const float* kd_cache = (const float*)K->data;
+        const float* vd_cache = (const float*)V->data;
+        for (size_t i=0;i<seq;++i) kvcache_append(cache, layer, &kd_cache[i*kv_dim], &vd_cache[i*kv_dim]);
         if (cache_append_log_enabled()) {
             fprintf(stderr, "[transformer] appended %zu rows to cache layer=%zu (newlen=%zu)\n", seq, layer, cache->lengths[layer]);
         }
@@ -472,7 +479,5 @@ bool transformer_forward_single_layer(
     tensor_free(Q);
     tensor_free(K);
     tensor_free(V);
-    tensor_free(Kconcat);
-    tensor_free(Vconcat);
     return ok;
 }

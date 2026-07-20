@@ -30,6 +30,10 @@ float* cpu_request_workspace(size_t n);
 // mat_rows is an array of Nrows rows, each at least row_stride long.
 bool cpu_vec_dot_rows(const float* vec, const float* mat_rows, float* out, size_t K, size_t Nrows, size_t row_stride);
 
+// Compute out[j] = dot(vec[0..K-1], ring[(head + j) % seq_max][0..K-1]) for j in [0..len)
+// ring rows are row-major with stride row_stride.
+bool cpu_vec_dot_rows_ring(const float* vec, const float* ring, size_t head, size_t seq_max, size_t len, size_t K, size_t row_stride, float* out);
+
 // Compute out[col] = sum_{row=0..Nrows-1} vec[row] * mat_rows[row*row_stride + col] for col in [0..Ncols)
 // This computes vec^T * Mat where Mat is Nrows x Ncols stored row-major with stride row_stride.
 bool cpu_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* out, size_t Nrows, size_t Ncols, size_t row_stride);
