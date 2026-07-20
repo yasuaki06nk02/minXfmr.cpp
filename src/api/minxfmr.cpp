@@ -16,6 +16,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cctype>
+#include "../backend/cpu/cpu_backend.h"
 
 struct minxfmr_context {
     KVCache* cache;
@@ -779,24 +780,51 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
 
         if (ctx->Wout && ctx->Wout->type == DataType::F32) {
             const float* wd = (const float*)ctx->Wout->data;
+            // Case A: Wout is [dim x vocab] (rows == dim)
             if (ctx->Wout->rows == dim) {
                 size_t out_vocab = ctx->Wout->cols;
                 size_t use_vocab = std::min(vocab_size, out_vocab);
-                logits.assign(use_vocab, 0.0);
-                for (size_t j = 0; j < use_vocab; ++j) {
-                    double s = 0.0;
-                    for (size_t i = 0; i < dim; ++i) s += (double)od[i] * (double)wd[i * out_vocab + j];
-                    logits[j] = s;
+                const size_t CHUNK = 4096;
+                float* ltmp = cpu_request_workspace(std::min(CHUNK, use_vocab));
+                for (size_t off = 0; off < use_vocab; off += CHUNK) {
+                    size_t cur = std::min(CHUNK, use_vocab - off);
+                    bool ok = false;
+                    if (ltmp) ok = cpu_matvec_strided(od, wd + off, ltmp, dim, cur, out_vocab);
+                    if (ok) {
+                        for (size_t j = 0; j < cur; ++j) logits[off + j] = (double)ltmp[j];
+                    } else {
+                        // Fallback scalar compute for this chunk
+                        for (size_t j = 0; j < cur; ++j) {
+                            double s = 0.0;
+                            size_t gj = off + j;
+                            for (size_t i = 0; i < dim; ++i) s += (double)od[i] * (double)wd[i * out_vocab + gj];
+                            logits[gj] = s;
+                        }
+                    }
                 }
                 vocab_size = use_vocab;
-            } else if (ctx->Wout->cols == dim) {
+            }
+            // Case B: Wout is [vocab x dim] (cols == dim)
+            else if (ctx->Wout->cols == dim) {
                 size_t out_vocab = ctx->Wout->rows;
                 size_t use_vocab = std::min(vocab_size, out_vocab);
-                logits.assign(use_vocab, 0.0);
-                for (size_t j = 0; j < use_vocab; ++j) {
-                    double s = 0.0;
-                    for (size_t i = 0; i < dim; ++i) s += (double)od[i] * (double)wd[j * dim + i];
-                    logits[j] = s;
+                const size_t CHUNK = 4096;
+                float* ltmp = cpu_request_workspace(std::min(CHUNK, use_vocab));
+                for (size_t off = 0; off < use_vocab; off += CHUNK) {
+                    size_t cur = std::min(CHUNK, use_vocab - off);
+                    const float* rowptr = wd + off * ctx->Wout->cols; // each row has length dim
+                    bool ok = false;
+                    if (ltmp) ok = cpu_vec_dot_rows(od, rowptr, ltmp, dim, cur, ctx->Wout->cols);
+                    if (ok) {
+                        for (size_t j = 0; j < cur; ++j) logits[off + j] = (double)ltmp[j];
+                    } else {
+                        for (size_t j = 0; j < cur; ++j) {
+                            double s = 0.0;
+                            size_t gj = off + j;
+                            for (size_t i = 0; i < dim; ++i) s += (double)od[i] * (double)wd[gj * dim + i];
+                            logits[gj] = s;
+                        }
+                    }
                 }
                 vocab_size = use_vocab;
             } else {
