@@ -22,8 +22,14 @@ static std::vector<std::string> g_vocab;
 static std::unordered_map<std::string,int> g_vid;
 static std::vector<float> g_vocab_scores;
 static std::vector<int>   g_vocab_types;
+static std::unordered_map<uint8_t, std::string> g_byte_encoder;
+static std::unordered_map<std::string, uint8_t> g_byte_decoder;
 static size_t g_max_token_len = 0;
 static const std::string kSpmMarker("\xE2\x96\x81");
+static const std::string kGptSpaceMarker("\xC3\x84\xC2\xA0");
+static const std::string kGptNewlineMarker("\xC3\x84\xC2\x8A");
+static std::string g_word_marker = kSpmMarker;
+static std::string g_newline_token = "\n";
 
 struct TrieNode {
     int token_id;
@@ -59,6 +65,96 @@ static void trie_build_from_vocab() {
     trie_clear();
     for (size_t i = 0; i < g_vocab.size(); ++i) {
         trie_insert(g_vocab[i], (int)i);
+    }
+}
+
+static void init_byte_level_maps() {
+    if (!g_byte_encoder.empty()) return;
+
+    std::vector<int> bs;
+    for (int i = '!'; i <= '~'; ++i) bs.push_back(i);
+    for (int i = 0xA1; i <= 0xAC; ++i) bs.push_back(i);
+    for (int i = 0xAE; i <= 0xFF; ++i) bs.push_back(i);
+
+    std::vector<int> cs = bs;
+    int n = 0;
+    for (int b = 0; b < 256; ++b) {
+        if (std::find(bs.begin(), bs.end(), b) == bs.end()) {
+            bs.push_back(b);
+            cs.push_back(256 + n);
+            ++n;
+        }
+    }
+
+    for (size_t i = 0; i < bs.size(); ++i) {
+        std::string u;
+        char32_t cp = (char32_t)cs[i];
+        if (cp <= 0x7F) {
+            u.push_back((char)cp);
+        } else if (cp <= 0x7FF) {
+            u.push_back((char)(0xC0 | (cp >> 6)));
+            u.push_back((char)(0x80 | (cp & 0x3F)));
+        } else {
+            u.push_back((char)(0xE0 | (cp >> 12)));
+            u.push_back((char)(0x80 | ((cp >> 6) & 0x3F)));
+            u.push_back((char)(0x80 | (cp & 0x3F)));
+        }
+        g_byte_encoder[(uint8_t)bs[i]] = u;
+        g_byte_decoder[u] = (uint8_t)bs[i];
+    }
+}
+
+static std::string byte_level_encode(const std::string& text) {
+    init_byte_level_maps();
+
+    std::string out;
+    out.reserve(text.size() * 2);
+    for (unsigned char b : text) {
+        out += g_byte_encoder[(uint8_t)b];
+    }
+    return out;
+}
+
+static std::string byte_level_decode(const std::string& text) {
+    init_byte_level_maps();
+
+    std::string out;
+    out.reserve(text.size());
+    for (size_t i = 0; i < text.size();) {
+        bool matched = false;
+        for (int len = 3; len >= 1; --len) {
+            if (i + (size_t)len > text.size()) continue;
+            std::string sub = text.substr(i, (size_t)len);
+            auto it = g_byte_decoder.find(sub);
+            if (it != g_byte_decoder.end()) {
+                out.push_back((char)it->second);
+                i += (size_t)len;
+                matched = true;
+                break;
+            }
+        }
+        if (!matched) {
+            out.push_back(text[i++]);
+        }
+    }
+    return out;
+}
+
+static void detect_tokenizer_markers_from_vocab() {
+    size_t spm_count = 0;
+    size_t gpt_count = 0;
+    for (const std::string& tok : g_vocab) {
+        if (tok.rfind(kSpmMarker, 0) == 0) ++spm_count;
+        if (tok.rfind(kGptSpaceMarker, 0) == 0) ++gpt_count;
+    }
+    g_word_marker = (gpt_count > spm_count) ? kGptSpaceMarker : kSpmMarker;
+
+    if (g_vid.find(kGptNewlineMarker) != g_vid.end()) {
+        g_newline_token = kGptNewlineMarker;
+    } else if (g_vid.find("\n") != g_vid.end()) {
+        g_newline_token = "\n";
+    } else {
+        g_newline_token = "\n";
     }
 }
 
@@ -161,6 +257,7 @@ bool tokenizer_load_from_list(const std::vector<std::string>& vocab) {
         g_vid[g_vocab[i]] = (int)i;
         if (g_vocab[i].size() > g_max_token_len) g_max_token_len = g_vocab[i].size();
     }
+    detect_tokenizer_markers_from_vocab();
     trie_build_from_vocab();
     return true;
 }
@@ -174,6 +271,7 @@ bool tokenizer_load_from_gguf(const GGUF_File& gf) {
         g_vid[g_vocab[i]] = (int)i;
         if (g_vocab[i].size() > g_max_token_len) g_max_token_len = g_vocab[i].size();
     }
+    detect_tokenizer_markers_from_vocab();
     trie_build_from_vocab();
 
     // load optional scores
@@ -225,7 +323,7 @@ std::string tokenizer_id_to_token(int id) {
 std::vector<int> tokenizer_encode(const std::string& text) {
     std::vector<int> out;
     if (text.empty()) return out;
-    const std::string norm_text = normalize_text_for_tokenizer(text);
+    const std::string norm_text = byte_level_encode(normalize_text_for_tokenizer(text));
 
     auto match_exact_prefix = [&](const std::string& src, size_t pos, size_t& matched_len) -> int {
         matched_len = 0;
@@ -259,6 +357,15 @@ std::vector<int> tokenizer_encode(const std::string& text) {
             return;
         }
 
+        if (b == '\n') {
+            int nl_id = tokenizer_token_to_id(g_newline_token);
+            if (nl_id < 0) nl_id = tokenizer_token_to_id("\\n");
+            if (nl_id >= 0) {
+                out.push_back(nl_id);
+                return;
+            }
+        }
+
         int unk = -1;
         auto it = g_vid.find("<unk>");
         if (it != g_vid.end()) unk = it->second;
@@ -266,50 +373,85 @@ std::vector<int> tokenizer_encode(const std::string& text) {
         out.push_back(unk);
     };
 
+    auto decode_one_byte_level_symbol = [&](const std::string& src, size_t pos, uint8_t& out_byte, size_t& consumed_len) -> bool {
+        consumed_len = 0;
+        for (int len = 3; len >= 1; --len) {
+            if (pos + (size_t)len > src.size()) continue;
+            std::string sub = src.substr(pos, (size_t)len);
+            auto it = g_byte_decoder.find(sub);
+            if (it == g_byte_decoder.end()) continue;
+            out_byte = it->second;
+            consumed_len = (size_t)len;
+            return true;
+        }
+        return false;
+    };
+
     size_t pos = 0;
-    bool at_word_start = true;
     while (pos < norm_text.size()) {
         size_t exact_len = 0;
         int exact_id = match_exact_prefix(norm_text, pos, exact_len);
         if (exact_id >= 0) {
             out.push_back(exact_id);
-            for (size_t i = 0; i < exact_len; ++i) {
-                if (std::isspace((unsigned char)norm_text[pos + i])) at_word_start = true;
-            }
             pos += exact_len;
             continue;
         }
 
-        if (std::isspace((unsigned char)norm_text[pos])) {
-            at_word_start = true;
+        uint8_t raw_byte = 0;
+        size_t consumed_len = 0;
+        if (decode_one_byte_level_symbol(norm_text, pos, raw_byte, consumed_len)) {
+            push_unknown_or_byte(raw_byte);
+            pos += consumed_len;
+        } else {
+            push_unknown_or_byte((unsigned char)norm_text[pos]);
             ++pos;
-            continue;
         }
-
-        size_t word_end = pos;
-        while (word_end < norm_text.size() && !std::isspace((unsigned char)norm_text[word_end])) ++word_end;
-
-        std::string piece;
-        if (at_word_start) piece = kSpmMarker;
-        piece += norm_text.substr(pos, word_end - pos);
-
-        size_t piece_pos = 0;
-        while (piece_pos < piece.size()) {
-            size_t best_len = 0;
-            int best_id = match_exact_prefix(piece, piece_pos, best_len);
-            if (best_id >= 0) {
-                out.push_back(best_id);
-                piece_pos += best_len;
-            } else {
-                push_unknown_or_byte((unsigned char)piece[piece_pos]);
-                ++piece_pos;
-            }
-        }
-
-        pos = word_end;
-        at_word_start = false;
     }
     return out;
+}
+
+std::string tokenizer_render_piece(const std::string& piece) {
+    if (piece.empty()) return piece;
+
+    std::string normalized;
+    normalized.reserve(piece.size() + 1);
+
+    const std::string spm = "\xE2\x96\x81";
+    const std::string spm_raw = "\xC4\xA0";
+    const std::string nl_raw = "\xC4\x8A";
+    const std::string spm2 = "\xC3\x84\xC2\xA0";
+    const std::string spm3 = "\xC3\x84\xC2\x8A";
+
+    for (size_t i = 0; i < piece.size();) {
+        if (i + spm.size() <= piece.size() && piece.compare(i, spm.size(), spm) == 0) {
+            normalized.push_back(' ');
+            i += spm.size();
+            continue;
+        }
+        if (i + spm_raw.size() <= piece.size() && piece.compare(i, spm_raw.size(), spm_raw) == 0) {
+            normalized.push_back(' ');
+            i += spm_raw.size();
+            continue;
+        }
+        if (i + spm2.size() <= piece.size() && piece.compare(i, spm2.size(), spm2) == 0) {
+            normalized.push_back(' ');
+            i += spm2.size();
+            continue;
+        }
+        if (i + nl_raw.size() <= piece.size() && piece.compare(i, nl_raw.size(), nl_raw) == 0) {
+            normalized.push_back('\n');
+            i += nl_raw.size();
+            continue;
+        }
+        if (i + spm3.size() <= piece.size() && piece.compare(i, spm3.size(), spm3) == 0) {
+            normalized.push_back('\n');
+            i += spm3.size();
+            continue;
+        }
+        normalized.push_back(piece[i++]);
+    }
+
+    return byte_level_decode(normalized);
 }
 
 std::string tokenizer_decode(const std::vector<int>& ids) {
@@ -334,20 +476,9 @@ std::string tokenizer_decode(const std::vector<int>& ids) {
             }
         }
 
-        size_t p = 0;
-        while (p < tok.size()) {
-            if (p + kSpmMarker.size() <= tok.size() && tok.compare(p, kSpmMarker.size(), kSpmMarker) == 0) {
-                s.push_back(' ');
-                p += kSpmMarker.size();
-            } else {
-                s.push_back(tok[p]);
-                p += 1;
-            }
-        }
+        s += tok;
     }
-    // trim at most one leading space to avoid over-trimming multi-token outputs
-    if (!s.empty() && s[0] == ' ') s.erase(0, 1);
-    return s;
+    return byte_level_decode(s);
 }
 
 size_t tokenizer_vocab_size() {

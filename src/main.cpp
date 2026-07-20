@@ -19,10 +19,14 @@
 #endif
 
 // model token output should go to stdout only (clean for chat). Logs go to stderr.
-static void print_callback(const char* token) {
+static void write_stdout_bytes(const char* token) {
     if (!token) return;
-    printf("%s", token);
-    fflush(stdout);
+    std::fwrite(token, 1, std::strlen(token), stdout);
+    std::fflush(stdout);
+}
+
+static void print_callback(const char* token) {
+    write_stdout_bytes(token);
 }
 
 // temporary buffer used to collect generated tokens during chat turn
@@ -31,8 +35,7 @@ static void gen_collect_callback(const char* token) {
     if (!token) return;
     gen_outbuf_global.append(token);
     // also print to stdout so user sees streaming
-    printf("%s", token);
-    fflush(stdout);
+    write_stdout_bytes(token);
 }
 
 int main(int argc, char** argv) {
@@ -402,6 +405,94 @@ int main(int argc, char** argv) {
         return true;
     };
 
+    auto looks_like_qwen_jinja_template = [](const char* tpl) {
+        if (!tpl || tpl[0] == '\0') return false;
+        return std::strstr(tpl, "<|im_start|>") != nullptr &&
+               (std::strstr(tpl, "{%-") != nullptr || std::strstr(tpl, "{{-") != nullptr || std::strstr(tpl, "messages[") != nullptr);
+    };
+
+    auto build_history_blob = [&](const std::vector<std::string>& history) {
+        std::string history_blob;
+        size_t begin = history.size() > (size_t)max_history ? history.size() - (size_t)max_history : 0;
+        for (size_t i = begin; i + 1 < history.size(); i += 2) {
+            history_blob += history[i];
+            history_blob += "\n";
+            history_blob += history[i + 1];
+            history_blob += "\n";
+        }
+        return history_blob;
+    };
+
+    auto render_template_auto = [&](const std::vector<std::string>& history, const char* template_text, const char* system_text, const char* user_text, bool* used_auto_qwen) {
+        if (used_auto_qwen) *used_auto_qwen = false;
+
+        auto append_qwen_message = [&](std::string& prompt_text, const char* role, const std::string& content) {
+            prompt_text += "<|im_start|>";
+            prompt_text += role;
+            prompt_text += '\n';
+            prompt_text += content;
+            prompt_text += "<|im_end|>\n";
+        };
+
+        if (template_text && template_text[0] != '\0') {
+            std::string assembled = template_text;
+            auto replace_all = [&](const std::string& key, const std::string& val) {
+                size_t pos = 0;
+                while ((pos = assembled.find(key, pos)) != std::string::npos) {
+                    assembled.replace(pos, key.size(), val);
+                    pos += val.size();
+                }
+            };
+
+            if (assembled.find("{{SYSTEM}}") != std::string::npos || assembled.find("{{HISTORY}}") != std::string::npos || assembled.find("{{USER}}") != std::string::npos) {
+                replace_all("{{SYSTEM}}", system_text ? system_text : "");
+                replace_all("{{HISTORY}}", build_history_blob(history));
+                replace_all("{{USER}}", user_text ? user_text : "");
+                return assembled;
+            }
+
+            if (looks_like_qwen_jinja_template(template_text)) {
+                if (used_auto_qwen) *used_auto_qwen = true;
+                std::string prompt_text;
+                prompt_text += "<|endoftext|>";
+                const char* sys = (system_text && system_text[0] != '\0')
+                    ? system_text
+                    : "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+                append_qwen_message(prompt_text, "system", sys);
+                size_t begin = history.size() > (size_t)max_history ? history.size() - (size_t)max_history : 0;
+                for (size_t i = begin; i + 1 < history.size(); i += 2) {
+                    append_qwen_message(prompt_text, "user", history[i]);
+                    append_qwen_message(prompt_text, "assistant", history[i + 1]);
+                }
+                prompt_text += "<|im_start|>user\n";
+                prompt_text += (user_text ? user_text : "");
+                prompt_text += "<|im_end|>\n";
+                prompt_text += "<|im_start|>assistant\n";
+                return prompt_text;
+            }
+
+            return assembled;
+        }
+
+        std::string assembled;
+        assembled += "<s>[INST] ";
+        if (system_text && system_text[0] != '\0') {
+            assembled += "<<SYS>>\n";
+            assembled += system_text;
+            assembled += "\n<</SYS>>\n\n";
+        }
+        size_t begin = history.size() > (size_t)max_history ? history.size() - (size_t)max_history : 0;
+        for (size_t i = begin; i + 1 < history.size(); i += 2) {
+            assembled += history[i];
+            assembled += " [/INST] ";
+            assembled += history[i + 1];
+            assembled += " </s><s>[INST] ";
+        }
+        assembled += (user_text ? user_text : "");
+        assembled += " [/INST]";
+        return assembled;
+    };
+
             if (run_once && !chat_mode) {
                 if (debug_attn_once) attention_set_debug_once(true);
                 minxfmr_generate(ctx, prompt, print_callback, temperature, top_k);
@@ -422,55 +513,20 @@ int main(int argc, char** argv) {
                     fprintf(stderr, "[main] dropping stray history entry to preserve user/assistant pairing\n");
                     history.pop_back();
                 }
-                std::string assembled;
-                if (model_chat_template && model_chat_template[0] != '\0') {
-                    // build history blob
-                    std::string history_blob;
-                    size_t begin = history.size() > (size_t)max_history ? history.size() - (size_t)max_history : 0;
-                    for (size_t i = begin; i + 1 < history.size(); i += 2) {
-                        history_blob += history[i];
-                        history_blob += "\n";
-                        history_blob += history[i+1];
-                        history_blob += "\n";
-                    }
-                    // simple placeholder replacement for {{SYSTEM}},{{HISTORY}},{{USER}}
-                    assembled = model_chat_template;
-                    auto replace_all = [&](const std::string& key, const std::string& val) {
-                        size_t pos = 0;
-                        while ((pos = assembled.find(key, pos)) != std::string::npos) {
-                            assembled.replace(pos, key.size(), val);
-                            pos += val.size();
-                        }
-                    };
-                    replace_all("{{SYSTEM}}", system_prompt ? system_prompt : "");
-                    replace_all("{{HISTORY}}", history_blob);
-                    replace_all("{{USER}}", line);
-                    // debug: log assembled prompt tokens
-                    std::vector<int> dbg_ids = tokenizer_encode(assembled);
-                    fprintf(stderr, "[main] assembled prompt token count=%zu\n", dbg_ids.size());
-                    if (!dbg_ids.empty()) {
-                        fprintf(stderr, "[main] token ids:");
-                        for (size_t ii=0; ii<dbg_ids.size(); ++ii) fprintf(stderr, " %d", dbg_ids[ii]);
-                        fprintf(stderr, "\n");
-                        std::string dbg_dec = tokenizer_decode(dbg_ids);
-                        fprintf(stderr, "[main] decoded assembled prompt: %s\n", dbg_dec.c_str());
-                    }
-                } else {
-                    assembled += "<s>[INST] ";
-                    if (system_prompt && system_prompt[0] != '\0') {
-                        assembled += "<<SYS>>\n";
-                        assembled += system_prompt;
-                        assembled += "\n<</SYS>>\n\n";
-                    }
-                    size_t begin = history.size() > (size_t)max_history ? history.size() - (size_t)max_history : 0;
-                    for (size_t i = begin; i + 1 < history.size(); i += 2) {
-                        assembled += history[i];
-                        assembled += " [/INST] ";
-                        assembled += history[i + 1];
-                        assembled += " </s><s>[INST] ";
-                    }
-                    assembled += line;
-                    assembled += " [/INST]";
+                bool used_auto_qwen = false;
+                std::string assembled = render_template_auto(history, model_chat_template, system_prompt, line, &used_auto_qwen);
+                if (used_auto_qwen) {
+                    fprintf(stderr, "[main] auto-detected qwen-style chat template\n");
+                }
+                // debug: log assembled prompt tokens
+                std::vector<int> dbg_ids = tokenizer_encode(assembled);
+                fprintf(stderr, "[main] assembled prompt token count=%zu\n", dbg_ids.size());
+                if (!dbg_ids.empty()) {
+                    fprintf(stderr, "[main] token ids:");
+                    for (size_t ii=0; ii<dbg_ids.size(); ++ii) fprintf(stderr, " %d", dbg_ids[ii]);
+                    fprintf(stderr, "\n");
+                    std::string dbg_dec = tokenizer_decode(dbg_ids);
+                    fprintf(stderr, "[main] decoded assembled prompt: %s\n", dbg_dec.c_str());
                 }
                 // If model doesn't provide a template, default to single deterministic template.
                 // Optional debug mode can still run all candidate templates.

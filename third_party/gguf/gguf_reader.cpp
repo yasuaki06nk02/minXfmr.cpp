@@ -18,6 +18,20 @@ static bool rd_u64(const std::vector<uint8_t>& d, size_t& p, uint64_t& out) {
     return true;
 }
 
+static bool rd_f32(const std::vector<uint8_t>& d, size_t& p, float& out) {
+    uint32_t v = 0;
+    if (!rd_u32(d, p, v)) return false;
+    std::memcpy(&out, &v, sizeof(out));
+    return true;
+}
+
+static bool rd_f64(const std::vector<uint8_t>& d, size_t& p, double& out) {
+    uint64_t v = 0;
+    if (!rd_u64(d, p, v)) return false;
+    std::memcpy(&out, &v, sizeof(out));
+    return true;
+}
+
 static bool rd_str(const std::vector<uint8_t>& d, size_t& p, std::string& s) {
     uint64_t n = 0;
     if (!rd_u64(d, p, n)) return false;
@@ -53,6 +67,14 @@ static bool skip_gguf_value(const std::vector<uint8_t>& d, size_t& p, uint32_t t
         default:
             return false;
     }
+}
+
+static bool key_matches_meta(const std::string& key, const char* suffix) {
+    const size_t suffix_len = std::strlen(suffix);
+    if (key == suffix) return true;
+    if (key.size() <= suffix_len) return false;
+    if (key.compare(key.size() - suffix_len, suffix_len, suffix) != 0) return false;
+    return key[key.size() - suffix_len - 1] == '.';
 }
 
 static const char* type_name(uint32_t t) {
@@ -142,6 +164,7 @@ bool gguf_open(const char* path, GGUF_File& out) {
     out.n_embd = 0;
     out.n_head = 0;
     out.n_head_kv = 0;
+    out.rope_freq_base = 0.0f;
     out.architecture.clear();
 
     size_t p = 0;
@@ -183,6 +206,18 @@ bool gguf_open(const char* path, GGUF_File& out) {
             if (sv < 0) return false;
             v = (uint64_t)sv;
             return true;
+        }
+        return false;
+    };
+    auto read_meta_f64 = [&](uint32_t t, size_t at, double& v)->bool {
+        if (t == 6) {
+            float f = 0.0f;
+            if (!rd_f32(out.data, at, f)) return false;
+            v = (double)f;
+            return true;
+        }
+        if (t == 12) {
+            return rd_f64(out.data, at, v);
         }
         return false;
     };
@@ -294,20 +329,39 @@ bool gguf_open(const char* path, GGUF_File& out) {
         uint64_t mv = 0;
         if (read_meta_u64(t, before, mv)) {
             // support multiple common metadata key names for portability
-            if (key == "llama.block_count" || key == "num_layers" || key == "model.num_layers") {
+            if (key_matches_meta(key, "block_count") || key == "num_layers" || key == "model.num_layers") {
                 out.n_layer = mv;
-            } else if (key == "llama.context_length" || key == "context_length") {
+            } else if (key_matches_meta(key, "context_length")) {
                 out.n_ctx = mv;
-            } else if (key == "llama.embedding_length" || key == "hidden_size") {
+            } else if (key_matches_meta(key, "embedding_length") || key == "hidden_size") {
                 out.n_embd = mv;
-            } else if (key == "llama.attention.head_count" || key == "num_heads") {
+            } else if (key_matches_meta(key, "attention.head_count") || key == "num_heads" || key == "num_attention_heads") {
                 out.n_head = mv;
-            } else if (key == "llama.attention.head_count_kv" || key == "num_heads_kv") {
+            } else if (key_matches_meta(key, "attention.head_count_kv") || key == "num_heads_kv" || key == "num_key_value_heads") {
                 out.n_head_kv = mv;
-            } else if (key == "llama.feed_forward_length" || key == "intermediate_size" || key == "feed_forward_length" || key == "ffn_size") {
+            } else if (key_matches_meta(key, "feed_forward_length") || key == "intermediate_size" || key == "ffn_size") {
                 out.n_intermediate = mv;
-            } else if (key == "vocab_size" || key == "tokenizer.vocab_size") {
+            } else if (key_matches_meta(key, "vocab_size") || key == "tokenizer.vocab_size") {
                 out.vocab_size = mv;
+            } else if (key_matches_meta(key, "rope.freq_base") || key == "rope_theta") {
+                if (t == 4 || t == 5) {
+                    uint32_t bits = (uint32_t)mv;
+                    float f = 0.0f;
+                    std::memcpy(&f, &bits, sizeof(f));
+                    out.rope_freq_base = f;
+                } else if (t == 10 || t == 11) {
+                    double dv = 0.0;
+                    std::memcpy(&dv, &mv, sizeof(dv));
+                    out.rope_freq_base = (float)dv;
+                }
+            }
+        }
+        double mf = 0.0;
+        if (read_meta_f64(t, before, mf)) {
+            if (key_matches_meta(key, "rope.freq_base") || key == "rope_theta") {
+                out.rope_freq_base = (float)mf;
+            } else if (key_matches_meta(key, "attention.layer_norm_rms_epsilon") || key_matches_meta(key, "layer_norm_rms_epsilon") || key == "rms_norm_eps") {
+                out.rmsnorm_epsilon = (float)mf;
             }
         }
 
@@ -323,7 +377,7 @@ bool gguf_open(const char* path, GGUF_File& out) {
             }
         }
         // Try to capture chat template strings if present
-        if ((key == "chat_template" || key == "general.chat_template" || key == "model.chat_template") && t == 8) {
+        if ((key == "chat_template" || key == "general.chat_template" || key == "model.chat_template" || key == "tokenizer.chat_template") && t == 8) {
             // we already skipped/consumed the string at 'before', re-parse it
             size_t tmp_p = before;
             std::string tmp;
@@ -408,6 +462,8 @@ bool gguf_open(const char* path, GGUF_File& out) {
 void gguf_close(GGUF_File& f) {
     f.data.clear(); f.tensors.clear(); f.path.clear();
     f.n_layer = f.n_ctx = f.n_embd = f.n_head = f.n_head_kv = 0;
+    f.rope_freq_base = 0.0f;
+    f.rmsnorm_epsilon = 1e-6f;
     f.architecture.clear();
     f.n_intermediate = 0;
     f.vocab_size = 0;
@@ -436,6 +492,8 @@ bool gguf_read_model_config(const char* path, GGUF_ModelConfig& out) {
     out.intermediate_size = f.n_intermediate;
     out.num_heads = f.n_head;
     out.vocab_size = f.vocab_size;
+    out.rope_freq_base = f.rope_freq_base;
+    out.rmsnorm_epsilon = f.rmsnorm_epsilon;
     gguf_close(f);
     return true;
 }

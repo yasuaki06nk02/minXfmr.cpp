@@ -12,6 +12,7 @@ bool tokenizer_load_from_gguf(const GGUF_File& gf);
 
 int tokenizer_token_to_id(const std::string& token);
 std::string tokenizer_id_to_token(int id);
+std::string tokenizer_render_piece(const std::string& piece);
 
 std::vector<int> tokenizer_encode(const std::string& text);
 std::string tokenizer_decode(const std::vector<int>& ids);

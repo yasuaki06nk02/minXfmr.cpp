@@ -10,11 +10,15 @@ struct GGUFLoaderModelConfig {
 	uint64_t n_embd;
 	uint64_t n_head;
 	uint64_t n_head_kv;
+	uint64_t n_intermediate;
+	float rope_freq_base;
+	float rmsnorm_epsilon;
 };
 
 // Heuristic GGUF loader: best-effort search for int dim followed by 3*d*d floats.
 bool gguf_try_load_projections(const char* path, Tensor*& outWq, Tensor*& outWk, Tensor*& outWv);
 bool gguf_try_load_projections_for_layer(const char* path, int layer, Tensor*& outWq, Tensor*& outWk, Tensor*& outWv);
+bool gguf_try_load_projection_biases_for_layer(const char* path, int layer, Tensor*& outBq, Tensor*& outBk, Tensor*& outBv);
 bool gguf_try_load_attn_out_for_layer(const char* path, int layer, Tensor*& outWo);
 bool gguf_try_load_norms_for_layer(const char* path, int layer, Tensor*& outAttnNorm, Tensor*& outFfnNorm);
 bool gguf_try_load_ffn_for_layer(const char* path, int layer, Tensor*& outWgate, Tensor*& outWup, Tensor*& outWdown);

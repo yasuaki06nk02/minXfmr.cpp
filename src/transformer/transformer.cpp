@@ -124,6 +124,27 @@ static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out,
     return false;
 }
 
+static bool add_bias_inplace(Tensor* x, const Tensor* bias) {
+    if (!x || !bias || x->type != DataType::F32 || bias->type != DataType::F32) return false;
+    const size_t cols = x->cols;
+    const float* bd = (const float*)bias->data;
+    float* xd = (float*)x->data;
+
+    if (bias->rows == 1 && bias->cols == cols) {
+        for (size_t r = 0; r < x->rows; ++r) {
+            for (size_t c = 0; c < cols; ++c) xd[r * cols + c] += bd[c];
+        }
+        return true;
+    }
+    if (bias->cols == 1 && bias->rows == cols) {
+        for (size_t r = 0; r < x->rows; ++r) {
+            for (size_t c = 0; c < cols; ++c) xd[r * cols + c] += bd[c];
+        }
+        return true;
+    }
+    return false;
+}
+
 static inline float silu_f32(float x) {
     return x / (1.0f + expf(-x));
 }
@@ -167,6 +188,9 @@ bool transformer_forward_single_layer(
     const Tensor* Wq_in,
     const Tensor* Wk_in,
     const Tensor* Wv_in,
+    const Tensor* Bq_in,
+    const Tensor* Bk_in,
+    const Tensor* Bv_in,
     const Tensor* Wo_in,
     const Tensor* Wattn_norm_in,
     const Tensor* Wffn_norm_in,
@@ -174,7 +198,9 @@ bool transformer_forward_single_layer(
     const Tensor* Wffn_up_in,
     const Tensor* Wffn_down_in,
     float* scores_workspace,
-    size_t scores_workspace_len) {
+    size_t scores_workspace_len,
+    float rope_theta,
+    float rmsnorm_epsilon) {
     if (!input || !output) return false;
     // Shapes: input seq x d
     size_t seq = input->rows;
@@ -204,7 +230,7 @@ bool transformer_forward_single_layer(
     Tensor* norm = tensor_create_f32(seq, d);
     if (!norm) return false;
 
-    if (!rmsnorm_forward(input, norm)) { tensor_free(norm); return false; }
+    if (!rmsnorm_forward(input, norm, rmsnorm_epsilon)) { tensor_free(norm); return false; }
     if (Wattn_norm_in) apply_norm_scale(norm, Wattn_norm_in);
 
     // Project norm -> Q,K,V. We accept either [din x dout] or [dout x din] weight layout.
@@ -215,6 +241,10 @@ bool transformer_forward_single_layer(
     bool q_ok = Wq_in ? project_with_weight(norm, Wq_in, Qraw, g_transpose_square_wq) : false;
     bool k_ok = Wk_in ? project_with_weight(norm, Wk_in, Kraw, g_transpose_square_wk) : false;
     bool v_ok = Wv_in ? project_with_weight(norm, Wv_in, Vraw, g_transpose_square_wv) : false;
+
+    if (q_ok && Qraw && Bq_in) add_bias_inplace(Qraw, Bq_in);
+    if (k_ok && Kraw && Bk_in) add_bias_inplace(Kraw, Bk_in);
+    if (v_ok && Vraw && Bv_in) add_bias_inplace(Vraw, Bv_in);
 
     if (!q_ok || !k_ok || !v_ok) {
         tensor_free(Qraw); tensor_free(Kraw); tensor_free(Vraw);
@@ -277,8 +307,8 @@ bool transformer_forward_single_layer(
     }
 
     const size_t start_pos = (cache != nullptr && layer < cache->layers) ? cache->lengths[layer] : 0;
-    rope_apply(Qraw, start_pos, use_n_head, head_dim);
-    rope_apply(Kraw, start_pos, use_n_head_kv, kv_head_dim);
+    rope_apply(Qraw, start_pos, use_n_head, head_dim, rope_theta);
+    rope_apply(Kraw, start_pos, use_n_head_kv, kv_head_dim, rope_theta);
 
     Tensor* Q = Qraw;
     Tensor* K = Kraw;
@@ -427,7 +457,7 @@ bool transformer_forward_single_layer(
         Tensor* down = nullptr;
 
         Tensor* ffn_norm = tensor_create_f32(seq, d);
-        if (ffn_norm && rmsnorm_forward(resid1, ffn_norm)) {
+        if (ffn_norm && rmsnorm_forward(resid1, ffn_norm, rmsnorm_epsilon)) {
             if (Wffn_norm_in) apply_norm_scale(ffn_norm, Wffn_norm_in);
             bool g_ok = project_with_weight(ffn_norm, Wffn_gate_in, gate, false);
             bool u_ok = project_with_weight(ffn_norm, Wffn_up_in, up, false);

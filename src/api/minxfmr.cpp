@@ -29,6 +29,9 @@ struct minxfmr_context {
     std::vector<Tensor*> Wq_layers;
     std::vector<Tensor*> Wk_layers;
     std::vector<Tensor*> Wv_layers;
+    std::vector<Tensor*> Bq_layers;
+    std::vector<Tensor*> Bk_layers;
+    std::vector<Tensor*> Bv_layers;
     std::vector<Tensor*> Wo_layers;
     std::vector<Tensor*> Wattn_norm_layers;
     std::vector<Tensor*> Wffn_norm_layers;
@@ -40,6 +43,9 @@ struct minxfmr_context {
     size_t n_layer;
     size_t n_head;
     size_t n_head_kv;
+    size_t n_intermediate;
+    float rope_theta;
+    float rmsnorm_epsilon;
     size_t seq_max;
     std::vector<float> scores_workspace;
     int dummy;
@@ -50,29 +56,8 @@ struct minxfmr_context {
 
 static std::string render_token_piece(const std::string& piece) {
     if (piece.empty()) return piece;
-    // Drop byte-fallback pieces like <0xE3>.
     if (piece.size() == 6 && piece.rfind("<0x", 0) == 0 && piece[5] == '>') return std::string();
-
-    std::string out;
-    out.reserve(piece.size() + 1);
-    const std::string spm = "\xE2\x96\x81"; // U+2581
-    const std::string spm2 = "\xC4\xA0"; // U+0120 (Latin capital G with dot)
-    size_t i = 0;
-    while (i < piece.size()) {
-        if (i + spm.size() <= piece.size() && piece.compare(i, spm.size(), spm) == 0) {
-            out.push_back(' ');
-            i += spm.size();
-            continue;
-        }
-        if (i + spm2.size() <= piece.size() && piece.compare(i, spm2.size(), spm2) == 0) {
-            out.push_back(' ');
-            i += spm2.size();
-            continue;
-        }
-        out.push_back(piece[i]);
-        i += 1;
-    }
-    return out;
+    return tokenizer_render_piece(piece);
 }
 
 static size_t infer_kv_dim_from_weight(const Tensor* w, size_t model_dim) {
@@ -208,11 +193,11 @@ static bool apply_norm_scale_local(Tensor* x, const Tensor* w) {
     return false;
 }
 
-static bool apply_final_norm_inplace(Tensor* x, const Tensor* wnorm) {
+static bool apply_final_norm_inplace(Tensor* x, const Tensor* wnorm, float rmsnorm_epsilon) {
     if (!x) return false;
     Tensor* tmp = tensor_create_f32(x->rows, x->cols);
     if (!tmp) return false;
-    bool ok = rmsnorm_forward(x, tmp);
+    bool ok = rmsnorm_forward(x, tmp, rmsnorm_epsilon);
     if (ok && wnorm) ok = apply_norm_scale_local(tmp, wnorm);
     if (ok) memcpy(x->data, tmp->data, sizeof(float) * x->rows * x->cols);
     tensor_free(tmp);
@@ -254,6 +239,9 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
         const Tensor* Wq = ctx->Wq;
         const Tensor* Wk = ctx->Wk;
         const Tensor* Wv = ctx->Wv;
+        const Tensor* Bq = nullptr;
+        const Tensor* Bk = nullptr;
+        const Tensor* Bv = nullptr;
         const Tensor* Wo = nullptr;
         const Tensor* WattnNorm = nullptr;
         const Tensor* WffnNorm = nullptr;
@@ -261,6 +249,9 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
             if (ctx->Wq_layers[l]) Wq = ctx->Wq_layers[l];
             if (ctx->Wk_layers[l]) Wk = ctx->Wk_layers[l];
             if (ctx->Wv_layers[l]) Wv = ctx->Wv_layers[l];
+            if (l < ctx->Bq_layers.size() && ctx->Bq_layers[l]) Bq = ctx->Bq_layers[l];
+            if (l < ctx->Bk_layers.size() && ctx->Bk_layers[l]) Bk = ctx->Bk_layers[l];
+            if (l < ctx->Bv_layers.size() && ctx->Bv_layers[l]) Bv = ctx->Bv_layers[l];
             if (!ctx->Wo_layers.empty()) Wo = ctx->Wo_layers[l];
             if (!ctx->Wattn_norm_layers.empty()) WattnNorm = ctx->Wattn_norm_layers[l];
             if (!ctx->Wffn_norm_layers.empty()) WffnNorm = ctx->Wffn_norm_layers[l];
@@ -278,7 +269,7 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
         float* scores_buf = ctx->scores_workspace.data();
         size_t scores_len = ctx->scores_workspace.size();
 
-        bool ok = transformer_forward_single_layer(cur, nxt, ctx->cache, l, ctx->n_head, ctx->n_head_kv, Wq, Wk, Wv, Wo, WattnNorm, WffnNorm, Wfg, Wfu, Wfd, scores_buf, scores_len);
+        bool ok = transformer_forward_single_layer(cur, nxt, ctx->cache, l, ctx->n_head, ctx->n_head_kv, Wq, Wk, Wv, Bq, Bk, Bv, Wo, WattnNorm, WffnNorm, Wfg, Wfu, Wfd, scores_buf, scores_len, ctx->rope_theta, ctx->rmsnorm_epsilon);
         tensor_free(cur);
         if (!ok) {
             tensor_free(nxt);
@@ -328,11 +319,14 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     ctx->Wffn_gate_layers.clear();
     ctx->Wffn_up_layers.clear();
     ctx->Wffn_down_layers.clear();
-    ctx->model_dim = 4;
-    ctx->kv_dim = 4;
+    ctx->model_dim = 0;
+    ctx->kv_dim = 0;
     ctx->n_layer = 1;
-    ctx->n_head = 1;
-    ctx->n_head_kv = 1;
+    ctx->n_head = 0;
+    ctx->n_head_kv = 0;
+    ctx->n_intermediate = 0;
+    ctx->rope_theta = 10000.0f;
+    ctx->rmsnorm_epsilon = 1e-6f;
     ctx->seq_max = 128;
 
     const char* ext = strrchr(model_path, '.');
@@ -390,15 +384,21 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     }
 
     if (looks_gguf) {
-        GGUFLoaderModelConfig cfg{0, 0, 0, 0, 0};
+        GGUFLoaderModelConfig cfg{0, 0, 0, 0, 0, 0, 0.0f, 1e-6f};
         if (gguf_try_read_model_config(model_path, cfg)) {
             if (cfg.n_layer > 0) ctx->n_layer = (size_t)cfg.n_layer;
             if (cfg.n_ctx > 0) ctx->seq_max = (size_t)cfg.n_ctx;
             if (cfg.n_embd > 0) ctx->model_dim = (size_t)cfg.n_embd;
             if (cfg.n_head > 0) ctx->n_head = (size_t)cfg.n_head;
             if (cfg.n_head_kv > 0) ctx->n_head_kv = (size_t)cfg.n_head_kv;
+            if (cfg.n_intermediate > 0) ctx->n_intermediate = (size_t)cfg.n_intermediate;
+            if (cfg.rope_freq_base > 0.0f) ctx->rope_theta = cfg.rope_freq_base;
+            if (cfg.rmsnorm_epsilon > 0.0f) ctx->rmsnorm_epsilon = cfg.rmsnorm_epsilon;
             fprintf(stderr, "[minxfmr] gguf meta layers=%zu ctx=%zu embd=%zu head=%zu head_kv=%zu\n",
                 ctx->n_layer, ctx->seq_max, ctx->model_dim, (size_t)cfg.n_head, (size_t)cfg.n_head_kv);
+            fprintf(stderr, "[minxfmr] ffn intermediate=%zu\n", ctx->n_intermediate);
+            fprintf(stderr, "[minxfmr] rope theta=%g\n", (double)ctx->rope_theta);
+            fprintf(stderr, "[minxfmr] rmsnorm epsilon=%g\n", (double)ctx->rmsnorm_epsilon);
             if (cfg.n_head == 0 || cfg.n_head_kv == 0) {
                 fprintf(stderr,
                     "[minxfmr] warning: gguf head metadata missing (llama.attention.head_count / llama.attention.head_count_kv). "
@@ -453,6 +453,9 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         ctx->Wq_layers.resize(ctx->n_layer, nullptr);
         ctx->Wk_layers.resize(ctx->n_layer, nullptr);
         ctx->Wv_layers.resize(ctx->n_layer, nullptr);
+        ctx->Bq_layers.resize(ctx->n_layer, nullptr);
+        ctx->Bk_layers.resize(ctx->n_layer, nullptr);
+        ctx->Bv_layers.resize(ctx->n_layer, nullptr);
         ctx->Wo_layers.resize(ctx->n_layer, nullptr);
         ctx->Wattn_norm_layers.resize(ctx->n_layer, nullptr);
         ctx->Wffn_norm_layers.resize(ctx->n_layer, nullptr);
@@ -461,6 +464,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         ctx->Wffn_down_layers.resize(ctx->n_layer, nullptr);
 
         size_t loaded_attn_layers = 0;
+        size_t loaded_attn_bias_layers = 0;
         size_t loaded_wo_layers = 0;
         size_t loaded_norm_layers = 0;
         size_t loaded_ffn_layers = 0;
@@ -473,6 +477,16 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 ctx->Wk_layers[l] = lk;
                 ctx->Wv_layers[l] = lv;
                 loaded_attn_layers++;
+            }
+
+            Tensor* bq = nullptr;
+            Tensor* bk = nullptr;
+            Tensor* bv = nullptr;
+            if (gguf_try_load_projection_biases_for_layer(model_path, (int)l, bq, bk, bv)) {
+                ctx->Bq_layers[l] = bq;
+                ctx->Bk_layers[l] = bk;
+                ctx->Bv_layers[l] = bv;
+                loaded_attn_bias_layers++;
             }
 
             Tensor* wo = nullptr;
@@ -509,6 +523,9 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                     break;
                 }
             }
+        }
+        if (loaded_attn_bias_layers > 0) {
+            fprintf(stderr, "[minxfmr] loaded per-layer projection biases: %zu/%zu layers\n", loaded_attn_bias_layers, ctx->n_layer);
         }
         if (loaded_ffn_layers > 0) {
             fprintf(stderr, "[minxfmr] loaded per-layer ffn weights: %zu/%zu layers\n", loaded_ffn_layers, ctx->n_layer);
@@ -635,11 +652,12 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
             Tensor*& wfu = ctx->Wffn_up_layers[l];
             Tensor*& wfd = ctx->Wffn_down_layers[l];
 
-            size_t ffn_hidden = 0;
+            size_t ffn_hidden = ctx->n_intermediate;
             if (wfg) {
                 if (normalize_linear_inplace(wfg, ctx->model_dim, desired_transpose_ffn_square, tr)) {
                     if (tr) ++n_ffn_gate;
                     if (wfg->rows == ctx->model_dim) ffn_hidden = wfg->cols;
+                    else if (wfg->cols == ctx->model_dim) ffn_hidden = wfg->rows;
                 } else {
                     ++bad_ffn;
                 }
@@ -649,15 +667,20 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 if (normalize_linear_inplace(wfu, ctx->model_dim, desired_transpose_ffn_square, tr)) {
                     if (tr) ++n_ffn_up;
                     if (ffn_hidden == 0 && wfu->rows == ctx->model_dim) ffn_hidden = wfu->cols;
+                    else if (ffn_hidden == 0 && wfu->cols == ctx->model_dim) ffn_hidden = wfu->rows;
                 } else {
                     ++bad_ffn;
                 }
             }
 
+            if (wfg && ffn_hidden > 0 && wfg->rows != ctx->model_dim && wfg->cols != ffn_hidden) ++bad_ffn;
+            if (wfu && ffn_hidden > 0 && wfu->rows != ctx->model_dim && wfu->cols != ffn_hidden) ++bad_ffn;
+
             if (wfd) {
                 if (ffn_hidden > 0) {
                     if (normalize_linear_inplace(wfd, ffn_hidden, desired_transpose_ffn_square, tr)) {
                         if (tr) ++n_ffn_down;
+                        if (wfd->rows != ffn_hidden && wfd->cols != ctx->model_dim) ++bad_ffn;
                     } else {
                         ++bad_ffn;
                     }
@@ -766,11 +789,12 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     // as generation terminators and skip role/template markers when
     // streaming/pushing history to avoid template leakage.
     auto is_eos_token = [](const std::string &s) {
-        return s == "</s>" || s == "<|endoftext|>" || s == "<|pad|>";
+        return s == "</s>" || s == "<|endoftext|>" || s == "<|pad|>" || s == "<|im_end|>";
     };
     auto is_role_token = [](const std::string &s) {
         return s == "<s>" || s == "</s>" || s == "[INST]" || s == "[/INST]" ||
-               s == "<|assistant|>" || s == "<|user|>" || s == "<assistant>" || s == "<user>" ||
+               s == "<|assistant|>" || s == "<|user|>" || s == "<|im_start|>" || s == "<|im_end|>" ||
+               s == "<assistant>" || s == "<user>" ||
                s == "[/ASSISTANT]" || s == "[/USER]" || s == "speaker" || s == "<speaker>" ||
                s == "<<SYS>>" || s == "<</SYS>>";
     };
@@ -835,7 +859,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
 
         if (!out) { fprintf(stderr, "[minxfmr] no output tensor at step=%d last=%d\n", t, last); fflush(stderr); gen_break_reason = "no_out"; break; }
 
-        if (ctx->Wnorm) apply_final_norm_inplace(out, ctx->Wnorm);
+        if (ctx->Wnorm) apply_final_norm_inplace(out, ctx->Wnorm, ctx->rmsnorm_epsilon);
 
         size_t vocab_size = vocab_size_base;
         std::vector<double> logits(vocab_size, 0.0);
@@ -1039,7 +1063,8 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                 for (auto &pp : pending_token_buf) concat += pp.second;
 
                 static const std::vector<std::string> role_markers = {
-                    "<s>", "[INST]", "[/INST]", "<|assistant|>", "<|user|>", "<<SYS>>", "<</SYS>>"
+                    "<s>", "[INST]", "[/INST]", "<|assistant|>", "<|user|>",
+                    "<|im_start|>", "<|im_end|>", "<<SYS>>", "<</SYS>>"
                 };
 
                 bool is_prefix = false;
@@ -1228,6 +1253,9 @@ void minxfmr_close(minxfmr_context* ctx) {
     free_layer_weights(ctx->Wq_layers);
     free_layer_weights(ctx->Wk_layers);
     free_layer_weights(ctx->Wv_layers);
+    free_layer_weights(ctx->Bq_layers);
+    free_layer_weights(ctx->Bk_layers);
+    free_layer_weights(ctx->Bv_layers);
     free_layer_weights(ctx->Wo_layers);
     free_layer_weights(ctx->Wattn_norm_layers);
     free_layer_weights(ctx->Wffn_norm_layers);

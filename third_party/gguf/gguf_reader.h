@@ -27,6 +27,8 @@ struct GGUF_File {
     uint64_t n_embd = 0;
     uint64_t n_head = 0;
     uint64_t n_head_kv = 0;
+    float rope_freq_base = 0.0f;
+    float rmsnorm_epsilon = 1e-6f;
     std::string architecture;
     // additional metadata
     uint64_t n_intermediate = 0; // feed-forward / intermediate size
@@ -53,6 +55,8 @@ struct GGUF_ModelConfig {
     uint64_t intermediate_size = 0; // feed-forward size
     uint64_t num_heads = 0;         // alias for n_head
     uint64_t vocab_size = 0;        // vocab size (if available)
+    float rope_freq_base = 0.0f;    // RoPE base / theta when available
+    float rmsnorm_epsilon = 1e-6f;  // RMSNorm epsilon when available
 };
 
 bool gguf_open(const char* path, GGUF_File& out);

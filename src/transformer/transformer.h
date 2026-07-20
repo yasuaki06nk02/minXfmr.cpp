@@ -18,6 +18,9 @@ bool transformer_forward_single_layer(
 	const Tensor* Wq_in = nullptr,
 	const Tensor* Wk_in = nullptr,
 	const Tensor* Wv_in = nullptr,
+	const Tensor* Bq_in = nullptr,
+	const Tensor* Bk_in = nullptr,
+	const Tensor* Bv_in = nullptr,
 	const Tensor* Wo_in = nullptr,
 	const Tensor* Wattn_norm_in = nullptr,
 	const Tensor* Wffn_norm_in = nullptr,
@@ -25,7 +28,9 @@ bool transformer_forward_single_layer(
 	const Tensor* Wffn_up_in = nullptr,
 	const Tensor* Wffn_down_in = nullptr,
 	float* scores_workspace = nullptr,
-	size_t scores_workspace_len = 0);
+	size_t scores_workspace_len = 0,
+	float rope_theta = 10000.0f,
+	float rmsnorm_epsilon = 1e-6f);
 
 // If enabled, square projection matrices (rows == cols == d_in) are treated as transposed.
 void transformer_set_transpose_square_weights(bool enabled);

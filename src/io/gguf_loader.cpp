@@ -104,6 +104,56 @@ bool gguf_try_load_projections_for_layer(const char* path, int layer, Tensor*& o
     return (outWq != nullptr && outWk != nullptr && outWv != nullptr);
 }
 
+bool gguf_try_load_projection_biases_for_layer(const char* path, int layer, Tensor*& outBq, Tensor*& outBk, Tensor*& outBv) {
+    outBq = outBk = outBv = nullptr;
+    GGUF_File gf;
+    if (!gguf_open(path, gf)) return false;
+
+    auto make_candidates = [&](char proj) {
+        std::vector<std::string> names;
+        char b0[64], b1[96], b2[80], b3[96], b4[96];
+        const char* suf = (proj == 'q') ? "q" : ((proj == 'k') ? "k" : "v");
+        std::snprintf(b0, sizeof(b0), "blk.%d.attn_%c.bias", layer, proj);
+        std::snprintf(b1, sizeof(b1), "model.layers.%d.attention.w%c.bias", layer, proj);
+        std::snprintf(b2, sizeof(b2), "layers.%d.attention.w%c.bias", layer, proj);
+        std::snprintf(b3, sizeof(b3), "model.blocks.%d.attention.w%c.bias", layer, proj);
+        std::snprintf(b4, sizeof(b4), "layers.%d.attn.w%c.bias", layer, proj);
+        names.emplace_back(b0);
+        names.emplace_back(b1);
+        names.emplace_back(b2);
+        names.emplace_back(b3);
+        names.emplace_back(b4);
+        names.emplace_back(std::string(suf) + "_proj.bias");
+        names.emplace_back(std::string("attn_") + suf + ".bias");
+        names.emplace_back(std::string("w") + suf + ".bias");
+        return names;
+    };
+
+    auto load_one = [&](const std::vector<std::string>& names, const char* tag, Tensor*& out) {
+        std::vector<const char*> cands;
+        cands.reserve(names.size());
+        for (const std::string& s : names) cands.push_back(s.c_str());
+        GGUF_TensorInfo info;
+        if (!gguf_find_tensor_any(gf, cands.data(), cands.size(), info)) return;
+        Tensor* t = nullptr;
+        if (gguf_read_tensor(gf, info, t)) {
+            float minv, maxv;
+            double mean;
+            gguf_tensor_stats(t, minv, maxv, mean);
+            fprintf(stderr, "[gguf] loaded %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
+                tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+            out = t;
+        }
+    };
+
+    load_one(make_candidates('q'), "Bq", outBq);
+    load_one(make_candidates('k'), "Bk", outBk);
+    load_one(make_candidates('v'), "Bv", outBv);
+
+    gguf_close(gf);
+    return (outBq != nullptr || outBk != nullptr || outBv != nullptr);
+}
+
 bool gguf_try_load_attn_out_for_layer(const char* path, int layer, Tensor*& outWo) {
     outWo = nullptr;
     GGUF_File gf;
@@ -261,7 +311,7 @@ bool gguf_try_load_ffn_for_layer(const char* path, int layer, Tensor*& outWgate,
 }
 
 bool gguf_try_read_model_config(const char* path, GGUFLoaderModelConfig& out) {
-    out = GGUFLoaderModelConfig{0,0,0,0,0};
+    out = GGUFLoaderModelConfig{0,0,0,0,0,0,0.0f,1e-6f};
     GGUF_ModelConfig cfg;
     if (!gguf_read_model_config(path, cfg)) return false;
     out.n_layer = cfg.n_layer;
@@ -269,6 +319,9 @@ bool gguf_try_read_model_config(const char* path, GGUFLoaderModelConfig& out) {
     out.n_embd = cfg.n_embd;
     out.n_head = cfg.n_head;
     out.n_head_kv = cfg.n_head_kv;
+    out.n_intermediate = cfg.intermediate_size;
+    out.rope_freq_base = cfg.rope_freq_base;
+    out.rmsnorm_epsilon = cfg.rmsnorm_epsilon;
     return true;
 }
 
