@@ -807,7 +807,10 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     float* global_chunk_workspace = nullptr;
     if (global_chunk_size > 0) global_chunk_workspace = cpu_request_workspace(global_chunk_size);
 
-    for (int t = 0; t < max_steps; ++t) {
+    int t = 0;
+    std::string gen_break_reason = "none";
+    int gen_tokens_emitted = 0;
+    for (t = 0; t < max_steps; ++t) {
         Tensor* in = nullptr;
         Tensor* out = nullptr;
         int next = 0;
@@ -820,7 +823,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             if (in && out) run_stack_forward(ctx, in, out);
         }
 
-        if (!out) break;
+        if (!out) { gen_break_reason = "no_out"; break; }
 
         if (ctx->Wnorm) apply_final_norm_inplace(out, ctx->Wnorm);
 
@@ -932,6 +935,8 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
 
         // If model emits an explicit EOS token, stop generation immediately.
         if (is_eos_token(raw_tok)) {
+            fprintf(stderr, "[minxfmr] stopping on EOS token id=%d raw='%s'\n", next, raw_tok.c_str());
+            gen_break_reason = "eos";
             if (in) tensor_free(in);
             if (out) tensor_free(out);
             break;
@@ -952,6 +957,9 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             } else {
                 if (callback) callback(tok.c_str());
             }
+            ++gen_tokens_emitted;
+        } else {
+            fprintf(stderr, "[minxfmr] suppressed role/template token id=%d raw='%s'\n", next, raw_tok.c_str());
         }
 
         if (!skip_role) recent_tokens.push_back(next);
@@ -968,6 +976,10 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     }
 
     if (last_out_prefill) tensor_free(last_out_prefill);
+
+    if (gen_break_reason == "none") gen_break_reason = "max_steps";
+    fprintf(stderr, "[minxfmr] generation finished: emitted=%d last=%d reason=%s steps=%d max=%d\n",
+        gen_tokens_emitted, last, gen_break_reason.c_str(), t, max_steps);
 
     // If emitting JSON, build object and write to stdout.
     if (emit_json) {
