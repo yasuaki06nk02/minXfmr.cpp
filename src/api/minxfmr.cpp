@@ -957,11 +957,10 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         if (!skip_role) recent_tokens.push_back(next);
         if (recent_tokens.size() > 48) recent_tokens.erase(recent_tokens.begin());
 
-        if (t >= 6 && (tok.find('.') != std::string::npos || tok.find('!') != std::string::npos || tok.find('?') != std::string::npos)) {
-            if (in) tensor_free(in);
-            if (out) tensor_free(out);
-            break;
-        }
+        // Removed heuristic: previously we stopped generation early when a
+        // punctuation token ('.','!','?') appeared after a few tokens.
+        // This caused premature truncation of replies; rely on explicit EOS
+        // tokens and max token limits instead.
 
         if (in) tensor_free(in);
         if (out) tensor_free(out);

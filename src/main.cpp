@@ -51,7 +51,7 @@ int main(int argc, char** argv) {
     float temperature = 1.0f;
     float top_p = 1.0f;
     int top_k = 8;
-    int max_gen_tokens = 24;
+    int max_gen_tokens = 128;
     const char* stop_token = nullptr;
     const char* log_file = nullptr;
     bool run_selftest = false;
