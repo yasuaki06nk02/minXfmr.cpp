@@ -763,7 +763,8 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         }
         tensor_free(out);
     }
-    if (temperature <= 0.0) temperature = 1.0;
+    // When temperature <= 0, use greedy sampling (deterministic argmax).
+    bool sampler_greedy = (temperature <= 0.0);
     if (top_k <= 0) top_k = 1;
     static std::mt19937 rng((unsigned)std::random_device{}());
 
@@ -896,19 +897,25 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         std::vector<double> probs;
         probs.reserve((size_t)k_use);
         double maxs = logits[(size_t)order[0]];
-        double sum = 0.0;
-        for (int i = 0; i < k_use; ++i) {
-            double p = exp((logits[(size_t)order[(size_t)i]] - maxs) / temperature);
-            probs.push_back(p);
-            sum += p;
-        }
-        if (sum <= 0.0) {
+
+        if (sampler_greedy) {
+            // Deterministic greedy: pick the highest-logit token.
             next = order[0];
         } else {
-            for (double& p : probs) p /= sum;
-            std::discrete_distribution<int> dist(probs.begin(), probs.end());
-            int pick = dist(rng);
-            next = order[(size_t)pick];
+            double sum = 0.0;
+            for (int i = 0; i < k_use; ++i) {
+                double p = exp((logits[(size_t)order[(size_t)i]] - maxs) / temperature);
+                probs.push_back(p);
+                sum += p;
+            }
+            if (sum <= 0.0) {
+                next = order[0];
+            } else {
+                for (double& p : probs) p /= sum;
+                std::discrete_distribution<int> dist(probs.begin(), probs.end());
+                int pick = dist(rng);
+                next = order[(size_t)pick];
+            }
         }
 
         std::string raw_tok = tokenizer_id_to_token(next);
