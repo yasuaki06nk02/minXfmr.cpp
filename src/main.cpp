@@ -198,6 +198,104 @@ int main(int argc, char** argv) {
         fprintf(stderr, "[main] square-weight transpose mode: auto (by model architecture)\n");
     }
 
+    if (run_selftest) {
+        // Phase1: simple tensor test
+        Tensor* t = tensor_create_f32(2, 3);
+        if (t) {
+            tensor_set_f32(t, 0, 0, 1.5f);
+            tensor_set_f32(t, 1, 2, 3.25f);
+            printf("tensor[0,0]=%f\n", tensor_get_f32(t,0,0));
+            printf("tensor[1,2]=%f\n", tensor_get_f32(t,1,2));
+            tensor_free(t);
+        }
+
+        // Phase2: CPU backend test (matrix multiply)
+        Tensor* A = tensor_create_f32(2,2);
+        Tensor* B = tensor_create_f32(2,2);
+        Tensor* C = tensor_create_f32(2,2);
+        if (A && B && C) {
+            tensor_set_f32(A,0,0,1.0f); tensor_set_f32(A,0,1,2.0f);
+            tensor_set_f32(A,1,0,3.0f); tensor_set_f32(A,1,1,4.0f);
+
+            tensor_set_f32(B,0,0,5.0f); tensor_set_f32(B,0,1,6.0f);
+            tensor_set_f32(B,1,0,7.0f); tensor_set_f32(B,1,1,8.0f);
+
+            if (cpu_matmul(A,B,C)) {
+                printf("matmul result:\n");
+                for (size_t i=0;i<2;++i) {
+                    for (size_t j=0;j<2;++j) {
+                        printf(" %f", tensor_get_f32(C,i,j));
+                    }
+                    printf("\n");
+                }
+            }
+            tensor_free(A); tensor_free(B); tensor_free(C);
+        }
+
+        // Phase3: Transformer component smoke test
+        // create a small seq=2, dim=4 token hidden matrix
+        Tensor* hidden = tensor_create_f32(2,4);
+        Tensor* hidden_out = tensor_create_f32(2,4);
+        if (hidden && hidden_out) {
+            // fill
+            for (size_t i=0;i<2;i++) for (size_t j=0;j<4;j++) tensor_set_f32(hidden,i,j, (float)(i*4 + j + 1));
+            // RMSNorm
+            if (rmsnorm_forward(hidden, hidden_out)) {
+                printf("rmsnorm ok\n");
+            }
+            // Attention QK scores
+            Tensor* scores = tensor_create_f32(2,2);
+            if (scores && attention_qk(hidden, hidden, scores)) {
+                printf("attention qk ok\n");
+            }
+            // FFN: use W = identity 4x4, b = zeros 1x4, out = seq x 4
+            Tensor* W = tensor_create_f32(4,4);
+            Tensor* b = tensor_create_f32(1,4);
+            Tensor* ffn_out = tensor_create_f32(2,4);
+            if (W && b && ffn_out) {
+                for (size_t i=0;i<4;i++) for (size_t j=0;j<4;j++) tensor_set_f32(W,i,j, (i==j)?1.0f:0.0f);
+                for (size_t j=0;j<4;j++) tensor_set_f32(b,0,j,0.0f);
+                if (ffn_forward(hidden, W, b, ffn_out)) printf("ffn ok\n");
+            }
+            tensor_free(scores);
+            tensor_free(W); tensor_free(b); tensor_free(ffn_out);
+            tensor_free(hidden); tensor_free(hidden_out);
+        }
+
+        // Phase4: single-layer transformer forward
+        Tensor* in = tensor_create_f32(2,4);
+        Tensor* out = tensor_create_f32(2,4);
+        if (in && out) {
+            for (size_t i=0;i<2;i++) for (size_t j=0;j<4;j++) tensor_set_f32(in,i,j,(float)(i*4 + j + 1));
+            if (transformer_forward_single_layer(in,out, nullptr, 0, 1, 1, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr)) {
+                printf("transformer single layer ok\n");
+            }
+            tensor_free(in); tensor_free(out);
+        }
+
+        // Phase5: Tokenizer test
+        tokenizer_load_from_list({"Hello","world","Do","you","remember","my","name","<unk>"});
+        std::vector<int> ids = tokenizer_encode("Hello world unknown_token");
+        printf("token ids:");
+        for (int id: ids) printf(" %d", id);
+        printf("\n");
+
+        printf("decoded: %s\n", tokenizer_decode(ids).c_str());
+
+        // KV Cache test
+        KVCache* cache = kvcache_create(2, 8, 4); // 2 layers, seq_max=8, dim=4
+        if (cache) {
+            float krow[4] = {0.1f,0.2f,0.3f,0.4f};
+            float vrow[4] = {1.1f,1.2f,1.3f,1.4f};
+            kvcache_append(cache, 0, krow, vrow);
+            kvcache_append(cache, 0, krow, vrow);
+            if (cache->lengths[0] == 2) printf("kvcache ok\n");
+            kvcache_reset(cache);
+            kvcache_free(cache);
+        }
+        return 0;
+    }
+
     minxfmr_context* ctx = minxfmr_open_with_layer(model, projection_layer);
     if (!ctx) return 1;
 
@@ -245,110 +343,6 @@ int main(int argc, char** argv) {
         }
         printf("]\n");
         return 0;
-    }
-
-    if (run_selftest) {
-    // Phase1: simple tensor test
-    Tensor* t = tensor_create_f32(2, 3);
-    if (t) {
-        tensor_set_f32(t, 0, 0, 1.5f);
-        tensor_set_f32(t, 1, 2, 3.25f);
-        printf("tensor[0,0]=%f\n", tensor_get_f32(t,0,0));
-        printf("tensor[1,2]=%f\n", tensor_get_f32(t,1,2));
-        tensor_free(t);
-    }
-
-
-    // Phase2: CPU backend test (matrix multiply)
-    Tensor* A = tensor_create_f32(2,2);
-    Tensor* B = tensor_create_f32(2,2);
-    Tensor* C = tensor_create_f32(2,2);
-    if (A && B && C) {
-        tensor_set_f32(A,0,0,1.0f); tensor_set_f32(A,0,1,2.0f);
-        tensor_set_f32(A,1,0,3.0f); tensor_set_f32(A,1,1,4.0f);
-
-        tensor_set_f32(B,0,0,5.0f); tensor_set_f32(B,0,1,6.0f);
-        tensor_set_f32(B,1,0,7.0f); tensor_set_f32(B,1,1,8.0f);
-
-        if (cpu_matmul(A,B,C)) {
-            printf("matmul result:\n");
-            for (size_t i=0;i<2;++i) {
-                for (size_t j=0;j<2;++j) {
-                    printf(" %f", tensor_get_f32(C,i,j));
-                }
-                printf("\n");
-            }
-        }
-        tensor_free(A); tensor_free(B); tensor_free(C);
-    }
-
-    // Phase3: Transformer component smoke test
-    // create a small seq=2, dim=4 token hidden matrix
-    Tensor* hidden = tensor_create_f32(2,4);
-    Tensor* hidden_out = tensor_create_f32(2,4);
-    if (hidden && hidden_out) {
-        // fill
-        for (size_t i=0;i<2;i++) for (size_t j=0;j<4;j++) tensor_set_f32(hidden,i,j, (float)(i*4 + j + 1));
-        // RMSNorm
-        if (rmsnorm_forward(hidden, hidden_out)) {
-            printf("rmsnorm ok\n");
-        }
-        // Attention QK scores
-        Tensor* scores = tensor_create_f32(2,2);
-        if (scores && attention_qk(hidden, hidden, scores)) {
-            printf("attention qk ok\n");
-        }
-        // FFN: use W = identity 4x4, b = zeros 1x4, out = seq x 4
-        Tensor* W = tensor_create_f32(4,4);
-        Tensor* b = tensor_create_f32(1,4);
-        Tensor* ffn_out = tensor_create_f32(2,4);
-        if (W && b && ffn_out) {
-            for (size_t i=0;i<4;i++) for (size_t j=0;j<4;j++) tensor_set_f32(W,i,j, (i==j)?1.0f:0.0f);
-            for (size_t j=0;j<4;j++) tensor_set_f32(b,0,j,0.0f);
-            if (ffn_forward(hidden, W, b, ffn_out)) printf("ffn ok\n");
-        }
-        tensor_free(scores);
-        tensor_free(W); tensor_free(b); tensor_free(ffn_out);
-        tensor_free(hidden); tensor_free(hidden_out);
-    }
-
-    // Phase4: single-layer transformer forward
-    Tensor* in = tensor_create_f32(2,4);
-    Tensor* out = tensor_create_f32(2,4);
-    if (in && out) {
-        for (size_t i=0;i<2;i++) for (size_t j=0;j<4;j++) tensor_set_f32(in,i,j,(float)(i*4 + j + 1));
-        if (transformer_forward_single_layer(in,out, nullptr, 0, 1, 1, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr)) {
-            printf("transformer single layer ok\n");
-        }
-        tensor_free(in); tensor_free(out);
-    }
-
-    // Phase5: Tokenizer test
-    tokenizer_load_from_list({"Hello","world","Do","you","remember","my","name","<unk>"});
-    std::vector<int> ids = tokenizer_encode("Hello world unknown_token");
-    printf("token ids:");
-    for (int id: ids) printf(" %d", id);
-    printf("\n");
-
-    printf("decoded: %s\n", tokenizer_decode(ids).c_str());
-
-    // KV Cache test
-    printf("-- before kvcache create\n");
-    KVCache* cache = kvcache_create(2, 8, 4); // 2 layers, seq_max=8, dim=4
-    printf("-- after kvcache create\n");
-    if (!cache) {
-        printf("kvcache create failed\n");
-    }
-    if (cache) {
-        float krow[4] = {0.1f,0.2f,0.3f,0.4f};
-        float vrow[4] = {1.1f,1.2f,1.3f,1.4f};
-        kvcache_append(cache, 0, krow, vrow);
-        kvcache_append(cache, 0, krow, vrow);
-        printf("kvcache layer0 length=%zu\n", cache->lengths[0]);
-        kvcache_reset(cache);
-        printf("kvcache layer0 after reset=%zu\n", cache->lengths[0]);
-        kvcache_free(cache);
-    }
     }
 
     auto sanitize_assistant_text = [](const std::string& text) {
