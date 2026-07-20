@@ -10,7 +10,6 @@
 #include <cstring>
 #include <cmath>
 #include <algorithm>
-#include <cassert>
 
 static bool g_transpose_square_wq = false;
 static bool g_transpose_square_wk = false;
@@ -73,6 +72,9 @@ static bool cpu_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* 
         for (size_t j = 0; j < n; ++j) {
             const float* brow = bd + j * k;
             float s = 0.0f;
+#if defined(_OPENMP)
+            #pragma omp simd reduction(+:s)
+#endif
             for (size_t kk = 0; kk < k; ++kk) {
                 s += arow[kk] * brow[kk];
             }
@@ -190,10 +192,22 @@ bool transformer_forward_single_layer(
 
     // If caller provided projection weights, they must be compatible with the
     // input hidden dimension `d` (either rows==d or cols==d depending on layout).
-    if (Wq_in) assert(Wq_in->rows == d || Wq_in->cols == d);
-    if (Wk_in) assert(Wk_in->rows == d || Wk_in->cols == d);
-    if (Wv_in) assert(Wv_in->rows == d || Wv_in->cols == d);
-    if (Wo_in) assert(Wo_in->rows == d || Wo_in->cols == d);
+    if (Wq_in && !(Wq_in->rows == d || Wq_in->cols == d)) {
+        fprintf(stderr, "[transformer] Wq shape mismatch (%zu x %zu) for d=%zu\n", Wq_in->rows, Wq_in->cols, d);
+        return false;
+    }
+    if (Wk_in && !(Wk_in->rows == d || Wk_in->cols == d)) {
+        fprintf(stderr, "[transformer] Wk shape mismatch (%zu x %zu) for d=%zu\n", Wk_in->rows, Wk_in->cols, d);
+        return false;
+    }
+    if (Wv_in && !(Wv_in->rows == d || Wv_in->cols == d)) {
+        fprintf(stderr, "[transformer] Wv shape mismatch (%zu x %zu) for d=%zu\n", Wv_in->rows, Wv_in->cols, d);
+        return false;
+    }
+    if (Wo_in && !(Wo_in->rows == d || Wo_in->cols == d)) {
+        fprintf(stderr, "[transformer] Wo shape mismatch (%zu x %zu) for d=%zu\n", Wo_in->rows, Wo_in->cols, d);
+        return false;
+    }
 
     // Allocate temporaries
     Tensor* norm = tensor_create_f32(seq, d);
@@ -232,8 +246,18 @@ bool transformer_forward_single_layer(
     }
 
     // Attention head size checks: hidden size must be divisible by number of heads.
-    if (n_head > 0) assert(model_dim % n_head == 0);
-    if (n_head_kv > 0) assert(kv_dim % n_head_kv == 0);
+    if (n_head > 0 && (model_dim % n_head) != 0) {
+        fprintf(stderr, "[transformer] n_head mismatch: model_dim=%zu n_head=%zu\n", model_dim, n_head);
+        tensor_free(Qraw); tensor_free(Kraw); tensor_free(Vraw);
+        tensor_free(norm);
+        return false;
+    }
+    if (n_head_kv > 0 && (kv_dim % n_head_kv) != 0) {
+        fprintf(stderr, "[transformer] n_head_kv mismatch: kv_dim=%zu n_head_kv=%zu\n", kv_dim, n_head_kv);
+        tensor_free(Qraw); tensor_free(Kraw); tensor_free(Vraw);
+        tensor_free(norm);
+        return false;
+    }
 
     size_t use_n_head = n_head;
     size_t use_n_head_kv = n_head_kv;
@@ -400,8 +424,6 @@ bool transformer_forward_single_layer(
             bool g_ok = project_with_weight(ffn_norm, Wffn_gate_in, gate, false);
             bool u_ok = project_with_weight(ffn_norm, Wffn_up_in, up, false);
             if (g_ok && u_ok && gate && up && gate->rows == up->rows && gate->cols == up->cols) {
-                // Ensure gate and up projections have identical shapes.
-                assert(gate->rows == up->rows && gate->cols == up->cols);
                 fused = tensor_create_f32(gate->rows, gate->cols);
                 if (fused) {
                     float* fd = (float*)fused->data;
@@ -427,20 +449,8 @@ bool transformer_forward_single_layer(
     }
 
     if (!ok) {
-        // Fallback to identity FFN for compatibility.
-        Tensor* W = tensor_create_f32(d, d);
-        Tensor* b = tensor_create_f32(1, d);
-        if (!W || !b) {
-            tensor_free(W); tensor_free(b);
-            tensor_free(norm); tensor_free(attn_out); tensor_free(ffn_out);
-            tensor_free(Q); tensor_free(K); tensor_free(V);
-            return false;
-        }
-        for (size_t i = 0; i < d; i++) for (size_t j = 0; j < d; j++) tensor_set_f32(W, i, j, (i == j) ? 1.0f : 0.0f);
-        for (size_t j = 0; j < d; j++) tensor_set_f32(b, 0, j, 0.0f);
-        ok = ffn_forward(resid1, W, b, ffn_out);
-        tensor_free(W);
-        tensor_free(b);
+        std::memset(ffn_out->data, 0, sizeof(float) * seq * d);
+        ok = true;
     }
     if (ok) {
         float* od = (float*)output->data;

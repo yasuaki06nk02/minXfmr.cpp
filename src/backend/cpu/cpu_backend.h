@@ -13,7 +13,7 @@ float* cpu_workspace(size_t n);
 
 // Reset the per-thread workspace allocation offset to zero. Call at logical
 // boundaries (e.g., at the start of a generation) to reuse the buffer.
-void cpu_workspace_reset();
+void cpu_workspace_reset(bool shrink = false);
 
 // Multiply vector (length K) by matrix (K x N) into out (length N).
 // mat is expected in row-major order with each row of length N: element (k,n) is mat[k*N + n].

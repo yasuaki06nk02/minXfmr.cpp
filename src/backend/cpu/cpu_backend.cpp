@@ -108,8 +108,11 @@ float* cpu_workspace(size_t n) {
     return p;
 }
 
-void cpu_workspace_reset() {
+void cpu_workspace_reset(bool shrink) {
     g_workspace.offset = 0;
+    if (shrink && g_workspace.buf.size() > (1u << 20)) {
+        std::vector<float>().swap(g_workspace.buf);
+    }
 }
 
 bool cpu_matvec(const float* vec, const float* mat, float* out, size_t K, size_t N) {
