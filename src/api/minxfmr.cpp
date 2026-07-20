@@ -784,6 +784,18 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     }
     std::vector<int> gen_ids;
     std::vector<std::string> gen_token_strs;
+    // Preallocate a reusable workspace for logits chunking to avoid repeated
+    // cpu_request_workspace calls inside the token loop.
+    const size_t OUT_CHUNK = 4096;
+    size_t global_out_vocab = 0;
+    if (ctx->Wout && ctx->Wout->type == DataType::F32) {
+        if (ctx->Wout->rows == dim) global_out_vocab = ctx->Wout->cols;
+        else if (ctx->Wout->cols == dim) global_out_vocab = ctx->Wout->rows;
+    }
+    size_t global_chunk_size = (global_out_vocab > 0) ? std::min(OUT_CHUNK, global_out_vocab) : 0;
+    float* global_chunk_workspace = nullptr;
+    if (global_chunk_size > 0) global_chunk_workspace = cpu_request_workspace(global_chunk_size);
+
     for (int t = 0; t < max_steps; ++t) {
         Tensor* in = nullptr;
         Tensor* out = nullptr;
@@ -811,8 +823,8 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             if (ctx->Wout->rows == dim) {
                 size_t out_vocab = ctx->Wout->cols;
                 size_t use_vocab = std::min(vocab_size, out_vocab);
-                const size_t CHUNK = 4096;
-                float* ltmp = cpu_request_workspace(std::min(CHUNK, use_vocab));
+                const size_t CHUNK = OUT_CHUNK;
+                float* ltmp = (global_chunk_workspace && global_chunk_size > 0) ? global_chunk_workspace : cpu_request_workspace(std::min(CHUNK, use_vocab));
                 for (size_t off = 0; off < use_vocab; off += CHUNK) {
                     size_t cur = std::min(CHUNK, use_vocab - off);
                     bool ok = false;
@@ -835,8 +847,8 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             else if (ctx->Wout->cols == dim) {
                 size_t out_vocab = ctx->Wout->rows;
                 size_t use_vocab = std::min(vocab_size, out_vocab);
-                const size_t CHUNK = 4096;
-                float* ltmp = cpu_request_workspace(std::min(CHUNK, use_vocab));
+                const size_t CHUNK = OUT_CHUNK;
+                float* ltmp = (global_chunk_workspace && global_chunk_size > 0) ? global_chunk_workspace : cpu_request_workspace(std::min(CHUNK, use_vocab));
                 for (size_t off = 0; off < use_vocab; off += CHUNK) {
                     size_t cur = std::min(CHUNK, use_vocab - off);
                     const float* rowptr = wd + off * ctx->Wout->cols; // each row has length dim
