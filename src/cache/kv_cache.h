@@ -12,6 +12,7 @@ struct KVCache {
     std::vector<float> keys_buf; // size = layers * seq_max * dim
     std::vector<float> vals_buf; // size = layers * seq_max * dim
     std::vector<size_t> lengths; // current length per layer
+    std::vector<size_t> heads;   // head index per layer (for ring buffer)
 };
 
 KVCache* kvcache_create(size_t layers, size_t seq_max, size_t dim);

@@ -10,6 +10,7 @@ KVCache* kvcache_create(size_t layers, size_t seq_max, size_t dim) {
     c->keys.assign(layers, nullptr);
     c->vals.assign(layers, nullptr);
     c->lengths.assign(layers, 0);
+    c->heads.assign(layers, 0);
 
     // allocate contiguous backing buffers to avoid repeated reallocations during append
     size_t per_layer = seq_max * dim;
@@ -47,34 +48,36 @@ void kvcache_free(KVCache* c) {
 }
 
 bool kvcache_append(KVCache* c, size_t layer, const float* key_row, const float* val_row) {
-    if (!c) return false;
-    if (layer >= c->layers) return false;
-    size_t pos = c->lengths[layer];
-    if (pos >= c->seq_max) {
-        // cache full: evict oldest row by shifting everything left by one
-        float* kd = (float*)c->keys[layer]->data;
-        float* vd = (float*)c->vals[layer]->data;
-        size_t d = c->dim;
-        // shift rows 1..seq_max-1 -> 0..seq_max-2
-        memmove(kd, kd + d, sizeof(float)*(c->seq_max-1)*d);
-        memmove(vd, vd + d, sizeof(float)*(c->seq_max-1)*d);
-        pos = c->seq_max - 1;
-        c->lengths[layer] = c->seq_max; // stays full
-        fprintf(stderr, "[kvcache] evict oldest for layer=%zu to make room\n", layer);
+    if (!c || layer >= c->layers) return false;
+    size_t d = c->dim;
+    size_t seq_max = c->seq_max;
+    size_t head = c->heads[layer];
+    size_t len = c->lengths[layer];
+
+    size_t write_pos;
+    if (len < seq_max) {
+        write_pos = len;
+        c->lengths[layer]++;
+    } else {
+        // buffer is full, overwrite oldest (at head) and move head forward
+        write_pos = head;
+        c->heads[layer] = (head + 1) % seq_max;
     }
-    // copy key_row and val_row into tensors at row=pos
+
+    // copy key_row and val_row into tensors at row=write_pos
     float* kd = (float*)c->keys[layer]->data;
     float* vd = (float*)c->vals[layer]->data;
-    for (size_t j=0;j<c->dim;++j) {
-        kd[pos * c->dim + j] = key_row[j];
-        vd[pos * c->dim + j] = val_row[j];
-    }
-    if (c->lengths[layer] < c->seq_max) c->lengths[layer]++;
-    fprintf(stderr, "[kvcache] append layer=%zu pos=%zu newlen=%zu\n", layer, pos, c->lengths[layer]);
+    memcpy(kd + write_pos * d, key_row, sizeof(float) * d);
+    memcpy(vd + write_pos * d, val_row, sizeof(float) * d);
+
+    // fprintf(stderr, "[kvcache] append layer=%zu write_pos=%zu newlen=%zu head=%zu\n", layer, write_pos, c->lengths[layer], c->heads[layer]);
     return true;
 }
 
 void kvcache_reset(KVCache* c) {
     if (!c) return;
-    for (size_t i=0;i<c->layers;++i) c->lengths[i] = 0;
+    for (size_t i=0;i<c->layers;++i) {
+        c->lengths[i] = 0;
+        c->heads[i] = 0;
+    }
 }

@@ -274,16 +274,24 @@ bool transformer_forward_single_layer(
     size_t cached_rows = 0;
     if (cache != nullptr && cache->keys.size() > layer && cache->keys[layer] != nullptr) {
         cached_rows = cache->lengths[layer];
-        size_t cached = cached_rows;
-        Kconcat = tensor_create_f32(cached + seq, kv_dim);
-        Vconcat = tensor_create_f32(cached + seq, kv_dim);
+        size_t head = cache->heads[layer];
+        size_t sm = cache->seq_max;
+        Kconcat = tensor_create_f32(cached_rows + seq, kv_dim);
+        Vconcat = tensor_create_f32(cached_rows + seq, kv_dim);
         if (Kconcat && Vconcat) {
-            if (cached > 0) {
-                memcpy(Kconcat->data, cache->keys[layer]->data, sizeof(float) * cached * kv_dim);
-                memcpy(Vconcat->data, cache->vals[layer]->data, sizeof(float) * cached * kv_dim);
+            if (cached_rows > 0) {
+                // With ring buffer, logical [0, cached_rows) maps to physical [head, head + cached_rows) mod seq_max
+                size_t p1 = std::min(cached_rows, sm - head);
+                memcpy(Kconcat->data, (float*)cache->keys[layer]->data + head * kv_dim, sizeof(float) * p1 * kv_dim);
+                memcpy(Vconcat->data, (float*)cache->vals[layer]->data + head * kv_dim, sizeof(float) * p1 * kv_dim);
+                if (p1 < cached_rows) {
+                    size_t p2 = cached_rows - p1;
+                    memcpy((float*)Kconcat->data + p1 * kv_dim, cache->keys[layer]->data, sizeof(float) * p2 * kv_dim);
+                    memcpy((float*)Vconcat->data + p1 * kv_dim, cache->vals[layer]->data, sizeof(float) * p2 * kv_dim);
+                }
             }
-            memcpy((char*)Kconcat->data + sizeof(float) * cached * kv_dim, K->data, sizeof(float) * seq * kv_dim);
-            memcpy((char*)Vconcat->data + sizeof(float) * cached * kv_dim, V->data, sizeof(float) * seq * kv_dim);
+            memcpy((float*)Kconcat->data + cached_rows * kv_dim, K->data, sizeof(float) * seq * kv_dim);
+            memcpy((float*)Vconcat->data + cached_rows * kv_dim, V->data, sizeof(float) * seq * kv_dim);
         }
     } else {
         Kconcat = tensor_clone_f32(K);
