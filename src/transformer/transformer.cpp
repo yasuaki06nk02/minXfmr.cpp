@@ -179,7 +179,9 @@ bool transformer_forward_single_layer(
     const Tensor* Wffn_norm_in,
     const Tensor* Wffn_gate_in,
     const Tensor* Wffn_up_in,
-    const Tensor* Wffn_down_in) {
+    const Tensor* Wffn_down_in,
+    float* scores_workspace,
+    size_t scores_workspace_len) {
     if (!input || !output) return false;
     // Shapes: input seq x d
     size_t seq = input->rows;
@@ -303,7 +305,13 @@ bool transformer_forward_single_layer(
     const float* kd = (const float*)Kconcat->data;
     const float* vd = (const float*)Vconcat->data;
     float* od = (float*)attn_out->data;
-    float* scores = cpu_workspace(cached_rows + seq);
+    const size_t J = cached_rows + seq;
+    float* scores = nullptr;
+    if (scores_workspace && scores_workspace_len >= J) {
+        scores = scores_workspace;
+    } else {
+        scores = cpu_request_workspace(J);
+    }
     const size_t group = use_n_head / use_n_head_kv;
     const float score_scale = 1.0f / sqrtf((float)head_dim);
 
@@ -313,20 +321,23 @@ bool transformer_forward_single_layer(
             const size_t kv_h = std::min(h / std::max<size_t>(1, group), use_n_head_kv - 1);
             const size_t kv_off = kv_h * kv_head_dim;
 
-            for (size_t j = 0; j < cached_rows + seq; ++j) {
-                double s = 0.0;
-                for (size_t t = 0; t < head_dim; ++t) {
-                    s += (double)qd[qi * model_dim + q_off + t] * (double)kd[j * kv_dim + kv_off + t];
-                }
-                scores[j] = (float)s * score_scale;
+            const float* qptr = qd + qi * model_dim + q_off;
+            const float* kbase = kd + kv_off;
+
+            // scores = dot(qptr, K_submatrix_rows) for each cached/j row
+            if (!cpu_vec_dot_rows(qptr, kbase, scores, head_dim, J, kv_dim)) {
+                tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(Kconcat); tensor_free(Vconcat); tensor_free(attn_out);
+                return false;
             }
-            softmax_row(scores, cached_rows + seq);
-            for (size_t t = 0; t < head_dim; ++t) {
-                double acc = 0.0;
-                for (size_t j = 0; j < cached_rows + seq; ++j) {
-                    acc += (double)scores[j] * (double)vd[j * kv_dim + kv_off + t];
-                }
-                od[qi * model_dim + q_off + t] = (float)acc;
+            for (size_t j = 0; j < J; ++j) scores[j] *= score_scale;
+            softmax_row(scores, J);
+
+            // outvec = scores^T * V_submatrix  (produces head_dim values)
+            float* outvec = od + qi * model_dim + q_off;
+            const float* vbase = vd + kv_off;
+            if (!cpu_vec_mul_rows_cols(scores, vbase, outvec, J, head_dim, kv_dim)) {
+                tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(Kconcat); tensor_free(Vconcat); tensor_free(attn_out);
+                return false;
             }
         }
     }

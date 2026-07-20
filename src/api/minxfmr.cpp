@@ -237,6 +237,19 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
     }
     if (ctx->cache && layers_to_run > ctx->cache->layers) layers_to_run = ctx->cache->layers;
 
+    // Preallocate a single contiguous workspace for attention score buffers
+    // across all layers to avoid repeated allocator resizes.
+    size_t total_scores_needed = 0;
+    for (size_t ll = 0; ll < layers_to_run; ++ll) {
+        size_t cached = 0;
+        if (ctx->cache && ctx->cache->keys.size() > ll && ctx->cache->keys[ll] != nullptr) cached = ctx->cache->lengths[ll];
+        total_scores_needed += cached + cur->rows;
+    }
+    float* all_scores_workspace = nullptr;
+    if (total_scores_needed > 0) all_scores_workspace = cpu_request_workspace(total_scores_needed);
+
+    size_t scores_off = 0;
+
     for (size_t l = 0; l < layers_to_run; ++l) {
         Tensor* nxt = tensor_create_f32(cur->rows, cur->cols);
         if (!nxt) {
@@ -268,7 +281,18 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
             Wfd = ctx->Wffn_down_layers[l];
         }
 
-        bool ok = transformer_forward_single_layer(cur, nxt, ctx->cache, l, ctx->n_head, ctx->n_head_kv, Wq, Wk, Wv, Wo, WattnNorm, WffnNorm, Wfg, Wfu, Wfd);
+        size_t cached_rows = 0;
+        if (ctx->cache && ctx->cache->keys.size() > l && ctx->cache->keys[l] != nullptr) cached_rows = ctx->cache->lengths[l];
+        size_t J = cached_rows + cur->rows;
+        float* scores_buf = nullptr;
+        size_t scores_len = 0;
+        if (all_scores_workspace && J > 0) {
+            scores_buf = all_scores_workspace + scores_off;
+            scores_len = J;
+            scores_off += J;
+        }
+
+        bool ok = transformer_forward_single_layer(cur, nxt, ctx->cache, l, ctx->n_head, ctx->n_head_kv, Wq, Wk, Wv, Wo, WattnNorm, WffnNorm, Wfg, Wfu, Wfd, scores_buf, scores_len);
         tensor_free(cur);
         if (!ok) {
             tensor_free(nxt);
