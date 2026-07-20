@@ -82,12 +82,20 @@ static std::string normalize_text_for_tokenizer(const std::string& s_in) {
                 while ((pos = out.find("\xC2\xA0", pos)) != std::string::npos) out.replace(pos, 2, " ");
                 pos = 0;
                 while ((pos = out.find("\xE3\x80\x80", pos)) != std::string::npos) out.replace(pos, 3, " ");
-                // compress whitespace
+                // compress whitespace, but preserve newlines because chat templates rely on them.
                 std::string comp;
                 comp.reserve(out.size());
                 bool last_space = false;
                 for (unsigned char c : out) {
-                    if (c == ' ' || c == '\n' || c == '\r' || c == '\t' || c == '\v' || c == '\f') {
+                    if (c == '\r') {
+                        continue;
+                    }
+                    if (c == '\n') {
+                        comp.push_back('\n');
+                        last_space = false;
+                        continue;
+                    }
+                    if (c == ' ' || c == '\t' || c == '\v' || c == '\f') {
                         if (!last_space) comp.push_back(' ');
                         last_space = true;
                     } else {
@@ -120,7 +128,15 @@ static std::string normalize_text_for_tokenizer(const std::string& s_in) {
             ch = ' ';
             i += 2;
         }
-        if (ch == '\r' || ch == '\n' || ch == '\t' || ch == '\v' || ch == '\f') {
+        if (ch == '\r') {
+            continue;
+        }
+        if (ch == '\n') {
+            out.push_back('\n');
+            last_was_space = false;
+            continue;
+        }
+        if (ch == '\t' || ch == '\v' || ch == '\f') {
             ch = ' ';
         }
         if (ch == ' ') {
