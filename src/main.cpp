@@ -13,6 +13,7 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <cctype>
 #include "transformer/attention.h"
 #ifdef _WIN32
 #include <windows.h>
@@ -351,7 +352,8 @@ int main(int argc, char** argv) {
     auto sanitize_assistant_text = [](const std::string& text) {
         static const std::vector<std::string> markers = {
             "<s>", "</s>", "[INST]", "[/INST]", "<|assistant|>", "<|user|>",
-            "<assistant>", "<user>", "[/ASSISTANT]", "[/USER]", "<<SYS>>", "<</SYS>>", "speaker"
+            "<assistant>", "<user>", "[/ASSISTANT]", "[/USER]", "<<SYS>>", "<</SYS>>", "speaker",
+            "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>"
         };
         std::string out;
         out.reserve(text.size());
@@ -373,7 +375,8 @@ int main(int argc, char** argv) {
         static const std::vector<std::string> markers = {
             "<s>", "</s>", "[INST]", "[/INST]", "<|assistant|>", "<|user|>",
             "<assistant>", "<user>", "[/ASSISTANT]", "[/USER]", "<<SYS>>", "<</SYS>>",
-            "speaker", "SYSTEMMODULE", "INST", "USER", "ASSISTANT", "SYS"
+            "speaker", "SYSTEMMODULE", "INST", "USER", "ASSISTANT", "SYS",
+            "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>"
         };
         for (const std::string& marker : markers) {
             if (text.find(marker) != std::string::npos) return true;
@@ -381,7 +384,58 @@ int main(int argc, char** argv) {
         return false;
     };
 
-    auto should_store_assistant_text = [](const std::string& text) {
+    auto has_non_ascii = [](const std::string& s) {
+        for (unsigned char c : s) {
+            if (c & 0x80) return true;
+        }
+        return false;
+    };
+
+    auto contains_japanese = [](const std::string& s) {
+        size_t i = 0;
+        while (i < s.size()) {
+            unsigned char c0 = (unsigned char)s[i];
+            uint32_t cp = 0;
+            size_t adv = 1;
+            if (c0 < 0x80) {
+                cp = c0;
+            } else if ((c0 & 0xE0) == 0xC0 && i + 1 < s.size()) {
+                unsigned char c1 = (unsigned char)s[i + 1];
+                if ((c1 & 0xC0) == 0x80) {
+                    cp = ((uint32_t)(c0 & 0x1F) << 6) | (uint32_t)(c1 & 0x3F);
+                    adv = 2;
+                }
+            } else if ((c0 & 0xF0) == 0xE0 && i + 2 < s.size()) {
+                unsigned char c1 = (unsigned char)s[i + 1];
+                unsigned char c2 = (unsigned char)s[i + 2];
+                if ((c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80) {
+                    cp = ((uint32_t)(c0 & 0x0F) << 12) |
+                         ((uint32_t)(c1 & 0x3F) << 6) |
+                         (uint32_t)(c2 & 0x3F);
+                    adv = 3;
+                }
+            } else if ((c0 & 0xF8) == 0xF0 && i + 3 < s.size()) {
+                unsigned char c1 = (unsigned char)s[i + 1];
+                unsigned char c2 = (unsigned char)s[i + 2];
+                unsigned char c3 = (unsigned char)s[i + 3];
+                if ((c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80 && (c3 & 0xC0) == 0x80) {
+                    cp = ((uint32_t)(c0 & 0x07) << 18) |
+                         ((uint32_t)(c1 & 0x3F) << 12) |
+                         ((uint32_t)(c2 & 0x3F) << 6) |
+                         (uint32_t)(c3 & 0x3F);
+                    adv = 4;
+                }
+            }
+
+            if ((cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x4E00 && cp <= 0x9FFF)) {
+                return true;
+            }
+            i += adv;
+        }
+        return false;
+    };
+
+    auto should_store_assistant_text = [&](const std::string& text) {
         if (text.empty()) return false;
         if (text.find("```") != std::string::npos) return false;
         if (text.find("Explanation:") != std::string::npos) return false;
@@ -392,16 +446,21 @@ int main(int argc, char** argv) {
         size_t line_count = 1;
         size_t non_space = 0;
         size_t alpha_num = 0;
+        size_t symbol_like = 0;
+        size_t i = 0;
         for (unsigned char c : text) {
             if (c == '\n') ++line_count;
             if (c != ' ' && c != '\t' && c != '\r' && c != '\n') ++non_space;
-            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
-                ++alpha_num;
-            }
+            if (std::isalnum((int)c)) ++alpha_num;
+            if (c == '|' || c == '<' || c == '>' || c == '[' || c == ']') ++symbol_like;
         }
         if (non_space == 0) return false;
-        if (line_count > 4) return false;
-        if (alpha_num * 2 < non_space) return false;
+        if (line_count > 16) return false;
+        while (i < text.size() && std::isspace((unsigned char)text[i])) ++i;
+        if (i < text.size() && (text[i] == '|' || text[i] == '<')) return false;
+        if (non_space <= 2) return false;
+        if (alpha_num == 0 && non_space > 8 && !has_non_ascii(text)) return false;
+        if (symbol_like * 2 >= non_space) return false;
         return true;
     };
 
@@ -457,15 +516,21 @@ int main(int argc, char** argv) {
                 prompt_text += "<|endoftext|>";
                 const char* sys = (system_text && system_text[0] != '\0')
                     ? system_text
-                    : "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.";
+                    : "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. Reply in the same language as the user.";
                 append_qwen_message(prompt_text, "system", sys);
                 size_t begin = history.size() > (size_t)max_history ? history.size() - (size_t)max_history : 0;
                 for (size_t i = begin; i + 1 < history.size(); i += 2) {
                     append_qwen_message(prompt_text, "user", history[i]);
                     append_qwen_message(prompt_text, "assistant", history[i + 1]);
                 }
+                std::string user_turn = user_text ? user_text : "";
+                if (contains_japanese(user_turn)) {
+                    user_turn += "\n\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x81\xA7\xE5\x9B\x9E\xE7\xAD\x94\xE3\x81\x97\xE3\x81\xA6\xE3\x81\x8F\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80\x82";
+                } else if (has_non_ascii(user_turn)) {
+                    user_turn += "\nAnswer in the same language as this user message.";
+                }
                 prompt_text += "<|im_start|>user\n";
-                prompt_text += (user_text ? user_text : "");
+                prompt_text += user_turn;
                 prompt_text += "<|im_end|>\n";
                 prompt_text += "<|im_start|>assistant\n";
                 return prompt_text;
@@ -488,7 +553,13 @@ int main(int argc, char** argv) {
             assembled += history[i + 1];
             assembled += " </s><s>[INST] ";
         }
-        assembled += (user_text ? user_text : "");
+        std::string user_turn = user_text ? user_text : "";
+        if (contains_japanese(user_turn)) {
+            user_turn += "\n\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x81\xA7\xE5\x9B\x9E\xE7\xAD\x94\xE3\x81\x97\xE3\x81\xA6\xE3\x81\x8F\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80\x82";
+        } else if (has_non_ascii(user_turn)) {
+            user_turn += "\nAnswer in the same language as this user message.";
+        }
+        assembled += user_turn;
         assembled += " [/INST]";
         return assembled;
     };

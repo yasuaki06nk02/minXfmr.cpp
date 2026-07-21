@@ -796,7 +796,9 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                s == "<|assistant|>" || s == "<|user|>" || s == "<|im_start|>" || s == "<|im_end|>" ||
                s == "<assistant>" || s == "<user>" ||
                s == "[/ASSISTANT]" || s == "[/USER]" || s == "speaker" || s == "<speaker>" ||
-               s == "<<SYS>>" || s == "<</SYS>>";
+               s == "<<SYS>>" || s == "<</SYS>>" ||
+               s == "<tool_call>" || s == "</tool_call>" ||
+               s == "<tool_response>" || s == "</tool_response>";
     };
     if (top_k <= 0) top_k = 1;
     static std::mt19937 rng((unsigned)std::random_device{}());
@@ -1064,7 +1066,8 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
 
                 static const std::vector<std::string> role_markers = {
                     "<s>", "[INST]", "[/INST]", "<|assistant|>", "<|user|>",
-                    "<|im_start|>", "<|im_end|>", "<<SYS>>", "<</SYS>>"
+                    "<|im_start|>", "<|im_end|>", "<<SYS>>", "<</SYS>>",
+                    "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>"
                 };
 
                 bool is_prefix = false;
