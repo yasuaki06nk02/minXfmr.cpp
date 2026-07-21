@@ -32,8 +32,18 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
         if (v > 0) nthreads = (unsigned int)v;
     }
 
-    // clamp to at most m threads
-    if ((size_t)nthreads > m) nthreads = (unsigned int)std::max<size_t>(1, m);
+    // Decide whether to split work by rows (output rows) or columns (output cols).
+    // Splitting by rows is efficient when m (rows) is large. When m is small
+    // (e.g. m==1 during decode), split by columns so we can still use threads.
+    bool split_cols = (m < n);
+
+    if (split_cols) {
+        // clamp to at most n threads when splitting columns
+        if ((size_t)nthreads > n) nthreads = (unsigned int)std::max<size_t>(1, n);
+    } else {
+        // clamp to at most m threads when splitting rows
+        if ((size_t)nthreads > m) nthreads = (unsigned int)std::max<size_t>(1, m);
+    }
 
     if (nthreads <= 1) {
         for (size_t i = 0; i < m; ++i) {
@@ -53,29 +63,58 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
     std::vector<std::thread> threads;
     threads.reserve(nthreads);
 
-    auto worker = [&](size_t row_start, size_t row_end) {
-        for (size_t i = row_start; i < row_end; ++i) {
-            float* orow = o + i * n;
-            const float* arow = a + i * k;
-            for (size_t kk = 0; kk < k; ++kk) {
-                float av = arow[kk];
-                const float* brow = b + kk * n;
-                for (size_t j = 0; j < n; ++j) {
-                    orow[j] += av * brow[j];
+    if (!split_cols) {
+        // split by rows (existing behavior)
+        auto worker = [&](size_t row_start, size_t row_end) {
+            for (size_t i = row_start; i < row_end; ++i) {
+                float* orow = o + i * n;
+                const float* arow = a + i * k;
+                for (size_t kk = 0; kk < k; ++kk) {
+                    float av = arow[kk];
+                    const float* brow = b + kk * n;
+                    for (size_t j = 0; j < n; ++j) {
+                        orow[j] += av * brow[j];
+                    }
                 }
             }
-        }
-    };
+        };
 
-    size_t rows_per = m / nthreads;
-    size_t rem = m % nthreads;
-    size_t cur = 0;
-    for (unsigned int t = 0; t < nthreads; ++t) {
-        size_t rs = cur;
-        size_t re = rs + rows_per + (t < rem ? 1 : 0);
-        cur = re;
-        if (rs >= re) break;
-        threads.emplace_back(worker, rs, re);
+        size_t rows_per = m / nthreads;
+        size_t rem = m % nthreads;
+        size_t cur = 0;
+        for (unsigned int t = 0; t < nthreads; ++t) {
+            size_t rs = cur;
+            size_t re = rs + rows_per + (t < rem ? 1 : 0);
+            cur = re;
+            if (rs >= re) break;
+            threads.emplace_back(worker, rs, re);
+        }
+    } else {
+        // split by columns (useful when m is small, e.g. m==1)
+        auto worker_cols = [&](size_t col_start, size_t col_end) {
+            for (size_t i = 0; i < m; ++i) {
+                float* orow = o + i * n;
+                const float* arow = a + i * k;
+                for (size_t kk = 0; kk < k; ++kk) {
+                    float av = arow[kk];
+                    const float* brow = b + kk * n;
+                    for (size_t j = col_start; j < col_end; ++j) {
+                        orow[j] += av * brow[j];
+                    }
+                }
+            }
+        };
+
+        size_t cols_per = n / nthreads;
+        size_t rem = n % nthreads;
+        size_t curc = 0;
+        for (unsigned int t = 0; t < nthreads; ++t) {
+            size_t cs = curc;
+            size_t ce = cs + cols_per + (t < rem ? 1 : 0);
+            curc = ce;
+            if (cs >= ce) break;
+            threads.emplace_back(worker_cols, cs, ce);
+        }
     }
 
     for (auto& th : threads) th.join();
@@ -145,8 +184,8 @@ bool cpu_vec_dot_rows(const float* vec, const float* mat_rows, float* out, size_
     for (size_t j = 0; j < Nrows; ++j) {
         const float* row = mat_rows + j * row_stride;
         double acc = 0.0;
-#if defined(_OPENMP)
-        #pragma omp simd reduction(+:acc)
+#if defined(_OPENMP) && !defined(_MSC_VER)
+    #pragma omp simd reduction(+:acc)
 #endif
         for (size_t k = 0; k < K; ++k) acc += (double)vec[k] * (double)row[k];
         out[j] = (float)acc;
@@ -161,8 +200,8 @@ bool cpu_vec_dot_rows_ring(const float* vec, const float* ring, size_t head, siz
         size_t phys = (head + j) % seq_max;
         const float* row = ring + phys * row_stride;
         double acc = 0.0;
-#if defined(_OPENMP)
-        #pragma omp simd reduction(+:acc)
+#if defined(_OPENMP) && !defined(_MSC_VER)
+    #pragma omp simd reduction(+:acc)
 #endif
         for (size_t k = 0; k < K; ++k) acc += (double)vec[k] * (double)row[k];
         out[j] = (float)acc;
@@ -175,8 +214,8 @@ bool cpu_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* out, 
     if (Nrows == 0 || Ncols == 0) return false;
     for (size_t col = 0; col < Ncols; ++col) {
         double acc = 0.0;
-#if defined(_OPENMP)
-        #pragma omp simd reduction(+:acc)
+#if defined(_OPENMP) && !defined(_MSC_VER)
+    #pragma omp simd reduction(+:acc)
 #endif
         for (size_t row = 0; row < Nrows; ++row) {
             acc += (double)vec[row] * (double)mat_rows[row * row_stride + col];

@@ -63,7 +63,7 @@ static bool cpu_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* 
             const float* arow = ad + (size_t)i * k;
             const float* brow = bd + (size_t)j * k;
             float s = 0.0f;
-#if defined(_OPENMP)
+#if defined(_OPENMP) && !defined(_MSC_VER)
             #pragma omp simd reduction(+:s)
 #endif
             for (size_t kk = 0; kk < k; ++kk) {
@@ -386,7 +386,7 @@ bool transformer_forward_single_layer(
                     size_t phys = (cache_head + j) % cache->seq_max;
                     const float w = scores[j];
                     const float* vrow = cache_vd + phys * kv_dim + kv_off;
-#if defined(_OPENMP)
+#if defined(_OPENMP) && !defined(_MSC_VER)
                     #pragma omp simd
 #endif
                     for (size_t t = 0; t < head_dim; ++t) {
@@ -406,7 +406,7 @@ bool transformer_forward_single_layer(
                     tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(attn_out);
                     return false;
                 }
-#if defined(_OPENMP)
+#if defined(_OPENMP) && !defined(_MSC_VER)
                 #pragma omp simd
 #endif
                 for (size_t t = 0; t < head_dim; ++t) {
