@@ -1,0 +1,5 @@
+Entering chat mode. Type 'reset' to clear history, 'exit' to quit.
+you> assistant> Hello! How can I assist you today?
+you> assistant> こんにちは
+you> assistant> こんにちは！私はQwen
+you> 

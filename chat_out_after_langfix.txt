@@ -1,0 +1,6 @@
+Entering chat mode. Type 'reset' to clear history, 'exit' to quit.
+you> assistant> Hello! How can I help you today, my name is Qwen. I'm a large language model. My purpose is to assist and assist in generating the best response, please provide more details about your request.
+you> assistant> |i'm a large language, i can assist you with any question or task.
+you> assistant> |i
+you> assistant> Hello, I am Qwen
+you> 
