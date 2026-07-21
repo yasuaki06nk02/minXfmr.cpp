@@ -15,6 +15,8 @@ add_library(minxfmr STATIC
     ../third_party/gguf/gguf_reader.cpp
 )
 
+find_package(OpenMP)
+
 target_include_directories(minxfmr PUBLIC
     ${CMAKE_SOURCE_DIR}/include
 )
@@ -22,6 +24,23 @@ target_include_directories(minxfmr PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${CMAKE_SOURCE_DIR}/third_party/gguf
 )
+
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(minxfmr PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+if(MSVC)
+    target_compile_options(minxfmr PRIVATE
+        $<$<NOT:$<CONFIG:Debug>>:/O2>
+        $<$<NOT:$<CONFIG:Debug>>:/arch:AVX2>
+    )
+else()
+    target_compile_options(minxfmr PRIVATE
+        $<$<NOT:$<CONFIG:Debug>>:-O3>
+        $<$<NOT:$<CONFIG:Debug>>:-march=native>
+    )
+endif()
+
 add_executable(minxfmr_cli
     main.cpp
 )
