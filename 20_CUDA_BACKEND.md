@@ -144,36 +144,15 @@ These APIs are available on both Jetson Nano and modern RTX GPUs.
 
 # Backend Interface
 
-The backend abstraction should remain small.
+The backend abstraction remains function-based in current implementation.
 
 ```cpp
-class Backend {
-public:
-    virtual ~Backend() = default;
-
-    virtual void linear(
-        const Tensor& input,
-        const Tensor& weight,
-        const Tensor* bias,
-        Tensor& output) = 0;
-
-    virtual void rmsnorm(
-        const Tensor& input,
-        const Tensor& weight,
-        Tensor& output,
-        float eps) = 0;
-
-    virtual void rope(
-        Tensor& q,
-        Tensor& k,
-        int position) = 0;
-
-    virtual void attention(
-        const Tensor& q,
-        const Tensor& k,
-        const Tensor& v,
-        Tensor& output) = 0;
-};
+bool backend_matmul(const Tensor* A, const Tensor* B, Tensor* out);
+bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out);
+bool backend_matvec_strided(const float* vec, const float* mat, float* out, size_t K, size_t N, size_t mat_row_stride);
+bool backend_vec_dot_rows(const float* vec, const float* mat_rows, float* out, size_t K, size_t Nrows, size_t row_stride);
+bool backend_vec_dot_rows_ring(const float* vec, const float* ring, size_t head, size_t seq_max, size_t len, size_t K, size_t row_stride, float* out);
+bool backend_preload_tensor(const Tensor* t);
 ```
 
 Transformer code must use only this interface.
@@ -233,20 +212,9 @@ Example:
 struct Tensor {
     void* data;
     DataType type;
-
-    int ndim;
-    int dims[4];
-
-    DeviceType device;
-};
-```
-
-Where:
-
-```cpp
-enum class DeviceType {
-    CPU,
-    CUDA
+    size_t rows;
+    size_t cols;
+    size_t bytes;
 };
 ```
 
@@ -344,11 +312,11 @@ cmake -DMINXFMR_ENABLE_CUDA=ON ..
 Runtime selection:
 
 ```bash
-minxfmr_cli model.gguf --backend cpu
+$env:MINXFMR_BACKEND = "cpu"
 ```
 
 ```bash
-minxfmr_cli model.gguf --backend cuda
+$env:MINXFMR_BACKEND = "cuda"
 ```
 
 If CUDA initialization fails:

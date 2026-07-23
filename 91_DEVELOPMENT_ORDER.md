@@ -2,7 +2,7 @@
 
 # minXfmr.cpp Development Order
 
-> **Implementation Roadmap**
+> **Implementation Roadmap (Aligned with 12_IMPLEMENTATION_PHASES.md)**
 
 ---
 
@@ -10,13 +10,13 @@
 
 minXfmr.cpp is developed incrementally.
 
-Each step must:
+Each phase must:
 
 * Compile successfully
-* Have a clear responsibility
+* Have one clear responsibility
 * Be independently testable
 
-Do not implement the entire runtime at once.
+Do not move to the next phase with a broken foundation.
 
 ---
 
@@ -26,572 +26,286 @@ Do not implement the entire runtime at once.
 
 Create the minimum C++ project structure.
 
+## Tasks
+
+* [ ] Setup CMake + C++17
+* [ ] Create `include/` and `src/`
+* [ ] Build `minxfmr_cli`
+
+## Expected Result
+
+A clean build runs on host environment.
+
 ---
+
+# Phase 1: Tensor System
+
+## Goal
+
+Create fundamental tensor container and memory helpers.
 
 ## Tasks
 
-* [ ] Create repository
-* [ ] Setup CMake
-* [ ] Setup C++17
-* [ ] Create include directory
-* [ ] Create src directory
-* [ ] Create test directory
-* [ ] Create basic executable
-
----
+* [ ] Implement tensor allocation/free
+* [ ] Implement F32 read/write helpers
+* [ ] Add tensor transpose helper
 
 ## Expected Result
 
-The project builds successfully.
-
-Example:
-
-```bash
-mkdir build
-cmake ..
-make
-```
+Tensor create/read/write/free works correctly.
 
 ---
 
-# Phase 1: Public API Skeleton
+# Phase 2: CPU Backend Basic Operations
 
 ## Goal
 
-Create the stable external interface first.
-
----
+Provide baseline math operations.
 
 ## Tasks
 
-* [ ] Create minxfmr.h
-* [ ] Define minxfmr_context
-* [ ] Implement minxfmr_open()
-* [ ] Implement minxfmr_generate()
-* [ ] Implement minxfmr_reset()
-* [ ] Implement minxfmr_close()
-
----
+* [ ] MatMul
+* [ ] Vector-dot helpers
+* [ ] Softmax support helpers
 
 ## Expected Result
 
-A dummy runtime can be called.
-
-Example:
-
-```c
-ctx = minxfmr_open();
-
-minxfmr_generate();
-
-minxfmr_reset();
-
-minxfmr_close();
-```
+Core math paths pass reference checks.
 
 ---
 
-# Phase 2: Core Data Structures
+# Phase 3: Transformer Components
 
 ## Goal
 
-Create the internal foundation.
-
----
-
-## Implement
-
-### Tensor
-
-Responsibilities:
-
-* Data pointer
-* Shape
-* Size calculation
-
----
-
-### Tensor Shape
-
-Responsibilities:
-
-* Dimension management
-* Element count
-
----
-
-### Context
-
-Responsibilities:
-
-* Runtime state
-* Memory ownership
-
----
-
-### KV Cache
-
-Responsibilities:
-
-* Key storage
-* Value storage
-* Reset
-
----
-
-## Expected Result
-
-All core structures exist without inference.
-
----
-
-# Phase 3: GGUF Reader
-
-## Goal
-
-Load model information.
-
----
+Implement independent Transformer building blocks.
 
 ## Tasks
 
-* [ ] GGUF header parser
-* [ ] Metadata reader
-* [ ] Tensor table reader
-* [ ] Vocabulary reader
-
----
+* [ ] RMSNorm
+* [ ] RoPE
+* [ ] Attention
+* [ ] FeedForward
 
 ## Expected Result
 
-The runtime can inspect a GGUF file.
-
-Example output:
-
-```
-Model:
-Qwen
-
-Layers:
-32
-
-Embedding:
-4096
-```
+Single components run with valid outputs.
 
 ---
 
-# Phase 4: Tokenizer
+# Phase 4: Full Transformer Model
 
 ## Goal
 
-Convert text into tokens.
-
----
+Execute decoder stack end-to-end for logits.
 
 ## Tasks
 
-* [ ] Load vocabulary
-* [ ] Implement encode()
-* [ ] Implement decode()
-
----
+* [ ] Multi-layer forward path
+* [ ] Embedding + final norm + output projection
+* [ ] Layer buffer reuse strategy
 
 ## Expected Result
 
-Input:
-
-```
-Hello
-```
-
-Output:
-
-```
-[9707]
-```
+Given token inputs, model produces logits.
 
 ---
 
-# Phase 5: CPU Backend
+# Phase 5: Tokenizer
 
 ## Goal
 
-Create basic tensor operations.
-
----
-
-## Implement
-
-* [ ] Matrix multiplication
-* [ ] Vector operations
-* [ ] Addition
-* [ ] Multiplication
-* [ ] RMSNorm support
-
----
-
-## Rules
-
-Do not optimize yet.
-
-Correctness first.
-
----
-
-# Phase 6: Transformer Components
-
-## Goal
-
-Implement decoder-only Transformer.
-
----
-
-## Implement Order
-
-### 1. Embedding
-
-Token ID
-
-↓
-
-Vector
-
----
-
-### 2. RMSNorm
-
-Normalize hidden state.
-
----
-
-### 3. RoPE
-
-Rotary positional embedding.
-
----
-
-### 4. Attention
-
-Implement:
-
-* Query
-* Key
-* Value
-* Softmax
-
----
-
-### 5. Feed Forward
-
-Implement:
-
-* Gate
-* Up
-* Down projection
-
----
-
-### 6. Decoder Block
-
-Combine:
-
-* Attention
-* FFN
-* Residual connection
-
----
-
-# Phase 7: Full Transformer Forward
-
-## Goal
-
-Complete one forward pass.
-
----
-
-## Flow
-
-```
-Token
-
-↓
-
-Embedding
-
-↓
-
-Decoder Blocks
-
-↓
-
-Final Norm
-
-↓
-
-Logits
-```
-
----
-
-## Expected Result
-
-Given a token, output logits.
-
----
-
-# Phase 8: KV Cache
-
-## Goal
-
-Enable efficient generation.
-
----
+Convert UTF-8 text to token IDs and back.
 
 ## Tasks
 
-* [ ] Store previous keys
-* [ ] Store previous values
-* [ ] Reuse cache
-* [ ] Implement reset()
-
----
+* [ ] Vocabulary loading
+* [ ] Encode
+* [ ] Decode
+* [ ] Special token handling
 
 ## Expected Result
 
-Conversation can continue efficiently.
+Round-trip tests and GGUF vocab loading behave correctly.
 
 ---
 
-# Phase 9: Sampler
+# Phase 6: GGUF Loader
 
 ## Goal
 
-Convert logits into tokens.
-
----
-
-## MVP
-
-Implement:
-
-* [ ] Greedy sampling
-
----
-
-## Future
-
-* Temperature
-* Top-K
-* Top-P
-
----
-
-# Phase 10: Token Streaming Generation
-
-## Goal
-
-Connect Transformer to public API.
-
----
-
-## Flow
-
-```
-Prompt
-
-↓
-
-Tokenizer
-
-↓
-
-Transformer
-
-↓
-
-Sampler
-
-↓
-
-Token
-
-↓
-
-Callback
-
-↓
-
-Repeat
-```
-
----
-
-## Expected Result
-
-Tokens are streamed to application.
-
----
-
-# Phase 11: Performance Improvement
-
-## Goal
-
-Optimize only after correctness.
-
----
-
-## Measure
-
-* Token/sec
-* Memory usage
-* Binary size
-
----
-
-## Possible Optimization
-
-* SIMD
-* ARM NEON
-* Memory reuse
-
----
-
-# Phase 12: Android Integration
-
-## Goal
-
-Run minXfmr.cpp on Android.
-
----
+Load metadata, tensors, and tokenizer assets from GGUF.
 
 ## Tasks
 
-* [ ] Android NDK build
-* [ ] JNI wrapper
-* [ ] Kotlin sample app
-* [ ] ARM64 testing
+* [ ] Read model config metadata
+* [ ] Locate/load per-layer tensors
+* [ ] Load token embedding/lm_head/final norm
+* [ ] Load chat template/special tokens when available
+
+## Expected Result
+
+Real GGUF model is opened successfully.
 
 ---
 
-## Architecture
-
-```
-Kotlin
-
-↓
-
-JNI
-
-↓
-
-C API
-
-↓
-
-minXfmr.cpp
-
-↓
-
-CPU Backend
-```
-
----
-
-# Phase 13: Jetson Nano Validation
+# Phase 7: Model Runtime
 
 ## Goal
 
-Validate architecture on Linux ARM.
+Connect loader outputs with runtime execution context.
+
+## Tasks
+
+* [ ] Build `minxfmr_context`
+* [ ] Create KV cache
+* [ ] Normalize weight orientations at load
+* [ ] Preload weights for backend when enabled
+
+## Expected Result
+
+Runtime context can execute model forward calls safely.
 
 ---
 
-## Conditions
+# Phase 8: Text Generation
 
-* CPU only
-* CUDA disabled
+## Goal
 
----
+Generate tokens autoregressively with callback streaming.
 
-## Purpose
+## Tasks
 
-Confirm portability before Android integration.
+* [ ] Prompt prefill
+* [ ] Token-by-token generation loop
+* [ ] EOS/limit/repetition guards
+* [ ] Stream callback outputs
 
----
+## Expected Result
 
-# Testing Strategy
-
-Each phase requires tests.
-
----
-
-## Unit Tests
-
-Examples:
-
-* Tensor calculation
-* Tokenizer
-* GGUF parser
-* Matrix multiplication
+Prompt produces streamed text output.
 
 ---
 
-## Integration Tests
+# Phase 9: Session Management
 
-Examples:
+## Goal
 
-* Load model
-* Generate tokens
-* Reset session
+Stabilize lifecycle APIs.
 
----
+## Tasks
 
-# Implementation Rules
+* [ ] `minxfmr_open`
+* [ ] `minxfmr_generate`
+* [ ] `minxfmr_reset`
+* [ ] `minxfmr_close`
 
-## Rule 1
+## Expected Result
 
-Never skip phases.
-
----
-
-## Rule 2
-
-Do not optimize before correctness.
+Repeated open/generate/reset/close cycles are stable and leak-free.
 
 ---
 
-## Rule 3
+# Phase 10: Quantization Support
 
-Do not add features without design review.
+## Goal
+
+Support Q4_K model paths with minimal complexity.
+
+## Tasks
+
+* [ ] Keep Q4_K tensors packed in memory
+* [ ] Dequantize on-the-fly in backend matmul
+* [ ] Support Q4_K output head path
+
+## Expected Result
+
+F32 vs Q4_K behavior is acceptable for MVP targets.
 
 ---
 
-## Rule 4
+# Phase 11: CPU Optimization
 
-Keep public API stable.
+## Goal
+
+Improve performance after correctness is stable.
+
+## Tasks
+
+* [ ] OpenMP/SIMD-friendly loops
+* [ ] Workspace/tensor reuse
+* [ ] Cache-friendly data access
+
+## Expected Result
+
+Higher token throughput with unchanged functional behavior.
+
+---
+
+# Phase 12: Linux / Jetson Validation
+
+## Goal
+
+Verify portability on Linux ARM CPU environments.
+
+## Tasks
+
+* [ ] Build and run on Jetson/Linux ARM
+* [ ] Check memory and tokens/sec
+* [ ] Confirm CPU-only fallback behavior
+
+## Expected Result
+
+Stable inference on embedded-style Linux setups.
+
+---
+
+# Phase 13: Android NDK Integration
+
+## Goal
+
+Integrate the same core runtime into Android apps.
+
+## Tasks
+
+* [ ] Build shared library in Android app toolchain
+* [ ] JNI wrapper for C API
+* [ ] Kotlin bridge and streaming UI path
+
+## Expected Result
+
+Android app can call open/generate/reset/close successfully.
+
+---
+
+# Phase 14: Release Preparation
+
+## Goal
+
+Prepare a usable and maintainable release.
+
+## Tasks
+
+* [ ] Documentation consistency
+* [ ] Remove noisy debug defaults
+* [ ] Build profile verification
+* [ ] Example command validation
+
+## Expected Result
+
+Release artifacts and docs are aligned and reproducible.
 
 ---
 
 # MVP Completion Criteria
 
-minXfmr.cpp MVP is complete when:
+MVP is complete when:
 
 * [ ] GGUF model loads
-* [ ] Tokenizer works
 * [ ] Transformer forward works
-* [ ] Text generation works
-* [ ] Streaming callback works
-* [ ] reset works
-* [ ] Android ARM64 build succeeds
+* [ ] Text generation streams via callback
+* [ ] Runtime lifecycle APIs are stable
+* [ ] F32/Q4_K paths are validated
+* [ ] CPU and optional CUDA selection are functional
 
----
-
-# Final Goal
-
-Create the smallest understandable Transformer runtime.
-
-Not the biggest.
-
-Not the most feature-rich.
-
-The simplest runtime that works.
+Android integration is the next milestone after MVP core completion.

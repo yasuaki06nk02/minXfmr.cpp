@@ -15,17 +15,9 @@ Supported environments:
 ```text id="u2f3k8"
 Linux
 
-↓
+Windows
 
-Jetson Nano
-
-↓
-
-Android NDK
-
-↓
-
-ARM64 Device
+Jetson (optional CUDA)
 ```
 
 ---
@@ -54,13 +46,13 @@ The build system follows:
 
         v                     v
 
-   Linux Build          Android Build
+    C++ Build            C++ Build
 
         |                     |
 
         v                     v
 
- libminxfmr.a       libminxfmr.so
+    minxfmr.a          minxfmr_cli
 
         |
 
@@ -80,9 +72,7 @@ minxfmr.cpp/
 
 ├── include/
 
-│   └── minxfmr/
-
-│       └── minxfmr.h
+│   └── minxfmr.h
 
 │
 
@@ -90,11 +80,9 @@ minxfmr.cpp/
 
 │   ├── api/
 
-│   ├── runtime/
+│   ├── io/
 
-│   ├── model/
-
-│   ├── gguf/
+│   ├── cache/
 
 │   ├── transformer/
 
@@ -106,17 +94,9 @@ minxfmr.cpp/
 
 ├── tests/
 
-│
+├── third_party/
 
-├── examples/
-
-│
-
-└── android/
-
-    ├── CMakeLists.txt
-
-    └── app/
+└── scripts/
 ```
 
 ---
@@ -149,40 +129,20 @@ Main inference engine.
 
 Contains:
 
-* GGUF reader
+* GGUF loader
 * Transformer
+* Backend runtime
 * CPU backend
 * Tokenizer
 
 ---
 
-# Shared Library
+# Current Target Set
 
-Target:
+The current CMake project intentionally keeps target count small:
 
-```text id="4q3k5r"
-minxfmr_shared
-```
-
-Type:
-
-```text id="x3i4fz"
-SHARED library
-```
-
----
-
-Used by:
-
-Android JNI.
-
-Output:
-
-```text id="4h9x8n"
-libminxfmr.so
-```
-
----
+* `minxfmr` (static library)
+* `minxfmr_cli` (executable)
 
 # Example Application
 
@@ -208,17 +168,13 @@ Example:
 
 # Test Target
 
-Target:
+Current status:
 
-```text id="h8c7f4"
-minxfmr_test
-```
+No dedicated `minxfmr_test` target is defined in the current top-level CMake.
 
----
+Future direction:
 
-Purpose:
-
-Unit testing.
+Add a dedicated unit/integration test target once test runner structure is finalized.
 
 ---
 
@@ -308,7 +264,7 @@ Concept:
 
 ```cmake
 cmake_minimum_required(
-    VERSION 3.22
+    VERSION 3.20
 )
 
 project(
@@ -316,12 +272,9 @@ project(
     LANGUAGES CXX
 )
 
+option(MINXFMR_ENABLE_CUDA "Enable CUDA backend when available" ON)
 
 add_subdirectory(src)
-
-add_subdirectory(tests)
-
-add_subdirectory(examples)
 ```
 
 ---
@@ -334,16 +287,19 @@ Example:
 add_library(
     minxfmr
 
-    runtime/context.cpp
+    api/minxfmr.cpp
 
-    model/model.cpp
-
-    gguf/reader.cpp
+    io/gguf_loader.cpp
 
     transformer/transformer.cpp
 
+    backend/backend_runtime.cpp
+
     backend/cpu/cpu_backend.cpp
 )
+
+add_executable(minxfmr_cli main.cpp)
+target_link_libraries(minxfmr_cli PRIVATE minxfmr)
 ```
 
 ---
@@ -448,6 +404,11 @@ No CUDA required.
 
 # Android Build
 
+Status:
+
+Android integration is documented as a design target, but this repository's
+mainline CMake currently focuses on host builds (library + CLI).
+
 Android uses:
 
 ```text id="z2q9lm"
@@ -520,20 +481,8 @@ Example:
 
 ```cmake
 option(
- ENABLE_TESTS
+ MINXFMR_ENABLE_CUDA
  ON
-)
-
-
-option(
- ENABLE_ANDROID
- OFF
-)
-
-
-option(
- ENABLE_NEON
- OFF
 )
 ```
 
@@ -541,14 +490,12 @@ option(
 
 # Feature Flags
 
-Possible:
+Current:
 
 ```text id="8p2w4k"
-MINXFMR_ENABLE_Q4
-
-MINXFMR_ENABLE_NEON
-
-MINXFMR_DEBUG
+MINXFMR_ENABLE_CUDA
+MINXFMR_CUDA_AVAILABLE
+MINXFMR_BACKEND (runtime env: auto/cpu/cuda)
 ```
 
 ---
@@ -568,7 +515,7 @@ NEON Kernel
 enabled by:
 
 ```text id="j5k8m1"
-ENABLE_NEON=ON
+(future proposal) ENABLE_NEON=ON
 ```
 
 ---
@@ -709,19 +656,19 @@ Small platform layer
 
         |                         |
 
-      Linux                  Android
+            Linux                 Windows
 
         |                         |
 
-   CLI/Test                JNI App
+     minxfmr_cli             minxfmr_cli
 
         |
 
-    CPUBackend
+ Backend Runtime
 
         |
 
-       ARM64
+     CPU / CUDA
 ```
 
 ---

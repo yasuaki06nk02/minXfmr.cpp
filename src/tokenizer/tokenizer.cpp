@@ -31,6 +31,7 @@ static const std::string kGptNewlineMarker("\xC3\x84\xC2\x8A");
 static std::string g_word_marker = kSpmMarker;
 static std::string g_newline_token = "\n";
 
+// Byte trie for greedy longest-match tokenization.
 struct TrieNode {
     int token_id;
     std::unordered_map<unsigned char,int> children;
@@ -62,6 +63,7 @@ static void trie_insert(const std::string &tok, int id) {
 }
 
 static void trie_build_from_vocab() {
+    // Rebuild once after vocabulary is loaded.
     trie_clear();
     for (size_t i = 0; i < g_vocab.size(); ++i) {
         trie_insert(g_vocab[i], (int)i);
@@ -71,6 +73,7 @@ static void trie_build_from_vocab() {
 static void init_byte_level_maps() {
     if (!g_byte_encoder.empty()) return;
 
+    // GPT-2 style byte-to-unicode reversible mapping.
     std::vector<int> bs;
     for (int i = '!'; i <= '~'; ++i) bs.push_back(i);
     for (int i = 0xA1; i <= 0xAC; ++i) bs.push_back(i);
@@ -206,7 +209,7 @@ static std::string normalize_text_for_tokenizer(const std::string& s_in) {
         }
     }
 #endif
-    // Fallback conservative normalization
+    // Cross-platform fallback: keep behavior conservative and predictable.
     std::string s = s_in;
     std::string out;
     out.reserve(s.size());
@@ -250,6 +253,7 @@ static std::string normalize_text_for_tokenizer(const std::string& s_in) {
 }
 
 bool tokenizer_load_from_list(const std::vector<std::string>& vocab) {
+    // Reset all derived tokenizer state when swapping vocabularies.
     g_vocab = vocab;
     g_vid.clear();
     g_max_token_len = 0;

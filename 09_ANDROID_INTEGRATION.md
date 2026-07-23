@@ -10,6 +10,11 @@
 
 minXfmr.cpp is designed as a native C++ inference engine.
 
+Current status:
+
+Android integration is a design target, while the mainline repository currently
+focuses on host CMake targets (`minxfmr` + `minxfmr_cli`).
+
 Android integration uses:
 
 ```text
@@ -85,11 +90,16 @@ minxfmr-cpp/
 
 ├── src/
 
-│   ├── runtime/
-
+│   ├── api/
+│   ├── io/
+│   ├── cache/
 │   ├── transformer/
 
 │   └── backend/
+
+├── include/
+
+│   └── minxfmr.h
 
 
 └── android/
@@ -123,6 +133,11 @@ Android NDK
 
 CMake
 ```
+
+Note:
+
+An `android/` application module is not included in the current repository tree.
+This section describes recommended integration structure for downstream apps.
 
 ---
 
@@ -275,7 +290,7 @@ minxfmr_open()
 
 ↓
 
-GGUF Reader
+GGUF Loader
 
 ↓
 
@@ -570,6 +585,11 @@ Output:
 libminxfmr.so
 ```
 
+Current status:
+
+The repository currently builds a static library (`minxfmr`) and CLI.
+Producing `libminxfmr.so` is an integration task for the Android app build.
+
 ---
 
 Architecture:
@@ -592,12 +612,14 @@ Concept:
 
 ```cmake
 add_library(
-    minxfmr
+    minxfmr_jni
     SHARED
 
     native.cpp
 )
 ```
+
+Use `minxfmr` core as a linked dependency from the app build.
 
 ---
 

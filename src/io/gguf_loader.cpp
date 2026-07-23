@@ -7,6 +7,8 @@
 #include <limits>
 #include <string>
 
+// This file resolves architecture-dependent GGUF tensor names into a common runtime form.
+
 // backing storage for accessors
 static std::string gguf_last_name_Wq;
 static size_t gguf_last_rows_Wq=0, gguf_last_cols_Wq=0;
@@ -26,6 +28,8 @@ bool gguf_try_load_projections_for_layer(const char* path, int layer, Tensor*& o
     (void)0;
 
     auto make_candidates = [&](char proj) {
+        // Different exporters use different naming conventions for the same tensor.
+        // We try a prioritized list and load the first match.
         std::vector<std::string> names;
         if (layer >= 0) {
             char b0[64], b1[96], b2[80];
@@ -111,6 +115,7 @@ bool gguf_try_load_projection_biases_for_layer(const char* path, int layer, Tens
     if (!gguf_open(path, gf)) return false;
 
     auto make_candidates = [&](char proj) {
+        // Bias tensors follow similar naming drift across model families.
         std::vector<std::string> names;
         char b0[64], b1[96], b2[80], b3[96], b4[96];
         const char* suf = (proj == 'q') ? "q" : ((proj == 'k') ? "k" : "v");
@@ -269,6 +274,7 @@ bool gguf_try_load_ffn_for_layer(const char* path, int layer, Tensor*& outWgate,
         }
     };
 
+    // FFN tensors are commonly named (w1,w2,w3) or (gate,up,down).
     std::vector<std::string> gate_names;
     std::vector<std::string> up_names;
     std::vector<std::string> down_names;

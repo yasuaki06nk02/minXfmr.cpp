@@ -9,7 +9,9 @@
 #endif
 
 struct TensorImpl {
+    // Public handle returned to callers.
     Tensor t;
+    // Non-null only when this object owns allocated storage.
     void* storage;
 };
 
@@ -43,6 +45,7 @@ static void free_aligned_64(void* p) {
 }
 
 static void* acquire_f32_storage(size_t bytes) {
+    // Reuse same-size buffers to reduce malloc/free churn in repeated inference calls.
     auto it = g_f32_cache.buckets.find(bytes);
     if (it != g_f32_cache.buckets.end() && !it->second.empty()) {
         void* p = it->second.back();
@@ -56,6 +59,7 @@ static void* acquire_f32_storage(size_t bytes) {
 static void release_f32_storage(void* p, size_t bytes) {
     if (!p || bytes == 0) return;
     std::vector<void*>& bucket = g_f32_cache.buckets[bytes];
+    // Keep cache bounded to avoid unbounded memory growth.
     if (bucket.size() >= kMaxBucketEntries || g_f32_cache.bytes_cached + bytes > kMaxCachedBytes) {
         free_aligned_64(p);
         return;
@@ -138,9 +142,11 @@ Tensor* tensor_create_q4_k_from_bytes(size_t rows, size_t cols, const uint8_t* p
 
 void tensor_free(Tensor* t) {
     if (!t) return;
+    // `t` points to TensorImpl::t. Recover enclosing allocation.
     TensorImpl* impl = (TensorImpl*)((char*)t - offsetof(TensorImpl, t));
     if (impl->storage) {
         if (impl->t.type == DataType::F32 && impl->t.bytes > 0) {
+            // F32 buffers are pooled per-thread for reuse.
             release_f32_storage(impl->storage, impl->t.bytes);
         } else {
             free_aligned_64(impl->storage);

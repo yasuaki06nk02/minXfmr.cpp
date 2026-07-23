@@ -25,7 +25,7 @@ Instead, generated tokens are streamed through a callback.
 
 # Public API
 
-The MVP provides four functions.
+The runtime provides core lifecycle APIs plus optional utility/accessor APIs.
 
 ```c
 typedef struct minxfmr_context minxfmr_context;
@@ -34,11 +34,17 @@ typedef struct minxfmr_context minxfmr_context;
 minxfmr_context* minxfmr_open(
     const char* model_path);
 
+minxfmr_context* minxfmr_open_with_layer(
+    const char* model_path,
+    int projection_layer);
+
 
 int minxfmr_generate(
     minxfmr_context* ctx,
     const char* prompt,
-    void (*callback)(const char* token));
+    void (*callback)(const char* token),
+    double temperature,
+    int top_k);
 
 
 void minxfmr_reset(
@@ -47,6 +53,19 @@ void minxfmr_reset(
 
 void minxfmr_close(
     minxfmr_context* ctx);
+
+void minxfmr_print_weights(
+    minxfmr_context* ctx);
+
+const char* minxfmr_get_chat_template(
+    minxfmr_context* ctx);
+
+size_t minxfmr_get_special_tokens_count(
+    minxfmr_context* ctx);
+
+const char* minxfmr_get_special_token(
+    minxfmr_context* ctx,
+    size_t idx);
 ```
 
 ---
@@ -194,7 +213,9 @@ Generated tokens are delivered immediately through a callback.
 int minxfmr_generate(
     minxfmr_context* ctx,
     const char* prompt,
-    void (*callback)(const char* token));
+    void (*callback)(const char* token),
+    double temperature,
+    int top_k);
 ```
 
 ---
@@ -235,6 +256,19 @@ void on_token(const char* token)
     printf("%s", token);
 }
 ```
+
+### temperature
+
+Sampling temperature.
+
+Rules:
+
+* `temperature <= 0`: greedy selection
+* `temperature > 0`: probabilistic sampling from top-k candidates
+
+### top_k
+
+Top-k candidate size used when sampling.
 
 ---
 
@@ -358,6 +392,26 @@ Releases:
 * Runtime memory
 
 After close(), the context is invalid.
+
+---
+
+# Utility APIs
+
+## minxfmr_open_with_layer()
+
+Opens model and requests projection tensor fallback from a specific layer index.
+
+## minxfmr_print_weights()
+
+Prints loaded projection weight summary for debugging.
+
+## minxfmr_get_chat_template()
+
+Returns optional chat template text loaded from GGUF metadata.
+
+## minxfmr_get_special_tokens_count() / minxfmr_get_special_token()
+
+Expose optional special token list loaded from GGUF metadata.
 
 ---
 

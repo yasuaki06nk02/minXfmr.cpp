@@ -291,6 +291,14 @@ blk.0.ffn_down.weight
 output.weight
 ```
 
+Current loader behavior:
+
+* prepare candidate names per tensor role (Q/K/V, norm, FFN, lm_head)
+* search candidates in order
+* load first match
+
+This allows one loader path to support naming differences across architectures/exporters.
+
 ---
 
 # Model Tensor Mapping
@@ -375,19 +383,11 @@ Q4
 Internal representation:
 
 ```cpp
-enum DataType
+enum class DataType
 {
     F32,
 
-    F16,
-
-    Q8,
-
-    Q6,
-
-    Q5,
-
-    Q4
+    Q4_K
 };
 ```
 
@@ -400,9 +400,7 @@ Initial implementation:
 ```text
 F32
 
-F16
-
-Q4
+Q4_K
 ```
 
 ---
@@ -449,7 +447,7 @@ scale
 
 ---
 
-# GGUF Reader Class
+# GGUF Loader Interface (Concept)
 
 ```cpp
 class GGUFReader
@@ -539,7 +537,7 @@ minxfmr_open()
 
 ↓
 
-GGUFReader
+GGUF Loader
 
 ↓
 
@@ -552,6 +550,10 @@ Tensor Allocation
 ↓
 
 Weight Loading
+
+↓
+
+Weight Orientation Normalization
 
 ↓
 

@@ -161,7 +161,9 @@ struct Tensor
 
     DataType type;
 
-    Shape shape;
+    size_t rows;
+
+    size_t cols;
 
     size_t bytes;
 };
@@ -171,20 +173,89 @@ struct Tensor
 
 # Tensor Ownership
 
-MVP:
+Tensor ownership has two modes:
 
-Model owns tensors.
+1) Owned tensor
+
+* memory allocated by tensor create API
+* freed by tensor_free()
+
+2) View tensor
+
+* wraps external buffer
+* tensor_free() releases wrapper only
+* caller keeps external buffer lifetime
 
 Example:
 
 ```text
-Model
+Model (owned tensor)
 
- ├── Tensor 1
+ ├── Tensor 1 (owns storage)
 
- ├── Tensor 2
+ ├── Tensor 2 (owns storage)
 
- └── Tensor 3
+ └── Tensor 3 (owns storage)
+
+
+Tokenizer scratch buffer (external)
+
+ └── Tensor view (does not own storage)
+```
+
+---
+
+# Tensor Layout Rules
+
+F32 tensors use row-major layout:
+
+```text
+index = row * cols + col
+```
+
+Q4_K tensors store packed GGUF blocks.
+
+Each row must satisfy:
+
+```text
+cols % 256 == 0
+```
+
+Row bytes for Q4_K:
+
+```text
+row_bytes = (cols / 256) * block_size
+```
+
+If row shape is invalid, allocation returns null.
+
+---
+
+# Tensor API Safety Contract
+
+The tensor helpers are defensive:
+
+* invalid shape -> return null
+* out-of-range get -> 0.0f
+* out-of-range set -> no-op
+* type mismatch get/set -> safe fallback (0.0f or no-op)
+
+This keeps caller code simple in early MVP stages and avoids crashes from accidental misuse.
+
+---
+
+# Tensor Lifetime
+
+```text
+tensor_create_*()
+
+↓
+
+use tensor
+
+↓
+
+tensor_free()
 ```
 
 ---

@@ -61,6 +61,14 @@ Test
 
 └── Device Test
 ```
+Current status:
+
+The repository currently has no dedicated `tests/` build target.
+Validation is primarily performed through:
+
+* CLI smoke/self tests (`minxfmr_cli --selftest`)
+* model-loading and generation runs
+* targeted logging checks
 
 ---
 
@@ -160,7 +168,7 @@ CPUBackend
 
 ---
 
-# 2. GGUF Reader Test
+# 2. GGUF Loader Test
 
 ## Purpose
 
@@ -463,30 +471,30 @@ Verify session behavior.
 
 Test:
 
-Without reset:
+Within one `generate()` call:
 
 ```text
 Prompt A
 
 ↓
 
-Prompt B
+next token steps
 
 ↓
 
-Continue
+continue using cache
 ```
 
 ---
 
-With reset:
+Across two separate `generate()` calls:
 
 ```text
 Prompt A
 
 ↓
 
-reset()
+generate() end
 
 ↓
 
@@ -495,7 +503,7 @@ Prompt B
 
 Expected:
 
-Different contexts.
+Second call starts with a reset cache unless prompt text explicitly includes prior context.
 
 ---
 
@@ -510,11 +518,11 @@ Verify accuracy and performance.
 Compare:
 
 ```text
-FP16
+F32
 
 vs
 
-Q4
+Q4_K
 ```
 
 ---
@@ -564,6 +572,11 @@ Same output
 ## Purpose
 
 Verify mobile integration.
+
+Current status:
+
+Android integration tests are a planned phase and are not part of current
+top-level CMake targets.
 
 ---
 
@@ -663,8 +676,8 @@ Device
 
 | Device      | Model | Type | RAM | Speed |
 | ----------- | ----- | ---- | --- | ----- |
-| Jetson Nano | Small | Q4   | TBD | TBD   |
-| Android     | Small | Q4   | TBD | TBD   |
+| Jetson Nano | Small | Q4_K | TBD | TBD   |
+| Android     | Small | Q4_K | TBD | TBD   |
 
 ---
 

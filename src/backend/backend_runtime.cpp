@@ -59,6 +59,7 @@ static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t
 }
 
 static float dot_q4_k_block(const uint8_t* blk, const float* x256) {
+    // Decode one GGUF Q4_K block on the fly and compute dot with 256 F32 values.
     uint16_t hd = 0;
     uint16_t hm = 0;
     std::memcpy(&hd, blk + 0, sizeof(hd));
@@ -109,6 +110,7 @@ void backend_initialize_from_env() {
     bool want_cuda = false;
     bool force_cpu = false;
 
+    // auto: try CUDA first, otherwise keep CPU reference path.
     if (!env || env[0] == '\0' || ieq(env, "auto")) {
         want_cuda = true;
     } else if (ieq(env, "cuda")) {
@@ -164,6 +166,7 @@ bool backend_using_cuda() {
 bool backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
     backend_initialize_from_env();
 #if defined(MINXFMR_ENABLE_CUDA)
+    // Prefer CUDA when selected and available; fallback is always CPU.
     if (g_backend_kind == BackendKind::CUDA && cuda_backend_matmul(A, B, out)) return true;
 #endif
     return cpu_matmul(A, B, out);
@@ -187,6 +190,7 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
     const float* ad = (const float*)A->data;
     float* od = (float*)out->data;
 
+    // Q4_K path: B rows are packed quantized blocks interpreted as transposed RHS.
     if (B->type == DataType::Q4_K) {
         const size_t row_bytes = tensor_q4_k_row_bytes(k);
         if (row_bytes == 0) return false;

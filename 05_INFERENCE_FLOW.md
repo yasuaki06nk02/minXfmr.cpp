@@ -176,7 +176,8 @@ std::vector<int> tokens;
 
 # Step 2: Token Processing
 
-Each token is processed sequentially.
+Prompt tokens are first processed sequentially (prefill stage).
+Then generation runs one-token-at-a-time (autoregressive stage).
 
 Example:
 
@@ -186,7 +187,7 @@ Input:
 [10, 25, 300]
 ```
 
-Processing:
+Prefill processing:
 
 ```text
 10
@@ -210,6 +211,25 @@ Transformer
 ↓
 
 Transformer
+
+
+Autoregressive processing:
+
+```text
+last_token
+
+↓
+
+Transformer
+
+↓
+
+next_token
+
+↓
+
+repeat
+```
 ```
 
 ---
@@ -513,6 +533,9 @@ Logits
 
 The Transformer outputs scores.
 
+In current implementation, logits are computed by multiplying hidden state
+with output head (`Wout`) when available.
+
 Example:
 
 ```text
@@ -539,13 +562,15 @@ Sampler selects next token.
 MVP:
 
 ```text
-Greedy Sampling
+Greedy or Top-K + Temperature
 ```
 
 Algorithm:
 
 ```text
-Choose highest probability token
+temperature <= 0  -> greedy
+
+temperature > 0   -> sample from top-k candidates
 ```
 
 Example:
@@ -615,6 +640,8 @@ Model outputs:
 <eos>
 ```
 
+Role/template marker tokens are also suppressed from user callback output.
+
 ---
 
 ## Maximum Token Count
@@ -669,7 +696,10 @@ generate(
 );
 ```
 
-The second call continues using KV Cache.
+Each `generate()` call resets KV Cache at start.
+
+So the second call does not continue prior call context unless the caller
+includes previous conversation text in the new prompt.
 
 ---
 
@@ -693,6 +723,10 @@ Clear
 ```
 
 Model remains loaded.
+
+Note:
+
+`generate()` already performs KV reset for per-call isolation.
 
 ---
 

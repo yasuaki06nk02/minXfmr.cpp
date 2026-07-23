@@ -19,11 +19,11 @@ Transformer
 
 ↓
 
-Tensor Operations
+Backend Runtime Interface
 
 ↓
 
-CPUBackend
+CPU Backend
 
 ↓
 
@@ -72,80 +72,45 @@ CPUBackend does not handle:
 ```text id="qz7mcm"
 src/backend/
 
+├── backend_runtime.h
+
+├── backend_runtime.cpp
+
 └── cpu/
 
     ├── cpu_backend.h
 
-    ├── cpu_backend.cpp
-
-    ├── matmul.cpp
-
-    ├── vector.cpp
-
-    └── quant.cpp
+    └── cpu_backend.cpp
 ```
 
 ---
 
-# CPUBackend Class
+# CPU Backend Interface (Current)
 
 ## Header
 
 ```cpp id="mfw93n"
-class CPUBackend
-{
+bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out);
+bool cpu_add(const Tensor* a, const Tensor* b, Tensor* out);
 
-public:
+float* cpu_workspace(size_t n);
+void cpu_workspace_reset(bool shrink = false);
 
-    bool initialize();
+bool cpu_matvec(const float* vec, const float* mat, float* out, size_t K, size_t N);
+bool cpu_matvec_strided(const float* vec, const float* mat, float* out, size_t K, size_t N, size_t mat_row_stride);
 
-
-    void matmul(
-        Tensor& a,
-        Tensor& b,
-        Tensor& output);
-
-
-    void add(
-        Tensor& a,
-        Tensor& b,
-        Tensor& output);
-
-
-    void multiply(
-        Tensor& a,
-        Tensor& b,
-        Tensor& output);
-
-
-};
+bool cpu_vec_dot_rows(const float* vec, const float* mat_rows, float* out, size_t K, size_t Nrows, size_t row_stride);
+bool cpu_vec_dot_rows_ring(const float* vec, const float* ring, size_t head, size_t seq_max, size_t len, size_t K, size_t row_stride, float* out);
+bool cpu_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* out, size_t Nrows, size_t Ncols, size_t row_stride);
 ```
 
 ---
 
-# Initialization
+# Runtime Selection
 
-## initialize()
+Backend selection is handled by backend runtime using `MINXFMR_BACKEND`.
 
-Purpose:
-
-Prepare CPU execution environment.
-
----
-
-Tasks:
-
-* Detect CPU features
-* Setup function pointers
-* Prepare workspace
-
----
-
-Example:
-
-```cpp id="cnq5u4"
-backend.initialize();
-```
+CPU backend remains the fallback/reference path when CUDA is unavailable.
 
 ---
 
@@ -355,9 +320,7 @@ CPUBackend handles:
 ```text id="g2e8t9"
 F32 MatMul
 
-FP16 MatMul
-
-Q4 MatMul
+Q4_K MatMul
 ```
 
 ---
@@ -367,11 +330,11 @@ Q4 MatMul
 Flow:
 
 ```text id="j5h7d7"
-Q4 Weight
+Q4_K Weight
 
 +
 
-FP16 Activation
+F32 Activation
 
 ↓
 
@@ -399,9 +362,9 @@ case F32:
 break;
 
 
-case Q4:
+case Q4_K:
 
-    matmul_q4();
+    matmul_q4_k();
 
 break;
 
@@ -440,22 +403,18 @@ Release
 
 # Workspace Buffer
 
-Future:
+Current implementation:
 
 ```cpp id="0m2p9h"
-class Workspace
-{
-    float* buffer;
-
-    size_t size;
-};
+float* cpu_workspace(size_t n);
+void cpu_workspace_reset(bool shrink = false);
 ```
 
 ---
 
 Purpose:
 
-Temporary calculation memory.
+Thread-local reusable temporary calculation memory.
 
 ---
 

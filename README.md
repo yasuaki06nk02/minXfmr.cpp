@@ -73,17 +73,18 @@ CUDA backend support is now available as an optional acceleration path while kee
 The MVP exposes only four public functions.
 
 ```c
-TinyLLM minxfmr_open(const char* model_path);
+minxfmr_context* minxfmr_open(const char* model_path);
 
-char* minxfmr_generate(
-    TinyLLM runtime,
-    const char* prompt);
+int minxfmr_generate(
+    minxfmr_context* ctx,
+    const char* prompt,
+    void (*callback)(const char* token),
+    double temperature,
+    int top_k);
 
-void minxfmr_reset(
-    TinyLLM runtime);
+void minxfmr_reset(minxfmr_context* ctx);
 
-void minxfmr_close(
-    TinyLLM runtime);
+void minxfmr_close(minxfmr_context* ctx);
 ```
 
 Everything else is considered an implementation detail.
@@ -93,22 +94,30 @@ Everything else is considered an implementation detail.
 # Example
 
 ```c
-TinyLLM ai = minxfmr_open("qwen3.gguf");
+#include <stdio.h>
+#include "minxfmr.h"
 
-char* reply;
+static void print_token(const char* token) {
+    if (token) fputs(token, stdout);
+}
 
-reply = minxfmr_generate(ai, "Hello");
-printf("%s\\n", reply);
+int main(void) {
+    minxfmr_context* ai = minxfmr_open("qwen3.gguf");
+    if (!ai) return 1;
 
-reply = minxfmr_generate(ai, "Do you remember my name?");
-printf("%s\\n", reply);
+    minxfmr_generate(ai, "Hello", print_token, 0.8, 8);
+    fputc('\n', stdout);
 
-minxfmr_reset(ai);
+    minxfmr_generate(ai, "Do you remember my name?", print_token, 0.8, 8);
+    fputc('\n', stdout);
 
-reply = minxfmr_generate(ai, "Do you remember my name?");
-printf("%s\\n", reply);
+    minxfmr_reset(ai);
+    minxfmr_generate(ai, "Do you remember my name?", print_token, 0.8, 8);
+    fputc('\n', stdout);
 
-minxfmr_close(ai);
+    minxfmr_close(ai);
+    return 0;
+}
 ```
 
 ---
@@ -188,7 +197,7 @@ At startup, runtime logs the selected backend to stderr.
 
 * GGUF
 * Decoder-only Transformer models
-* Q4_K_M quantization (initial target)
+* F32 and Q4_K tensor paths
 
 Additional quantization methods may be added while maintaining compatibility with GGUF.
 
@@ -307,7 +316,7 @@ Each module should perform one task only.
 
 Examples include
 
-* GGUF Reader
+* GGUF Loader
 * Tokenizer
 * Tensor
 * Attention
@@ -336,17 +345,19 @@ Simple code is preferred over clever code.
 ```text
 minxfmr-cpp
 
-├── docs
 ├── include
-├── samples
+│   └── minxfmr.h
 ├── src
 │   ├── backend
-│   ├── model
-│   ├── runtime
+│   ├── api
+│   ├── io
+│   ├── cache
+│   ├── tokenizer
+│   ├── transformer
 │   ├── tensor
-│   ├── platform
-│   └── util
-├── tests
+│   └── main.cpp
+├── third_party
+├── scripts
 ├── CMakeLists.txt
 └── README.md
 ```
@@ -357,21 +368,21 @@ minxfmr-cpp
 
 MVP development proceeds in the following order
 
-1. GGUF Reader
-2. Tokenizer
-3. Tensor
-4. Embedding
-5. RoPE
-6. RMSNorm
-7. Attention
-8. Feed Forward Network
-9. Decoder Block
-10. Transformer
-11. KV Cache
-12. Sampler
-13. Text Generation
-14. C API
-15. Platform Integrations
+1. Project Foundation
+2. Tensor System
+3. CPU Backend Basic Operations
+4. Transformer Components
+5. Full Transformer Model
+6. Tokenizer
+7. GGUF Loader
+8. Model Runtime Integration
+9. Text Generation API
+10. Session Lifecycle (open/generate/reset/close)
+11. Quantization Support (F32/Q4_K paths)
+12. CPU Optimization
+13. Linux/Jetson Validation
+14. Android NDK Integration
+15. Release Preparation
 
 Each step should produce a working build.
 

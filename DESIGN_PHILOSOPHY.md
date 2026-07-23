@@ -78,17 +78,20 @@ The public API must remain extremely small.
 MVP exposes only four functions.
 
 ```c
-TinyLLM* minxfmr_open(const char* model_path);
+minxfmr_context* minxfmr_open(const char* model_path);
 
-char* minxfmr_generate(
-    TinyLLM* runtime,
-    const char* prompt);
+int minxfmr_generate(
+    minxfmr_context* ctx,
+    const char* prompt,
+    void (*callback)(const char* token),
+    double temperature,
+    int top_k);
 
 void minxfmr_reset(
-    TinyLLM* runtime);
+    minxfmr_context* ctx);
 
 void minxfmr_close(
-    TinyLLM* runtime);
+    minxfmr_context* ctx);
 ```
 
 Everything else belongs to the internal implementation.
@@ -115,7 +118,7 @@ Each module should have exactly one responsibility.
 
 Examples:
 
-* GGUF Reader
+* GGUF Loader
 * Tokenizer
 * Tensor
 * Attention

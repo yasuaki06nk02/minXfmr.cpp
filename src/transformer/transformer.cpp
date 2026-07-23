@@ -56,6 +56,7 @@ static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out,
     if (W->type != DataType::F32 && W->type != DataType::Q4_K) return false;
     const size_t d_in = in->cols;
 
+    // Some checkpoints store square matrices in the opposite orientation.
     if (transpose_square && W->rows == d_in && W->cols == d_in) {
         out = tensor_create_f32_noinit(in->rows, d_in);
         if (!out || !backend_matmul_rhs_transposed(in, W, out)) {
@@ -192,14 +193,15 @@ bool transformer_forward_single_layer(
         return false;
     }
 
-    // Allocate temporaries
+    // Stage 1: attention input normalization.
     Tensor* norm = tensor_create_f32_noinit(seq, d);
     if (!norm) return false;
 
     if (!rmsnorm_forward(input, norm, rmsnorm_epsilon)) { tensor_free(norm); return false; }
     if (Wattn_norm_in) apply_norm_scale(norm, Wattn_norm_in);
 
-    // Project norm -> Q,K,V. We accept either [din x dout] or [dout x din] weight layout.
+    // Stage 2: linear projections to Q/K/V.
+    // We accept either [din x dout] or [dout x din] weight layout.
     Tensor* Qraw = nullptr;
     Tensor* Kraw = nullptr;
     Tensor* Vraw = nullptr;
@@ -272,6 +274,7 @@ bool transformer_forward_single_layer(
         return false;
     }
 
+    // Stage 3: apply RoPE using logical sequence position before cache append.
     const size_t start_pos = (cache != nullptr && layer < cache->layers) ? cache->lengths[layer] : 0;
     rope_apply(Qraw, start_pos, use_n_head, head_dim, rope_theta);
     rope_apply(Kraw, start_pos, use_n_head_kv, kv_head_dim, rope_theta);
@@ -291,6 +294,7 @@ bool transformer_forward_single_layer(
         cache_vd = (const float*)cache->vals[layer]->data;
     }
 
+    // Stage 4: causal self-attention against [cached tokens + current tokens].
     Tensor* attn_out = tensor_create_f32_noinit(seq, model_dim);
     if (!attn_out) {
         tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V);

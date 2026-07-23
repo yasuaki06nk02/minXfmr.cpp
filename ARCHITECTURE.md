@@ -80,7 +80,7 @@ Tensor
 
 ↓
 
-CPU Backend
+Backend Runtime (CPU/CUDA)
 ```
 
 Each layer only communicates with the layer directly below it.
@@ -103,22 +103,21 @@ samples/
 
 src/
 
+    api/
+
     backend/
         cpu/
+        cuda/
 
-    model/
-        gguf/
-        tokenizer/
+    io/
 
-    runtime/
+    tokenizer/
+
+    cache/
 
     transformer/
 
     tensor/
-
-    platform/
-
-    util/
 
 tests/
 ```
@@ -147,6 +146,10 @@ Responsible for:
 * Tensor metadata
 * Vocabulary
 * Hyperparameters
+
+Current implementation location:
+
+* `src/io/gguf_loader.*`
 
 Does NOT execute inference.
 
@@ -239,6 +242,10 @@ MVP includes:
 
 * CPU Backend
 
+Also available:
+
+* Optional CUDA Backend (runtime selectable)
+
 Future:
 
 * NEON
@@ -266,6 +273,10 @@ Input Tokens
 ↓
 
 Transformer
+
+↓
+
+Backend Runtime
 
 ↓
 

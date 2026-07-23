@@ -18,6 +18,8 @@
 #include <cctype>
 #include "../backend/backend_runtime.h"
 
+// Runtime context owned by minxfmr_open()/minxfmr_close().
+// This struct keeps both model weights and per-request reusable buffers.
 struct minxfmr_context {
     KVCache* cache;
     Tensor* Wemb;
@@ -251,6 +253,7 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
     }
     if (ctx->cache && layers_to_run > ctx->cache->layers) layers_to_run = ctx->cache->layers;
 
+    // Run decoder blocks sequentially and ping-pong between two reusable buffers.
     for (size_t l = 0; l < layers_to_run; ++l) {
         const Tensor* Wq = ctx->Wq;
         const Tensor* Wk = ctx->Wk;
@@ -385,6 +388,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     bool desired_transpose_wo = false;
     bool desired_transpose_ffn_square = false;
 
+    // Non-GGUF debug path: load simple text weights used by early bring-up.
     if (!looks_gguf) {
         FILE* f = fopen(model_path, "r");
         if (f) {
@@ -430,6 +434,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         }
     }
 
+    // Main path: load GGUF metadata + per-layer tensors.
     if (looks_gguf) {
         GGUFLoaderModelConfig cfg{0, 0, 0, 0, 0, 0, 0.0f, 1e-6f};
         if (gguf_try_read_model_config(model_path, cfg)) {
@@ -628,6 +633,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         }
     }
 
+    // Derive missing dimensions from loaded tensors so later code can validate shapes.
     if (ctx->Wq) {
         if (ctx->model_dim == 0) {
             ctx->model_dim = (ctx->Wq->rows == ctx->Wq->cols) ? ctx->Wq->rows : std::max(ctx->Wq->rows, ctx->Wq->cols);
@@ -794,6 +800,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     // Reset per-call backend workspace allocations for this generation call.
     backend_workspace_reset();
 
+    // 1) Tokenize prompt and prefill cache by running prompt tokens.
     std::vector<int> ids = tokenizer_encode(prompt);
     // debug: log prompt token ids and decoded prompt
     if (!ids.empty()) {
@@ -890,6 +897,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     std::vector<float> logits_chunk_buffer;
     if (global_chunk_size > 0) logits_chunk_buffer.resize(global_chunk_size);
 
+    // 2) Autoregressive loop: predict one token at a time.
     int t = 0;
     std::string gen_break_reason = "none";
     int gen_tokens_emitted = 0;
@@ -1245,6 +1253,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
 
     if (last_out_prefill) tensor_free(last_out_prefill);
 
+    // 3) Flush buffered fragments and finalize logs.
     // Flush any pending byte-fallbacks accumulated during streaming.
     if (!pending_bytes.empty()) {
         std::string pb;

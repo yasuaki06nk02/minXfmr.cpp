@@ -118,9 +118,13 @@ struct Tensor
 {
     void* data;
 
-    Shape shape;
-
     DataType type;
+
+    size_t rows;
+
+    size_t cols;
+
+    size_t bytes;
 };
 ```
 
@@ -348,7 +352,7 @@ Tokenizer works independently.
 
 ---
 
-# Phase 6: GGUF Reader
+# Phase 6: GGUF Loader
 
 ## Goal
 
@@ -368,11 +372,14 @@ Order:
 
 ---
 
-## Do Not Implement Yet
+## Scope Notes
 
-* Quantization
-* mmap
-* Advanced optimization
+MVP supports loading GGUF tensors for:
+
+* F32
+* Q4_K
+
+mmap and advanced loading optimizations remain future work.
 
 ---
 
@@ -432,11 +439,12 @@ Generate tokens.
 ## API
 
 ```c id="q7m3x5"
-minxfmr_generate(
-    ctx,
-    prompt,
-    callback
-);
+int minxfmr_generate(
+    minxfmr_context* ctx,
+    const char* prompt,
+    void (*callback)(const char* token),
+    double temperature,
+    int top_k);
 ```
 
 ---
@@ -493,10 +501,10 @@ Reduce memory usage.
 
 Order:
 
-1. FP16 loading
-2. Q4 reading
-3. Q4 dequantization
-4. Q4 matmul
+1. Q4_K GGUF read path
+2. Packed tensor storage
+3. On-the-fly dequantization in backend matmul
+4. Q4_K logits/output head path
 
 ---
 
@@ -505,11 +513,11 @@ Order:
 Compare:
 
 ```text id="p2x7m9"
-FP16
+F32
 
 vs
 
-Q4
+Q4_K
 ```
 
 ---
@@ -666,8 +674,10 @@ minXfmr.cpp MVP is complete when:
 
 ✓ Jetson Nano CPU works
 
-✓ Android ARM64 works
+✓ Optional CUDA build/runtime selection works
 ```
+
+Android ARM64 integration is treated as the next milestone after MVP core.
 
 ---
 
@@ -700,10 +710,14 @@ Do not implement initially:
 * Training
 * Fine tuning
 * Distributed inference
-* GPU acceleration
 * Multi-model management
 * Chat UI
 * Agent features
+
+Notes:
+
+* Optional CUDA acceleration is already supported as an implementation detail.
+* Advanced GPU features (Flash Attention, Tensor Core tuning, multi-GPU) are not MVP.
 
 ---
 
