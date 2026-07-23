@@ -1,7 +1,7 @@
 #include <cstdio>
 #include "minxfmr.h"
 #include "tensor/tensor.h"
-#include "backend/cpu/cpu_backend.h"
+#include "backend/backend_runtime.h"
 #include "transformer/rmsnorm.h"
 #include "transformer/rope.h"
 #include "transformer/attention.h"
@@ -229,7 +229,8 @@ int main(int argc, char** argv) {
             tensor_set_f32(B,0,0,5.0f); tensor_set_f32(B,0,1,6.0f);
             tensor_set_f32(B,1,0,7.0f); tensor_set_f32(B,1,1,8.0f);
 
-            if (cpu_matmul(A,B,C)) {
+            backend_initialize_from_env();
+            if (backend_matmul(A,B,C)) {
                 printf("matmul result:\n");
                 for (size_t i=0;i<2;++i) {
                     for (size_t j=0;j<2;++j) {

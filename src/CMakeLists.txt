@@ -1,6 +1,7 @@
 add_library(minxfmr STATIC
     api/minxfmr.cpp
     tensor/tensor.cpp
+    backend/backend_runtime.cpp
     backend/cpu/cpu_backend.cpp
     transformer/rmsnorm.cpp
     transformer/rope.cpp
@@ -15,6 +16,18 @@ add_library(minxfmr STATIC
     ../third_party/gguf/gguf_reader.cpp
 )
 
+if(MINXFMR_CUDA_AVAILABLE)
+    target_sources(minxfmr PRIVATE
+        backend/cuda/cuda_backend.cu
+    )
+    target_compile_definitions(minxfmr PRIVATE MINXFMR_ENABLE_CUDA=1)
+    set_target_properties(minxfmr PROPERTIES
+        CUDA_STANDARD 14
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_SEPARABLE_COMPILATION ON
+    )
+endif()
+
 find_package(OpenMP)
 
 target_include_directories(minxfmr PUBLIC
@@ -27,6 +40,11 @@ target_include_directories(minxfmr PRIVATE
 
 if(OpenMP_CXX_FOUND)
     target_link_libraries(minxfmr PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
+if(MINXFMR_CUDA_AVAILABLE)
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(minxfmr PRIVATE CUDA::cudart CUDA::cublas)
 endif()
 
 if(MSVC)

@@ -4,7 +4,7 @@
 #include "rope.h"
 #include "../cache/kv_cache.h"
 #include "feed_forward.h"
-#include "../backend/cpu/cpu_backend.h"
+#include "../backend/backend_runtime.h"
 #include "softmax.h"
 #include <cstdlib>
 #include <cstring>
@@ -40,41 +40,6 @@ static Tensor* tensor_clone_f32(const Tensor* in) {
     return out;
 }
 
-// Compute out = A * B^T without materializing B^T.
-// A: [m x k], B: [n x k], out: [m x n]
-static bool cpu_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out) {
-    if (!A || !B || !out) return false;
-    if (A->type != DataType::F32 || B->type != DataType::F32 || out->type != DataType::F32) return false;
-    if (A->cols != B->cols) return false;
-    if (out->rows != A->rows || out->cols != B->rows) return false;
-
-    const size_t m = A->rows;
-    const size_t k = A->cols;
-    const size_t n = B->rows;
-    const float* ad = (const float*)A->data;
-    const float* bd = (const float*)B->data;
-    float* od = (float*)out->data;
-
-    #if defined(_OPENMP)
-    #pragma omp parallel for collapse(2)
-    #endif
-    for (ptrdiff_t i = 0; i < (ptrdiff_t)m; ++i) {
-        for (ptrdiff_t j = 0; j < (ptrdiff_t)n; ++j) {
-            const float* arow = ad + (size_t)i * k;
-            const float* brow = bd + (size_t)j * k;
-            float s = 0.0f;
-#if defined(_OPENMP) && !defined(_MSC_VER)
-            #pragma omp simd reduction(+:s)
-#endif
-            for (size_t kk = 0; kk < k; ++kk) {
-                s += arow[kk] * brow[kk];
-            }
-            od[(size_t)i * n + (size_t)j] = s;
-        }
-    }
-    return true;
-}
-
 static bool cache_append_log_enabled() {
     if (g_cache_append_log_enabled < 0) {
         const char* v = std::getenv("MINXFMR_VERBOSE_CACHE");
@@ -92,7 +57,7 @@ static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out,
 
     if (transpose_square && W->rows == d_in && W->cols == d_in) {
         out = tensor_create_f32(in->rows, d_in);
-        if (!out || !cpu_matmul_rhs_transposed(in, W, out)) {
+        if (!out || !backend_matmul_rhs_transposed(in, W, out)) {
             tensor_free(out);
             out = nullptr;
             return false;
@@ -103,7 +68,7 @@ static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out,
     if (W->rows == d_in) {
         out = tensor_create_f32(in->rows, W->cols);
         if (!out) return false;
-        if (!cpu_matmul(in, W, out)) {
+        if (!backend_matmul(in, W, out)) {
             tensor_free(out);
             out = nullptr;
             return false;
@@ -113,7 +78,7 @@ static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out,
 
     if (W->cols == d_in) {
         out = tensor_create_f32(in->rows, W->rows);
-        if (!out || !cpu_matmul_rhs_transposed(in, W, out)) {
+        if (!out || !backend_matmul_rhs_transposed(in, W, out)) {
             tensor_free(out);
             out = nullptr;
             return false;
@@ -340,7 +305,7 @@ bool transformer_forward_single_layer(
     if (scores_workspace && scores_workspace_len >= J) {
         scores = scores_workspace;
     } else {
-        scores = cpu_request_workspace(J);
+        scores = backend_request_workspace(J);
     }
     const size_t group = use_n_head / use_n_head_kv;
     const float score_scale = 1.0f / sqrtf((float)head_dim);
@@ -356,7 +321,7 @@ bool transformer_forward_single_layer(
             // scores for cached rows from ring buffer
             if (cached_rows > 0) {
                 const float* k_ring_base = cache_kd + kv_off;
-                if (!cpu_vec_dot_rows_ring(qptr, k_ring_base, cache_head, cache->seq_max, cached_rows, head_dim, kv_dim, scores)) {
+                if (!backend_vec_dot_rows_ring(qptr, k_ring_base, cache_head, cache->seq_max, cached_rows, head_dim, kv_dim, scores)) {
                     tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(attn_out);
                     return false;
                 }
@@ -364,7 +329,7 @@ bool transformer_forward_single_layer(
             // scores for current rows from contiguous current-K
             if (seq > 0) {
                 const float* k_cur_base = kd + kv_off;
-                if (!cpu_vec_dot_rows(qptr, k_cur_base, scores + cached_rows, head_dim, seq, kv_dim)) {
+                if (!backend_vec_dot_rows(qptr, k_cur_base, scores + cached_rows, head_dim, seq, kv_dim)) {
                     tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(attn_out);
                     return false;
                 }
@@ -396,13 +361,13 @@ bool transformer_forward_single_layer(
             }
 
             if (seq > 0) {
-                float* outvec_cur = cpu_request_workspace(head_dim);
+                float* outvec_cur = backend_request_workspace(head_dim);
                 if (!outvec_cur) {
                     tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(attn_out);
                     return false;
                 }
                 const float* v_cur_base = vd + kv_off;
-                if (!cpu_vec_mul_rows_cols(scores + cached_rows, v_cur_base, outvec_cur, seq, head_dim, kv_dim)) {
+                if (!backend_vec_mul_rows_cols(scores + cached_rows, v_cur_base, outvec_cur, seq, head_dim, kv_dim)) {
                     tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(attn_out);
                     return false;
                 }

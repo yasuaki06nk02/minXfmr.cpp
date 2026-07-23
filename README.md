@@ -34,6 +34,7 @@ Just as SQLite provides a small, stable, and dependable SQL engine, minXfmr.cpp 
 * High maintainability
 * GGUF native support
 * CPU inference
+* Optional CUDA acceleration (runtime selectable)
 * Small binary size
 * Minimal external dependencies
 
@@ -45,8 +46,6 @@ The runtime follows a **CPU-first, minimal-dependency design** similar to SQLite
 
 The following features are intentionally excluded from the first release
 
-* GPU acceleration
-* CUDA
 * Metal
 * Vulkan
 * OpenCL
@@ -62,6 +61,10 @@ The following features are intentionally excluded from the first release
 * Agent framework
 
 These features may be considered in the future, but simplicity always takes priority.
+
+Note:
+
+CUDA backend support is now available as an optional acceleration path while keeping CPU as the reference backend.
 
 ---
 
@@ -128,6 +131,56 @@ Verification platforms
 * Android ARM64
 
 The runtime core is developed on Linux first and then validated across the supported platforms. Platform-specific integrations such as Android (JNI) and future Apple Silicon backends are built on top of the shared core runtime.
+
+---
+
+# Build
+
+## CPU-only build
+
+CPU-only builds are the default fallback even when CUDA is enabled as an option.
+
+```bash
+cmake -S . -B build -DMINXFMR_ENABLE_CUDA=OFF
+cmake --build build --config Release --target minxfmr_cli
+```
+
+## CUDA-capable build
+
+When CUDA compiler/toolkit is available, build with CUDA backend enabled.
+
+```bash
+cmake -S . -B build -DMINXFMR_ENABLE_CUDA=ON
+cmake --build build --config Release --target minxfmr_cli
+```
+
+If CUDA is requested but not available on the build host, CMake configures CPU-only mode automatically.
+
+---
+
+# Runtime Backend Selection
+
+Backend selection is controlled by environment variable MINXFMR_BACKEND.
+
+Supported values:
+
+* auto (default): try CUDA first, fallback to CPU
+* cuda: require CUDA path, fallback to CPU if runtime init fails
+* cpu: force CPU backend
+
+PowerShell examples:
+
+```powershell
+$env:MINXFMR_BACKEND = "cpu"
+.\build\src\Release\minxfmr_cli.exe .\model.gguf "hello"
+```
+
+```powershell
+$env:MINXFMR_BACKEND = "cuda"
+.\build\src\Release\minxfmr_cli.exe .\model.gguf "hello"
+```
+
+At startup, runtime logs the selected backend to stderr.
 
 ---
 

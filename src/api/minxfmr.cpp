@@ -16,7 +16,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cctype>
-#include "../backend/cpu/cpu_backend.h"
+#include "../backend/backend_runtime.h"
 
 struct minxfmr_context {
     KVCache* cache;
@@ -298,6 +298,9 @@ minxfmr_context* minxfmr_open(const char* model_path) {
 
 minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_layer) {
     if (!model_path) return nullptr;
+
+    backend_initialize_from_env();
+    fprintf(stderr, "[minxfmr] backend=%s\n", backend_get_name());
 
     minxfmr_context* ctx = new (std::nothrow) minxfmr_context();
     if (!ctx) return nullptr;
@@ -740,8 +743,8 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
 int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(const char* token), double temperature, int top_k) {
     if (!ctx || !prompt) return -1;
 
-    // Reset per-thread CPU workspace allocations for this generation call.
-    cpu_workspace_reset();
+    // Reset per-call backend workspace allocations for this generation call.
+    backend_workspace_reset();
 
     std::vector<int> ids = tokenizer_encode(prompt);
     // debug: log prompt token ids and decoded prompt
@@ -878,7 +881,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                     size_t cur = std::min(CHUNK, use_vocab - off);
                     float* ltmp = logits_chunk_buffer.empty() ? nullptr : logits_chunk_buffer.data();
                     bool ok = false;
-                    if (ltmp) ok = cpu_matvec_strided(od, wd + off, ltmp, dim, cur, out_vocab);
+                    if (ltmp) ok = backend_matvec_strided(od, wd + off, ltmp, dim, cur, out_vocab);
                     if (ok) {
                         for (size_t j = 0; j < cur; ++j) logits[off + j] = (double)ltmp[j];
                     } else {
@@ -903,7 +906,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                     float* ltmp = logits_chunk_buffer.empty() ? nullptr : logits_chunk_buffer.data();
                     const float* rowptr = wd + off * ctx->Wout->cols; // each row has length dim
                     bool ok = false;
-                    if (ltmp) ok = cpu_vec_dot_rows(od, rowptr, ltmp, dim, cur, ctx->Wout->cols);
+                    if (ltmp) ok = backend_vec_dot_rows(od, rowptr, ltmp, dim, cur, ctx->Wout->cols);
                     if (ok) {
                         for (size_t j = 0; j < cur; ++j) logits[off + j] = (double)ltmp[j];
                     } else {

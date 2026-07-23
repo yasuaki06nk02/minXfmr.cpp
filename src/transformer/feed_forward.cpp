@@ -1,12 +1,12 @@
 #include "feed_forward.h"
-#include "../backend/cpu/cpu_backend.h"
+#include "../backend/backend_runtime.h"
 
 bool ffn_forward(const Tensor* input, const Tensor* W, const Tensor* b, Tensor* out) {
     // input: seq x d, W: d x d_ff, out: seq x d_ff, b: 1 x d_ff
     if (!input || !W || !b || !out) return false;
     if (input->type != DataType::F32 || W->type != DataType::F32 || out->type != DataType::F32) return false;
-    // use cpu_matmul for input * W
-    if (!cpu_matmul(input, W, out)) return false;
+    // Use active runtime backend for input * W.
+    if (!backend_matmul(input, W, out)) return false;
     // add bias
     if (b->rows != 1 || b->cols != out->cols) return false;
     size_t seq = out->rows;
