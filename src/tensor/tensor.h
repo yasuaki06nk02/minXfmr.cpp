@@ -29,6 +29,9 @@ struct Tensor {
 
 // allocate a float matrix (rows x cols)
 Tensor* tensor_create_f32(size_t rows, size_t cols);
+// Allocate a float matrix without zero-initializing the buffer.
+// Use only when the caller fully overwrites all elements before reading.
+Tensor* tensor_create_f32_noinit(size_t rows, size_t cols);
 // Create a tensor view into externally managed float buffer (does not take ownership of buffer).
 Tensor* tensor_create_f32_view(size_t rows, size_t cols, float* buffer);
 // Create a packed GGML Q4_K tensor and copy raw block data into owned storage.

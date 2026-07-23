@@ -2,6 +2,8 @@
 #include <cstdlib>
 #include <new>
 #include <cstring>
+#include <vector>
+#include <unordered_map>
 #ifdef _WIN32
 #include <malloc.h>
 #endif
@@ -11,26 +13,77 @@ struct TensorImpl {
     void* storage;
 };
 
+namespace {
+struct F32StorageCache {
+    std::unordered_map<size_t, std::vector<void*>> buckets;
+    size_t bytes_cached = 0;
+};
+
+static thread_local F32StorageCache g_f32_cache;
+static constexpr size_t kMaxCachedBytes = 64u * 1024u * 1024u;
+static constexpr size_t kMaxBucketEntries = 16;
+
+static void* alloc_aligned_64(size_t bytes) {
+#ifdef _WIN32
+    return _aligned_malloc(bytes, 64);
+#else
+    void* p = nullptr;
+    if (posix_memalign(&p, 64, bytes) != 0) return nullptr;
+    return p;
+#endif
+}
+
+static void free_aligned_64(void* p) {
+    if (!p) return;
+#ifdef _WIN32
+    _aligned_free(p);
+#else
+    std::free(p);
+#endif
+}
+
+static void* acquire_f32_storage(size_t bytes) {
+    auto it = g_f32_cache.buckets.find(bytes);
+    if (it != g_f32_cache.buckets.end() && !it->second.empty()) {
+        void* p = it->second.back();
+        it->second.pop_back();
+        g_f32_cache.bytes_cached -= bytes;
+        return p;
+    }
+    return alloc_aligned_64(bytes);
+}
+
+static void release_f32_storage(void* p, size_t bytes) {
+    if (!p || bytes == 0) return;
+    std::vector<void*>& bucket = g_f32_cache.buckets[bytes];
+    if (bucket.size() >= kMaxBucketEntries || g_f32_cache.bytes_cached + bytes > kMaxCachedBytes) {
+        free_aligned_64(p);
+        return;
+    }
+    bucket.push_back(p);
+    g_f32_cache.bytes_cached += bytes;
+}
+}
+
 size_t tensor_q4_k_row_bytes(size_t cols) {
     if (cols == 0 || (cols % TENSOR_Q4_K_QK_K) != 0) return 0;
     return (cols / TENSOR_Q4_K_QK_K) * TENSOR_Q4_K_BLOCK_SIZE;
 }
 
 Tensor* tensor_create_f32(size_t rows, size_t cols) {
+    Tensor* t = tensor_create_f32_noinit(rows, cols);
+    if (!t) return nullptr;
+    std::memset(t->data, 0, t->bytes);
+    return t;
+}
+
+Tensor* tensor_create_f32_noinit(size_t rows, size_t cols) {
     if (rows == 0 || cols == 0) return nullptr;
     TensorImpl* impl = new (std::nothrow) TensorImpl();
     if (!impl) return nullptr;
     size_t bytes = rows * cols * sizeof(float);
-#ifdef _WIN32
-    impl->storage = _aligned_malloc(bytes, 64);
+    impl->storage = acquire_f32_storage(bytes);
     if (!impl->storage) { delete impl; return nullptr; }
-    std::memset(impl->storage, 0, bytes);
-#else
-    void* p = nullptr;
-    if (posix_memalign(&p, 64, bytes) != 0) { delete impl; return nullptr; }
-    impl->storage = p;
-    std::memset(impl->storage, 0, bytes);
-#endif
     impl->t.data = impl->storage;
     impl->t.type = DataType::F32;
     impl->t.rows = rows;
@@ -87,11 +140,11 @@ void tensor_free(Tensor* t) {
     if (!t) return;
     TensorImpl* impl = (TensorImpl*)((char*)t - offsetof(TensorImpl, t));
     if (impl->storage) {
-#ifdef _WIN32
-        _aligned_free(impl->storage);
-#else
-        std::free(impl->storage);
-#endif
+        if (impl->t.type == DataType::F32 && impl->t.bytes > 0) {
+            release_f32_storage(impl->storage, impl->t.bytes);
+        } else {
+            free_aligned_64(impl->storage);
+        }
     }
     delete impl;
 }

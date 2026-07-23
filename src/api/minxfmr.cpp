@@ -48,6 +48,8 @@ struct minxfmr_context {
     float rmsnorm_epsilon;
     size_t seq_max;
     std::vector<float> scores_workspace;
+    Tensor* layer_buf_a;
+    Tensor* layer_buf_b;
     int dummy;
     // optional metadata
     std::string chat_template;
@@ -71,10 +73,21 @@ static size_t infer_kv_dim_from_weight(const Tensor* w, size_t model_dim) {
 
 static Tensor* tensor_clone_f32_local(const Tensor* in) {
     if (!in || in->type != DataType::F32) return nullptr;
-    Tensor* out = tensor_create_f32(in->rows, in->cols);
+    Tensor* out = tensor_create_f32_noinit(in->rows, in->cols);
     if (!out) return nullptr;
     memcpy(out->data, in->data, sizeof(float) * in->rows * in->cols);
     return out;
+}
+
+static bool ensure_f32_tensor_shape(Tensor*& t, size_t rows, size_t cols) {
+    if (rows == 0 || cols == 0) return false;
+    if (t && t->type == DataType::F32 && t->rows == rows && t->cols == cols) return true;
+    if (t) {
+        tensor_free(t);
+        t = nullptr;
+    }
+    t = tensor_create_f32_noinit(rows, cols);
+    return t != nullptr;
 }
 
 static Tensor* token_embedding_row(const minxfmr_context* ctx, int token_id) {
@@ -225,8 +238,12 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
     // Transformer hidden size must match the model config when available.
     if (ctx->model_dim > 0) assert(input->cols == ctx->model_dim);
 
-    Tensor* cur = tensor_clone_f32_local(input);
-    if (!cur) return false;
+    if (!ensure_f32_tensor_shape(ctx->layer_buf_a, input->rows, input->cols)) return false;
+    if (!ensure_f32_tensor_shape(ctx->layer_buf_b, input->rows, input->cols)) return false;
+    memcpy(ctx->layer_buf_a->data, input->data, sizeof(float) * input->rows * input->cols);
+
+    Tensor* cur = ctx->layer_buf_a;
+    Tensor* nxt = ctx->layer_buf_b;
 
     size_t layers_to_run = 1;
     if (!ctx->Wq_layers.empty() && ctx->Wq_layers.size() == ctx->Wk_layers.size() && ctx->Wq_layers.size() == ctx->Wv_layers.size()) {
@@ -235,12 +252,6 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
     if (ctx->cache && layers_to_run > ctx->cache->layers) layers_to_run = ctx->cache->layers;
 
     for (size_t l = 0; l < layers_to_run; ++l) {
-        Tensor* nxt = tensor_create_f32(cur->rows, cur->cols);
-        if (!nxt) {
-            tensor_free(cur);
-            return false;
-        }
-
         const Tensor* Wq = ctx->Wq;
         const Tensor* Wk = ctx->Wk;
         const Tensor* Wv = ctx->Wv;
@@ -275,20 +286,18 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
         size_t scores_len = ctx->scores_workspace.size();
 
         bool ok = transformer_forward_single_layer(cur, nxt, ctx->cache, l, ctx->n_head, ctx->n_head_kv, Wq, Wk, Wv, Bq, Bk, Bv, Wo, WattnNorm, WffnNorm, Wfg, Wfu, Wfd, scores_buf, scores_len, ctx->rope_theta, ctx->rmsnorm_epsilon);
-        tensor_free(cur);
         if (!ok) {
-            tensor_free(nxt);
             return false;
         }
+        Tensor* tmp = cur;
         cur = nxt;
+        nxt = tmp;
     }
 
     if (output->rows != cur->rows || output->cols != cur->cols) {
-        tensor_free(cur);
         return false;
     }
     memcpy(output->data, cur->data, sizeof(float) * cur->rows * cur->cols);
-    tensor_free(cur);
     return true;
 }
 
@@ -364,6 +373,8 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     ctx->rope_theta = 10000.0f;
     ctx->rmsnorm_epsilon = 1e-6f;
     ctx->seq_max = 128;
+    ctx->layer_buf_a = nullptr;
+    ctx->layer_buf_b = nullptr;
 
     const char* ext = strrchr(model_path, '.');
     const bool looks_gguf = (ext != nullptr) && (_stricmp(ext, ".gguf") == 0);
@@ -768,6 +779,8 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     // Preallocate scores workspace for attention.
     // Length J = cached_rows + seq. Max value is approx seq_max.
     ctx->scores_workspace.assign(ctx->seq_max + 128, 0.0f);
+    ctx->layer_buf_a = nullptr;
+    ctx->layer_buf_b = nullptr;
 
     preload_context_weights_to_backend(ctx);
 
@@ -1348,6 +1361,8 @@ void minxfmr_close(minxfmr_context* ctx) {
     if (ctx->Wk) tensor_free(ctx->Wk);
     if (ctx->Wv) tensor_free(ctx->Wv);
     if (ctx->Wout) tensor_free(ctx->Wout);
+    if (ctx->layer_buf_a) tensor_free(ctx->layer_buf_a);
+    if (ctx->layer_buf_b) tensor_free(ctx->layer_buf_b);
     free_layer_weights(ctx->Wq_layers);
     free_layer_weights(ctx->Wk_layers);
     free_layer_weights(ctx->Wv_layers);

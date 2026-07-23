@@ -260,13 +260,18 @@ bool cpu_matvec(const float* vec, const float* mat, float* out, size_t K, size_t
 bool cpu_matvec_strided(const float* vec, const float* mat, float* out, size_t K, size_t N, size_t mat_row_stride) {
     if (!vec || !mat || !out) return false;
     if (K == 0 || N == 0) return false;
-    for (size_t n = 0; n < N; ++n) {
-        double acc = 0.0;
-        const float* col = mat + n; // start at offset n, step by mat_row_stride
-        for (size_t k = 0; k < K; ++k) {
-            acc += (double)vec[k] * (double)col[k * mat_row_stride];
+    // Compute y = x^T * W by streaming each row segment of W contiguously.
+    // This avoids cache-thrashing caused by column-stride walks on row-major data.
+    std::memset(out, 0, sizeof(float) * N);
+    for (size_t k = 0; k < K; ++k) {
+        const double scale = (double)vec[k];
+        const float* row = mat + k * mat_row_stride;
+#if defined(_OPENMP) && !defined(_MSC_VER)
+    #pragma omp simd
+#endif
+        for (size_t n = 0; n < N; ++n) {
+            out[n] += (float)(scale * (double)row[n]);
         }
-        out[n] = (float)acc;
     }
     return true;
 }

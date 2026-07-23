@@ -34,7 +34,7 @@ void transformer_set_transpose_square_weights_for_all(bool wq, bool wk, bool wv,
 
 static Tensor* tensor_clone_f32(const Tensor* in) {
     if (!in || in->type != DataType::F32) return nullptr;
-    Tensor* out = tensor_create_f32(in->rows, in->cols);
+    Tensor* out = tensor_create_f32_noinit(in->rows, in->cols);
     if (!out) return nullptr;
     memcpy(out->data, in->data, sizeof(float) * in->rows * in->cols);
     return out;
@@ -57,7 +57,7 @@ static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out,
     const size_t d_in = in->cols;
 
     if (transpose_square && W->rows == d_in && W->cols == d_in) {
-        out = tensor_create_f32(in->rows, d_in);
+        out = tensor_create_f32_noinit(in->rows, d_in);
         if (!out || !backend_matmul_rhs_transposed(in, W, out)) {
             tensor_free(out);
             out = nullptr;
@@ -67,7 +67,7 @@ static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out,
     }
 
     if (W->rows == d_in) {
-        out = tensor_create_f32(in->rows, W->cols);
+        out = tensor_create_f32_noinit(in->rows, W->cols);
         if (!out) return false;
         if (!backend_matmul(in, W, out)) {
             tensor_free(out);
@@ -78,7 +78,7 @@ static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out,
     }
 
     if (W->cols == d_in) {
-        out = tensor_create_f32(in->rows, W->rows);
+        out = tensor_create_f32_noinit(in->rows, W->rows);
         if (!out || !backend_matmul_rhs_transposed(in, W, out)) {
             tensor_free(out);
             out = nullptr;
@@ -193,7 +193,7 @@ bool transformer_forward_single_layer(
     }
 
     // Allocate temporaries
-    Tensor* norm = tensor_create_f32(seq, d);
+    Tensor* norm = tensor_create_f32_noinit(seq, d);
     if (!norm) return false;
 
     if (!rmsnorm_forward(input, norm, rmsnorm_epsilon)) { tensor_free(norm); return false; }
@@ -291,7 +291,7 @@ bool transformer_forward_single_layer(
         cache_vd = (const float*)cache->vals[layer]->data;
     }
 
-    Tensor* attn_out = tensor_create_f32(seq, model_dim);
+    Tensor* attn_out = tensor_create_f32_noinit(seq, model_dim);
     if (!attn_out) {
         tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V);
         return false;
@@ -396,7 +396,7 @@ bool transformer_forward_single_layer(
     }
 
     // First residual: x + attn_proj
-    Tensor* resid1 = tensor_create_f32(seq, d);
+    Tensor* resid1 = tensor_create_f32_noinit(seq, d);
     if (!resid1) {
         tensor_free(norm); tensor_free(attn_out); tensor_free(attn_proj); tensor_free(Q); tensor_free(K); tensor_free(V);
         return false;
@@ -409,7 +409,7 @@ bool transformer_forward_single_layer(
     }
 
     bool ok = false;
-    Tensor* ffn_out = tensor_create_f32(seq, d);
+    Tensor* ffn_out = tensor_create_f32_noinit(seq, d);
     if (!ffn_out) {
         tensor_free(norm); tensor_free(attn_out);
         tensor_free(Q); tensor_free(K); tensor_free(V);
@@ -422,13 +422,13 @@ bool transformer_forward_single_layer(
         Tensor* fused = nullptr;
         Tensor* down = nullptr;
 
-        Tensor* ffn_norm = tensor_create_f32(seq, d);
+        Tensor* ffn_norm = tensor_create_f32_noinit(seq, d);
         if (ffn_norm && rmsnorm_forward(resid1, ffn_norm, rmsnorm_epsilon)) {
             if (Wffn_norm_in) apply_norm_scale(ffn_norm, Wffn_norm_in);
             bool g_ok = project_with_weight(ffn_norm, Wffn_gate_in, gate, false);
             bool u_ok = project_with_weight(ffn_norm, Wffn_up_in, up, false);
             if (g_ok && u_ok && gate && up && gate->rows == up->rows && gate->cols == up->cols) {
-                fused = tensor_create_f32(gate->rows, gate->cols);
+                fused = tensor_create_f32_noinit(gate->rows, gate->cols);
                 if (fused) {
                     float* fd = (float*)fused->data;
                     const float* gd = (const float*)gate->data;
