@@ -28,9 +28,9 @@ Create the minimum C++ project structure.
 
 ## Tasks
 
-* [ ] Setup CMake + C++17
-* [ ] Create `include/` and `src/`
-* [ ] Build `minxfmr_cli`
+* [x] Setup CMake + C++17
+* [x] Create `include/` and `src/`
+* [x] Build `minxfmr_cli`
 
 ## Expected Result
 
@@ -46,9 +46,9 @@ Create fundamental tensor container and memory helpers.
 
 ## Tasks
 
-* [ ] Implement tensor allocation/free
-* [ ] Implement F32 read/write helpers
-* [ ] Add tensor transpose helper
+* [x] Implement tensor allocation/free
+* [x] Implement F32 read/write helpers
+* [x] Add tensor transpose helper
 
 ## Expected Result
 
@@ -64,9 +64,9 @@ Provide baseline math operations.
 
 ## Tasks
 
-* [ ] MatMul
-* [ ] Vector-dot helpers
-* [ ] Softmax support helpers
+* [x] MatMul
+* [x] Vector-dot helpers
+* [x] Softmax support helpers
 
 ## Expected Result
 
@@ -82,10 +82,10 @@ Implement independent Transformer building blocks.
 
 ## Tasks
 
-* [ ] RMSNorm
-* [ ] RoPE
-* [ ] Attention
-* [ ] FeedForward
+* [x] RMSNorm
+* [x] RoPE
+* [x] Attention
+* [x] FeedForward
 
 ## Expected Result
 
@@ -101,9 +101,9 @@ Execute decoder stack end-to-end for logits.
 
 ## Tasks
 
-* [ ] Multi-layer forward path
-* [ ] Embedding + final norm + output projection
-* [ ] Layer buffer reuse strategy
+* [x] Multi-layer forward path
+* [x] Embedding + final norm + output projection
+* [x] Layer buffer reuse strategy
 
 ## Expected Result
 
@@ -119,10 +119,10 @@ Convert UTF-8 text to token IDs and back.
 
 ## Tasks
 
-* [ ] Vocabulary loading
-* [ ] Encode
-* [ ] Decode
-* [ ] Special token handling
+* [x] Vocabulary loading
+* [x] Encode
+* [x] Decode
+* [x] Special token handling
 
 ## Expected Result
 
@@ -138,10 +138,10 @@ Load metadata, tensors, and tokenizer assets from GGUF.
 
 ## Tasks
 
-* [ ] Read model config metadata
-* [ ] Locate/load per-layer tensors
-* [ ] Load token embedding/lm_head/final norm
-* [ ] Load chat template/special tokens when available
+* [x] Read model config metadata
+* [x] Locate/load per-layer tensors
+* [x] Load token embedding/lm_head/final norm
+* [x] Load chat template/special tokens when available
 
 ## Expected Result
 
@@ -157,10 +157,10 @@ Connect loader outputs with runtime execution context.
 
 ## Tasks
 
-* [ ] Build `minxfmr_context`
-* [ ] Create KV cache
-* [ ] Normalize weight orientations at load
-* [ ] Preload weights for backend when enabled
+* [x] Build `minxfmr_context`
+* [x] Create KV cache
+* [x] Normalize weight orientations at load
+* [x] Preload weights for backend when enabled
 
 ## Expected Result
 
@@ -176,10 +176,10 @@ Generate tokens autoregressively with callback streaming.
 
 ## Tasks
 
-* [ ] Prompt prefill
-* [ ] Token-by-token generation loop
-* [ ] EOS/limit/repetition guards
-* [ ] Stream callback outputs
+* [x] Prompt prefill
+* [x] Token-by-token generation loop
+* [x] EOS/limit/repetition guards
+* [x] Stream callback outputs
 
 ## Expected Result
 
@@ -195,10 +195,10 @@ Stabilize lifecycle APIs.
 
 ## Tasks
 
-* [ ] `minxfmr_open`
-* [ ] `minxfmr_generate`
-* [ ] `minxfmr_reset`
-* [ ] `minxfmr_close`
+* [x] `minxfmr_open`
+* [x] `minxfmr_generate`
+* [x] `minxfmr_reset`
+* [x] `minxfmr_close`
 
 ## Expected Result
 
@@ -214,9 +214,9 @@ Support Q4_K model paths with minimal complexity.
 
 ## Tasks
 
-* [ ] Keep Q4_K tensors packed in memory
-* [ ] Dequantize on-the-fly in backend matmul
-* [ ] Support Q4_K output head path
+* [x] Keep Q4_K tensors packed in memory
+* [x] Dequantize on-the-fly in backend matmul
+* [x] Support Q4_K output head path
 
 ## Expected Result
 
@@ -232,9 +232,9 @@ Improve performance after correctness is stable.
 
 ## Tasks
 
-* [ ] OpenMP/SIMD-friendly loops
-* [ ] Workspace/tensor reuse
-* [ ] Cache-friendly data access
+* [x] OpenMP/SIMD-friendly loops
+* [x] Workspace/tensor reuse
+* [x] Cache-friendly data access
 
 ## Expected Result
 
@@ -286,7 +286,7 @@ Prepare a usable and maintainable release.
 
 ## Tasks
 
-* [ ] Documentation consistency
+* [x] Documentation consistency
 * [ ] Remove noisy debug defaults
 * [ ] Build profile verification
 * [ ] Example command validation
@@ -301,11 +301,11 @@ Release artifacts and docs are aligned and reproducible.
 
 MVP is complete when:
 
-* [ ] GGUF model loads
-* [ ] Transformer forward works
-* [ ] Text generation streams via callback
-* [ ] Runtime lifecycle APIs are stable
-* [ ] F32/Q4_K paths are validated
-* [ ] CPU and optional CUDA selection are functional
+* [x] GGUF model loads
+* [x] Transformer forward works
+* [x] Text generation streams via callback
+* [x] Runtime lifecycle APIs are stable
+* [x] F32/Q4_K paths are validated
+* [x] CPU and optional CUDA selection are functional
 
 Android integration is the next milestone after MVP core completion.
