@@ -564,88 +564,24 @@ bool gguf_read_f32_tensor(const GGUF_File& f, const GGUF_TensorInfo& info, Tenso
 bool gguf_dequant_q4_k_m(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out) {
     out = nullptr;
 
-    // Q4_K_M tensors are encoded as GGML_TYPE_Q4_K blocks.
+    // Keep Q4_K tensors packed in memory. Dequant is handled in matmul kernels.
     if (info.ggml_type != 12) return false;
 
     const uint32_t rows = info.rows;
     const uint32_t cols = info.cols;
 
-    // q4_k block operates on 256 values.
-    static const uint32_t QK_K = 256;
-    static const size_t BLOCK_SIZE = 2 + 2 + 12 + (QK_K / 2); // fp16 d, fp16 dmin, scales[12], qs[128]
-
-    if (rows == 0 || cols == 0 || (cols % QK_K) != 0) {
+    const size_t row_bytes = tensor_q4_k_row_bytes(cols);
+    if (rows == 0 || cols == 0 || row_bytes == 0) {
         return false;
     }
 
-    const size_t blocks_per_row = cols / QK_K;
-    const size_t total_blocks = (size_t)rows * blocks_per_row;
-    const size_t need = total_blocks * BLOCK_SIZE;
+    const size_t need = (size_t)rows * row_bytes;
     if (info.offset + need > f.data.size()) {
         return false;
     }
 
-    out = tensor_create_f32(rows, cols);
-    if (!out) return false;
-
-    auto rd_f16_at = [&](const uint8_t* p) -> float {
-        uint16_t h;
-        memcpy(&h, p, sizeof(h));
-        return fp16_to_fp32(h);
-    };
-
-    auto get_scale_min_k4 = [](int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
-        if (j < 4) {
-            d = q[j] & 63;
-            m = q[j + 4] & 63;
-        } else {
-            d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-            m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
-        }
-    };
-
-    const uint8_t* src = f.data.data() + info.offset;
-    float* dst = (float*)out->data;
-
-    for (uint32_t r = 0; r < rows; ++r) {
-        float* row_dst = dst + (size_t)r * cols;
-        const uint8_t* row_src = src + (size_t)r * blocks_per_row * BLOCK_SIZE;
-
-        for (size_t b = 0; b < blocks_per_row; ++b) {
-            const uint8_t* blk = row_src + b * BLOCK_SIZE;
-
-            const float d = rd_f16_at(blk + 0);
-            const float dmin = rd_f16_at(blk + 2);
-            const uint8_t* scales = blk + 4;
-            const uint8_t* q = blk + 16;
-
-            float* block_dst = row_dst + b * QK_K;
-
-            int is = 0;
-            for (int j = 0; j < (int)QK_K; j += 64) {
-                uint8_t sc, m;
-                get_scale_min_k4(is + 0, scales, sc, m);
-                const float d1 = d * sc;
-                const float m1 = dmin * m;
-
-                get_scale_min_k4(is + 1, scales, sc, m);
-                const float d2 = d * sc;
-                const float m2 = dmin * m;
-
-                for (int l = 0; l < 32; ++l) {
-                    block_dst[j + l] = d1 * (q[l] & 0xF) - m1;
-                }
-                for (int l = 0; l < 32; ++l) {
-                    block_dst[j + 32 + l] = d2 * (q[l] >> 4) - m2;
-                }
-
-                q += 32;
-                is += 2;
-            }
-        }
-    }
-
-    return true;
+    out = tensor_create_q4_k_from_bytes(rows, cols, f.data.data() + info.offset, need);
+    return out != nullptr;
 }
 
 bool gguf_dequant_q6_k(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out) {
@@ -741,6 +677,12 @@ bool gguf_read_tensor(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& 
 }
 
 void gguf_tensor_stats(const Tensor* t, float& minv, float& maxv, double& mean) {
+    if (!t || t->type != DataType::F32) {
+        minv = 0.0f;
+        maxv = 0.0f;
+        mean = 0.0;
+        return;
+    }
     minv = 1e30f; maxv = -1e30f; mean = 0.0;
     size_t n = t->rows * t->cols;
     const float* d = (const float*)t->data;

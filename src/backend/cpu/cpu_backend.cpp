@@ -5,11 +5,78 @@
 #include <vector>
 #include <cstdlib>
 
+static float fp16_to_fp32_local(uint16_t h) {
+    uint32_t s = (h >> 15) & 1;
+    uint32_t e = (h >> 10) & 0x1f;
+    uint32_t f = h & 0x3ff;
+    uint32_t out;
+    if (e == 0) {
+        if (f == 0) {
+            out = s << 31;
+        } else {
+            e = 1;
+            while ((f & 0x400) == 0) { f <<= 1; --e; }
+            f &= 0x3ff;
+            out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+        }
+    } else if (e == 31) {
+        out = (s << 31) | 0x7f800000 | (f << 13);
+    } else {
+        out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+    }
+    float v;
+    std::memcpy(&v, &out, sizeof(v));
+    return v;
+}
+
+static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static void dequant_q4_k_block(const uint8_t* blk, float* dst256) {
+    uint16_t hd = 0;
+    uint16_t hm = 0;
+    std::memcpy(&hd, blk + 0, sizeof(hd));
+    std::memcpy(&hm, blk + 2, sizeof(hm));
+    const float d = fp16_to_fp32_local(hd);
+    const float dmin = fp16_to_fp32_local(hm);
+
+    const uint8_t* scales = blk + 4;
+    const uint8_t* q = blk + 16;
+
+    int is = 0;
+    for (int j = 0; j < (int)TENSOR_Q4_K_QK_K; j += 64) {
+        uint8_t sc = 0;
+        uint8_t m = 0;
+
+        get_scale_min_k4(is + 0, scales, sc, m);
+        const float d1 = d * sc;
+        const float m1 = dmin * m;
+
+        get_scale_min_k4(is + 1, scales, sc, m);
+        const float d2 = d * sc;
+        const float m2 = dmin * m;
+
+        for (int l = 0; l < 32; ++l) dst256[j + l] = d1 * (q[l] & 0xF) - m1;
+        for (int l = 0; l < 32; ++l) dst256[j + 32 + l] = d2 * (q[l] >> 4) - m2;
+
+        q += 32;
+        is += 2;
+    }
+}
+
 // Simple, safe threaded matmul. Controlled by env MINXFMR_CPU_THREADS (if set),
 // otherwise uses hardware_concurrency(). Splits work by output rows.
 bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
     if (!A || !B || !out) return false;
-    if (A->type != DataType::F32 || B->type != DataType::F32 || out->type != DataType::F32) return false;
+    if (A->type != DataType::F32 || out->type != DataType::F32) return false;
+    if (B->type != DataType::F32 && B->type != DataType::Q4_K) return false;
     size_t m = A->rows;
     size_t k = A->cols;
     size_t kb = B->rows;
@@ -18,8 +85,38 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
     if (out->rows != m || out->cols != n) return false;
 
     const float* a = (const float*)A->data;
-    const float* b = (const float*)B->data;
     float* o = (float*)out->data;
+
+    if (B->type == DataType::Q4_K) {
+        const size_t row_bytes = tensor_q4_k_row_bytes(n);
+        if (row_bytes == 0) return false;
+        if (B->bytes < B->rows * row_bytes) return false;
+
+        const uint8_t* bq = (const uint8_t*)B->data;
+        const size_t blocks_per_row = n / TENSOR_Q4_K_QK_K;
+
+        std::memset(o, 0, sizeof(float) * m * n);
+        float tmp[TENSOR_Q4_K_QK_K];
+
+        for (size_t i = 0; i < m; ++i) {
+            float* orow = o + i * n;
+            const float* arow = a + i * k;
+
+            for (size_t kk = 0; kk < k; ++kk) {
+                const float av = arow[kk];
+                const uint8_t* brow = bq + kk * row_bytes;
+
+                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+                    dequant_q4_k_block(brow + blk * TENSOR_Q4_K_BLOCK_SIZE, tmp);
+                    float* out_blk = orow + blk * TENSOR_Q4_K_QK_K;
+                    for (size_t t = 0; t < TENSOR_Q4_K_QK_K; ++t) out_blk[t] += av * tmp[t];
+                }
+            }
+        }
+        return true;
+    }
+
+    const float* b = (const float*)B->data;
 
     // zero out output
     std::memset(o, 0, sizeof(float) * m * n);

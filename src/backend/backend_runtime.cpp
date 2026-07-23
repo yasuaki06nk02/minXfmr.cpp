@@ -24,6 +24,74 @@ static bool ieq(const char* a, const char* b) {
     return *a == '\0' && *b == '\0';
 }
 
+static float fp16_to_fp32_local(uint16_t h) {
+    uint32_t s = (h >> 15) & 1;
+    uint32_t e = (h >> 10) & 0x1f;
+    uint32_t f = h & 0x3ff;
+    uint32_t out;
+    if (e == 0) {
+        if (f == 0) {
+            out = s << 31;
+        } else {
+            e = 1;
+            while ((f & 0x400) == 0) { f <<= 1; --e; }
+            f &= 0x3ff;
+            out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+        }
+    } else if (e == 31) {
+        out = (s << 31) | 0x7f800000 | (f << 13);
+    } else {
+        out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+    }
+    float v;
+    std::memcpy(&v, &out, sizeof(v));
+    return v;
+}
+
+static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static float dot_q4_k_block(const uint8_t* blk, const float* x256) {
+    uint16_t hd = 0;
+    uint16_t hm = 0;
+    std::memcpy(&hd, blk + 0, sizeof(hd));
+    std::memcpy(&hm, blk + 2, sizeof(hm));
+    const float d = fp16_to_fp32_local(hd);
+    const float dmin = fp16_to_fp32_local(hm);
+
+    const uint8_t* scales = blk + 4;
+    const uint8_t* q = blk + 16;
+
+    float acc = 0.0f;
+    int is = 0;
+    for (int j = 0; j < (int)TENSOR_Q4_K_QK_K; j += 64) {
+        uint8_t sc = 0;
+        uint8_t m = 0;
+
+        get_scale_min_k4(is + 0, scales, sc, m);
+        const float d1 = d * sc;
+        const float m1 = dmin * m;
+
+        get_scale_min_k4(is + 1, scales, sc, m);
+        const float d2 = d * sc;
+        const float m2 = dmin * m;
+
+        for (int l = 0; l < 32; ++l) acc += x256[j + l] * (d1 * (q[l] & 0xF) - m1);
+        for (int l = 0; l < 32; ++l) acc += x256[j + 32 + l] * (d2 * (q[l] >> 4) - m2);
+
+        q += 32;
+        is += 2;
+    }
+    return acc;
+}
+
 static bool try_enable_cuda() {
 #if defined(MINXFMR_ENABLE_CUDA)
     if (!cuda_backend_is_available()) return false;
@@ -108,7 +176,8 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
 #endif
 
     if (!A || !B || !out) return false;
-    if (A->type != DataType::F32 || B->type != DataType::F32 || out->type != DataType::F32) return false;
+    if (A->type != DataType::F32 || out->type != DataType::F32) return false;
+    if (B->type != DataType::F32 && B->type != DataType::Q4_K) return false;
     if (A->cols != B->cols) return false;
     if (out->rows != A->rows || out->cols != B->rows) return false;
 
@@ -116,8 +185,33 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
     const size_t k = A->cols;
     const size_t n = B->rows;
     const float* ad = (const float*)A->data;
-    const float* bd = (const float*)B->data;
     float* od = (float*)out->data;
+
+    if (B->type == DataType::Q4_K) {
+        const size_t row_bytes = tensor_q4_k_row_bytes(k);
+        if (row_bytes == 0) return false;
+        if (B->bytes < B->rows * row_bytes) return false;
+
+        const uint8_t* bdq = (const uint8_t*)B->data;
+        const size_t blocks_per_row = k / TENSOR_Q4_K_QK_K;
+
+        for (size_t i = 0; i < m; ++i) {
+            const float* arow = ad + i * k;
+            for (size_t j = 0; j < n; ++j) {
+                const uint8_t* brow = bdq + j * row_bytes;
+                float s = 0.0f;
+                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+                    s += dot_q4_k_block(
+                        brow + blk * TENSOR_Q4_K_BLOCK_SIZE,
+                        arow + blk * TENSOR_Q4_K_QK_K);
+                }
+                od[i * n + j] = s;
+            }
+        }
+        return true;
+    }
+
+    const float* bd = (const float*)B->data;
 
 #if defined(_OPENMP)
     #pragma omp parallel for collapse(2)

@@ -85,6 +85,7 @@ bool gguf_try_load_projections_for_layer(const char* path, int layer, Tensor*& o
     // transpose them so they become k_rows x d for downstream code.
     auto normalize_kv = [&](Tensor*& T, const char* tag) {
         if (!T) return;
+        if (T->type != DataType::F32) return;
         // heuristics: if rows > cols treat as transposed source (d x k_rows) and transpose to k_rows x d
         if (T->rows > T->cols) {
             Tensor* t2 = tensor_transpose_f32(T);

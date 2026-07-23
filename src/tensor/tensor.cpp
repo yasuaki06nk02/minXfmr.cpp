@@ -8,8 +8,13 @@
 
 struct TensorImpl {
     Tensor t;
-    float* storage;
+    void* storage;
 };
+
+size_t tensor_q4_k_row_bytes(size_t cols) {
+    if (cols == 0 || (cols % TENSOR_Q4_K_QK_K) != 0) return 0;
+    return (cols / TENSOR_Q4_K_QK_K) * TENSOR_Q4_K_BLOCK_SIZE;
+}
 
 Tensor* tensor_create_f32(size_t rows, size_t cols) {
     if (rows == 0 || cols == 0) return nullptr;
@@ -17,13 +22,13 @@ Tensor* tensor_create_f32(size_t rows, size_t cols) {
     if (!impl) return nullptr;
     size_t bytes = rows * cols * sizeof(float);
 #ifdef _WIN32
-    impl->storage = (float*)_aligned_malloc(bytes, 64);
+    impl->storage = _aligned_malloc(bytes, 64);
     if (!impl->storage) { delete impl; return nullptr; }
     std::memset(impl->storage, 0, bytes);
 #else
     void* p = nullptr;
     if (posix_memalign(&p, 64, bytes) != 0) { delete impl; return nullptr; }
-    impl->storage = (float*)p;
+    impl->storage = p;
     std::memset(impl->storage, 0, bytes);
 #endif
     impl->t.data = impl->storage;
@@ -44,6 +49,37 @@ Tensor* tensor_create_f32_view(size_t rows, size_t cols, float* buffer) {
     impl->t.rows = rows;
     impl->t.cols = cols;
     impl->t.bytes = rows * cols * sizeof(float);
+    return &impl->t;
+}
+
+Tensor* tensor_create_q4_k_from_bytes(size_t rows, size_t cols, const uint8_t* packed, size_t packed_bytes) {
+    if (rows == 0 || cols == 0 || packed == nullptr) return nullptr;
+
+    const size_t row_bytes = tensor_q4_k_row_bytes(cols);
+    if (row_bytes == 0) return nullptr;
+
+    const size_t need = rows * row_bytes;
+    if (packed_bytes < need) return nullptr;
+
+    TensorImpl* impl = new (std::nothrow) TensorImpl();
+    if (!impl) return nullptr;
+
+#ifdef _WIN32
+    impl->storage = _aligned_malloc(need, 64);
+    if (!impl->storage) { delete impl; return nullptr; }
+#else
+    void* p = nullptr;
+    if (posix_memalign(&p, 64, need) != 0) { delete impl; return nullptr; }
+    impl->storage = p;
+#endif
+
+    std::memcpy(impl->storage, packed, need);
+
+    impl->t.data = impl->storage;
+    impl->t.type = DataType::Q4_K;
+    impl->t.rows = rows;
+    impl->t.cols = cols;
+    impl->t.bytes = need;
     return &impl->t;
 }
 

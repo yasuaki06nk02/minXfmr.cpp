@@ -120,8 +120,13 @@ static bool transpose_square_inplace(Tensor*& t) {
 
 static bool normalize_linear_inplace(Tensor*& t, size_t in_dim, bool transpose_square, bool& transposed) {
     transposed = false;
-    if (!t || t->type != DataType::F32) return false;
+    if (!t) return false;
     if (in_dim == 0) return false;
+
+    if (t->type != DataType::F32) {
+        // Quantized weights are kept packed; only validate compatibility.
+        return (t->rows == in_dim || t->cols == in_dim);
+    }
 
     if (t->rows == in_dim && t->cols == in_dim) {
         if (!transpose_square) return true;
@@ -864,7 +869,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     // from cpu_workspace because run_stack_forward may grow/reset that workspace.
     const size_t OUT_CHUNK = 4096;
     size_t global_out_vocab = 0;
-    if (ctx->Wout && ctx->Wout->type == DataType::F32) {
+    if (ctx->Wout && (ctx->Wout->type == DataType::F32 || ctx->Wout->type == DataType::Q4_K)) {
         if (ctx->Wout->rows == dim) global_out_vocab = ctx->Wout->cols;
         else if (ctx->Wout->cols == dim) global_out_vocab = ctx->Wout->rows;
     }
@@ -900,7 +905,41 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         std::vector<double> logits(vocab_size, 0.0);
         const float* od = (const float*)out->data;
 
-        if (ctx->Wout && ctx->Wout->type == DataType::F32) {
+        if (ctx->Wout && (ctx->Wout->type == DataType::F32 || ctx->Wout->type == DataType::Q4_K)) {
+            if (ctx->Wout->type == DataType::Q4_K) {
+                size_t out_vocab = 0;
+                bool rhs_transposed = false;
+                if (ctx->Wout->rows == dim) {
+                    out_vocab = ctx->Wout->cols;
+                } else if (ctx->Wout->cols == dim) {
+                    out_vocab = ctx->Wout->rows;
+                    rhs_transposed = true;
+                }
+
+                size_t use_vocab = std::min(vocab_size, out_vocab);
+                bool ok = false;
+                if (out_vocab > 0) {
+                    Tensor* logits_t = tensor_create_f32(1, out_vocab);
+                    if (logits_t) {
+                        ok = rhs_transposed ?
+                            backend_matmul_rhs_transposed(out, ctx->Wout, logits_t) :
+                            backend_matmul(out, ctx->Wout, logits_t);
+                        if (ok) {
+                            const float* ldata = (const float*)logits_t->data;
+                            for (size_t j = 0; j < use_vocab; ++j) logits[j] = (double)ldata[j];
+                            vocab_size = use_vocab;
+                        }
+                        tensor_free(logits_t);
+                    }
+                }
+
+                if (!ok) {
+                    for (size_t i = 0; i < vocab_size; ++i) {
+                        size_t idx = (dim == 0) ? 0 : (i % dim);
+                        logits[i] = (double)od[idx];
+                    }
+                }
+            } else {
             const float* wd = (const float*)ctx->Wout->data;
             // Case A: Wout is [dim x vocab] (rows == dim)
             if (ctx->Wout->rows == dim) {
@@ -954,6 +993,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                     size_t idx = (dim == 0) ? 0 : (i % dim);
                     logits[i] = (double)od[idx];
                 }
+            }
             }
         } else {
             for (size_t i = 0; i < vocab_size; ++i) {

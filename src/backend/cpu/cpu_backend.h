@@ -1,7 +1,8 @@
 #pragma once
 #include "../..//tensor/tensor.h"
 
-// Multiply A (m x k) by B (k x n) into out (m x n). All tensors must be F32.
+// Multiply A (m x k) by B (k x n) into out (m x n).
+// A/out are F32. B can be F32 or Q4_K (dequantized on the fly).
 bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out);
 
 // Element-wise add: out = a + b

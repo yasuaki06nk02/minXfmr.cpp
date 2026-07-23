@@ -52,7 +52,8 @@ static bool cache_append_log_enabled() {
 // [d_in x d_out] or [d_out x d_in].
 static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out, bool transpose_square) {
     out = nullptr;
-    if (!in || !W || in->type != DataType::F32 || W->type != DataType::F32) return false;
+    if (!in || !W || in->type != DataType::F32) return false;
+    if (W->type != DataType::F32 && W->type != DataType::Q4_K) return false;
     const size_t d_in = in->cols;
 
     if (transpose_square && W->rows == d_in && W->cols == d_in) {
