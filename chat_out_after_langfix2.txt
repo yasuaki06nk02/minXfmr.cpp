@@ -1,4 +1,0 @@
-Entering chat mode. Type 'reset' to clear history, 'exit' to quit.
-you> assistant> Hello! How can I assist you?
-you> assistant> I'm sorry, but i don't have any specific information or request.
-you> 

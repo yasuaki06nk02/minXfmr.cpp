@@ -1,9 +1,0 @@
-Entering chat mode. Type 'reset' to clear history, 'exit' to quit.
-you> assistant> Hello! How are you today?
-you> assistant> こんにちは, Alibaba. あなたは、私の優々! 今日、私の名前のアラブリッチングです。
-you> assistant> Hello, Alibaba. こんにちは
-
-you> assistant> Hello, Alibaba. I apologize
-you> assistant> Hello, お|i|a
-Q
-you> 

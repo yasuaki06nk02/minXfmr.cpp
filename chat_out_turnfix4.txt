@@ -1,8 +1,0 @@
-Entering chat mode. Type 'reset' to clear history, 'exit' to quit.
-you> assistant> Hello there! How can I assist you today?
-you> assistant> こんにちは
-こんにちは！何を学びー
-you> assistant> こんにちは！ こんにちは！私の名は、私は日本語を学んで
-you> assistant> |i|<|
-you> assistant> |i| こんにちは
-you> 
