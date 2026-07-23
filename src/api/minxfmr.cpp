@@ -980,12 +980,33 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             return false;
         };
 
-        if (gen_tokens_emitted == 0 && (!is_visible_piece(preview) || is_eos_token(raw_tok) || is_role_token(raw_tok))) {
+        auto is_bad_leading_piece = [](const std::string& s) {
+            if (s.empty()) return true;
+            size_t i = 0;
+            while (i < s.size()) {
+                unsigned char c = (unsigned char)s[i];
+                if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f') {
+                    ++i;
+                    continue;
+                }
+                if (c == '|' || c == '<' || c == '>' || c == '[' || c == ']' || c == '{' || c == '}') return true;
+                if (c == '.' || c == ',' || c == ';' || c == ':' || c == '!' || c == '?' || c == '\'' || c == '"') return true;
+                if (c == ':' && i + 1 < s.size()) {
+                    unsigned char n = (unsigned char)s[i + 1];
+                    if ((n >= 'A' && n <= 'Z') || (n >= 'a' && n <= 'z')) return true;
+                }
+                if (c == 'Q' && i + 1 < s.size() && s[i + 1] == ':') return true;
+                return false;
+            }
+            return true;
+        };
+
+        if (gen_tokens_emitted == 0 && (!is_visible_piece(preview) || is_bad_leading_piece(preview) || is_eos_token(raw_tok) || is_role_token(raw_tok))) {
             for (int i = 1; i < k_use; ++i) {
                 int alt = order[(size_t)i];
                 std::string alt_raw = tokenizer_id_to_token(alt);
                 std::string alt_preview = render_token_piece(alt_raw);
-                if (is_visible_piece(alt_preview) && !is_eos_token(alt_raw) && !is_role_token(alt_raw)) {
+                if (is_visible_piece(alt_preview) && !is_bad_leading_piece(alt_preview) && !is_eos_token(alt_raw) && !is_role_token(alt_raw)) {
                     next = alt;
                     raw_tok = alt_raw;
                     if (next >= 0 && (size_t)next < logits.size()) chosen_logit = logits[(size_t)next];

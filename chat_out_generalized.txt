@@ -1,0 +1,6 @@
+Entering chat mode. Type 'reset' to clear history, 'exit' to quit.
+you> assistant> Hello! How can I assist?
+you> assistant> Hello there! How can I assist with anything today?
+you> assistant> I am not sure of the user is asking about a specific questions or concerns de la programmation.
+you> assistant> I'm sorry; I'm a chatbot. How can i assist you today?
+you> 

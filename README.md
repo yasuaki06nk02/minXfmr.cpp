@@ -1,12 +1,14 @@
 # minXfmr.cpp
 
- A Minimal Transformer Runtime for Android
+**SQLite for local LLM inference**
+
+A Minimal Transformer Runtime
 
 minXfmr.cpp is an open-source Transformer inference runtime designed with one primary goal
 
- Keep it minimal.
+Keep it minimal.
 
-The project focuses on building a small, readable, and maintainable runtime for local Transformer models on Android.
+The project focuses on building a small, readable, and maintainable runtime for local Transformer models across multiple platforms, including Linux, Windows, Android, Raspberry Pi, and Jetson devices.
 
 Unlike feature-rich inference frameworks, minXfmr.cpp intentionally limits its scope to provide a clean architecture that is easy to understand, maintain, and extend.
 
@@ -16,24 +18,26 @@ Unlike feature-rich inference frameworks, minXfmr.cpp intentionally limits its s
 
 The long-term vision of minXfmr.cpp is
 
- SQLite for Local Transformer Runtime
+SQLite for Local Transformer Runtime
 
-Just as SQLite provides a small, stable, and dependable SQL engine, minXfmr.cpp aims to provide a compact and reliable Transformer runtime.
+Just as SQLite provides a small, stable, and dependable SQL engine, minXfmr.cpp aims to provide a compact and reliable Transformer runtime that can be embedded into applications and deployed on edge devices without requiring a large runtime environment.
 
 ---
 
 # Project Goals
 
- Android-first architecture
- Native C API
- C++17 implementation
- Minimal public API
- High readability
- High maintainability
- GGUF native support
- CPU inference
- Small binary size
- Minimal external dependencies
+* Portable architecture
+* Native C API
+* C++17 implementation
+* Minimal public API
+* High readability
+* High maintainability
+* GGUF native support
+* CPU inference
+* Small binary size
+* Minimal external dependencies
+
+The runtime follows a **CPU-first, minimal-dependency design** similar to SQLite: small enough to understand, easy to embed into applications, and portable across different operating systems and hardware platforms.
 
 ---
 
@@ -41,21 +45,21 @@ Just as SQLite provides a small, stable, and dependable SQL engine, minXfmr.cpp 
 
 The following features are intentionally excluded from the first release
 
- GPU acceleration
- CUDA
- Metal
- Vulkan
- OpenCL
- LoRA
- Vision models
- Audio models
- Embedding API
- HTTP server
- RPC
- Multi-GPU
- Distributed inference
- Function Calling
- Agent framework
+* GPU acceleration
+* CUDA
+* Metal
+* Vulkan
+* OpenCL
+* LoRA
+* Vision models
+* Audio models
+* Embedding API
+* HTTP server
+* RPC
+* Multi-GPU
+* Distributed inference
+* Function Calling
+* Agent framework
 
 These features may be considered in the future, but simplicity always takes priority.
 
@@ -66,11 +70,11 @@ These features may be considered in the future, but simplicity always takes prio
 The MVP exposes only four public functions.
 
 ```c
-TinyLLM minxfmr_open(const char model_path);
+TinyLLM minxfmr_open(const char* model_path);
 
-char minxfmr_generate(
+char* minxfmr_generate(
     TinyLLM runtime,
-    const char prompt);
+    const char* prompt);
 
 void minxfmr_reset(
     TinyLLM runtime);
@@ -86,20 +90,20 @@ Everything else is considered an implementation detail.
 # Example
 
 ```c
-TinyLLM ai = minxfmr_open(qwen3.gguf);
+TinyLLM ai = minxfmr_open("qwen3.gguf");
 
-char reply;
+char* reply;
 
-reply = minxfmr_generate(ai, Hello);
-printf(%sn, reply);
+reply = minxfmr_generate(ai, "Hello");
+printf("%s\\n", reply);
 
-reply = minxfmr_generate(ai, Do you remember my name);
-printf(%sn, reply);
+reply = minxfmr_generate(ai, "Do you remember my name?");
+printf("%s\\n", reply);
 
 minxfmr_reset(ai);
 
-reply = minxfmr_generate(ai, Do you remember my name);
-printf(%sn, reply);
+reply = minxfmr_generate(ai, "Do you remember my name?");
+printf("%s\\n", reply);
 
 minxfmr_close(ai);
 ```
@@ -110,25 +114,28 @@ minxfmr_close(ai);
 
 Current development platform
 
- Ubuntu 22.04+
- C++17
- CMake
- GCC  Clang
+* Ubuntu 22.04+
+* C++17
+* CMake
+* GCC / Clang
 
-Verification platform
+Verification platforms
 
- Jetson Nano (CPU)
- Android ARM64
+* Windows x64
+* Linux x64
+* Apple Silicon
+* Jetson Nano (CPU)
+* Android ARM64
 
-The runtime core is developed on Linux first and then integrated into Android through JNI.
+The runtime core is developed on Linux first and then validated across the supported platforms. Platform-specific integrations such as Android (JNI) and future Apple Silicon backends are built on top of the shared core runtime.
 
 ---
 
 # Supported Model Format (MVP)
 
- GGUF
- Decoder-only Transformer models
- Q4_K_M quantization (initial target)
+* GGUF
+* Decoder-only Transformer models
+* Q4_K_M quantization (initial target)
 
 Additional quantization methods may be added while maintaining compatibility with GGUF.
 
@@ -154,12 +161,12 @@ This prints each fallback prompt as `assistant(template N)> ...` and logs the to
 
 Sample `--try-all-templates` log fragment (from `--log-file chat_debug_try_all_templates.log`):
 
-```
+```text
 [INFO] trying template 0 => "<s><|system|>You are a helpful assistant...</|system|><|user|>hello</|user|>"
 [DEBUG] tpl 0 token count=9 ids=[1,234,45,67,89, ...]
 [INFO] assistant(template 0)> I am a helpful assistant. How can I help you today?
 
-[INFO] trying template 1 => "<s>[INST] <<SYS>> You are a helpful assistant. <</SYS>>\n#B# hello [/INST]"
+[INFO] trying template 1 => "<s>[INST] <<SYS>> You are a helpful assistant. <</SYS>>\\n#B# hello [/INST]"
 [DEBUG] tpl 1 token count=11 ids=[1,230,90, ...]
 [INFO] assistant(template 1)> Hello! What would you like to talk about?
 
@@ -185,7 +192,7 @@ Recommended defaults: for GGUF models, transpose behavior is selected automatica
 
 Quick automated search
 
-There is a helper script at `scripts\find_best_transpose.py` that searches transpose combinations and writes logs to `scripts\transpose_search_logs`.
+There is a helper script at `scripts/find_best_transpose.py` that searches transpose combinations and writes logs to `scripts/transpose_search_logs`.
 
 Safety note (Windows)
 
@@ -194,20 +201,19 @@ Running all 16 combinations continuously can cause sustained high CPU load. The 
 Safer default usage (Python):
 
 ```powershell
-python .\scripts\find_best_transpose.py .\model.gguf .\build\src\Release\minxfmr_cli.exe "hello"
+python .\\scripts\\find_best_transpose.py .\\model.gguf .\\build\\src\\Release\\minxfmr_cli.exe "hello"
 ```
 
 Full search (explicit high-load opt-in):
 
 ```powershell
-python .\scripts\find_best_transpose.py .\model.gguf .\build\src\Release\minxfmr_cli.exe "hello" --max-masks 16 --allow-high-load --cooldown-sec 5 --priority idle
+python .\\scripts\\find_best_transpose.py .\\model.gguf .\\build\\src\\Release\\minxfmr_cli.exe "hello" --max-masks 16 --allow-high-load --cooldown-sec 5 --priority idle
 ```
 
 Legacy PowerShell helper (no safety guardrails):
 
 ```powershell
-.
-\scripts\find_best_transpose.ps1 -ModelPath .\model.gguf -CliPath .\build\src\Release\minxfmr_cli.exe -Prompt "hello"
+.\\scripts\\find_best_transpose.ps1 -ModelPath .\\model.gguf -CliPath .\\build\\src\\Release\\minxfmr_cli.exe -Prompt "hello"
 ```
 
 The script runs each combination, extracts assistant lines from the per-run log, scores them with a simple heuristic (ASCII letter count), and prints the best-scoring combination.
@@ -248,12 +254,12 @@ Each module should perform one task only.
 
 Examples include
 
- GGUF Reader
- Tokenizer
- Tensor
- Attention
- Sampler
- KV Cache
+* GGUF Reader
+* Tokenizer
+* Tensor
+* Attention
+* Sampler
+* KV Cache
 
 ---
 
@@ -263,10 +269,10 @@ The project intentionally avoids unnecessary complexity.
 
 Examples
 
- Deep inheritance
- Large class hierarchies
- Excessive design patterns
- Hidden control flow
+* Deep inheritance
+* Large class hierarchies
+* Excessive design patterns
+* Hidden control flow
 
 Simple code is preferred over clever code.
 
@@ -274,7 +280,7 @@ Simple code is preferred over clever code.
 
 # Repository Structure
 
-```
+```text
 minxfmr-cpp
 
 ├── docs
@@ -312,7 +318,7 @@ MVP development proceeds in the following order
 12. Sampler
 13. Text Generation
 14. C API
-15. Android Integration
+15. Platform Integrations
 
 Each step should produce a working build.
 
@@ -326,10 +332,11 @@ minXfmr.cpp explores a different direction.
 
 Instead of maximizing features, it maximizes
 
- Simplicity
- Clarity
- Maintainability
- Educational value
+* Simplicity
+* Clarity
+* Maintainability
+* Educational value
+* Embeddability
 
 The project is designed so that developers can understand the complete runtime architecture without reading hundreds of thousands of lines of code.
 
@@ -347,6 +354,6 @@ Contributions are welcome.
 
 Before adding a new feature, ask one question
 
- Does this make minXfmr.cpp simpler
+Does this make minXfmr.cpp simpler?
 
 If the answer is No, the design should be reconsidered.

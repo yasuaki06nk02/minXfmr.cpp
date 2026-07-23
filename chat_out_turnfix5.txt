@@ -1,0 +1,9 @@
+Entering chat mode. Type 'reset' to clear history, 'exit' to quit.
+you> assistant> Hello! How can I assist you?
+you> assistant> こんにちは
+今日はどんなお話し
+:i: 今日の予語にんわるな. あいは、うらんりゅーー
+| | |<|
+you> assistant> すみません。もう一度お願いします。
+you> assistant> すみません。もう一度お願いします。
+you> 

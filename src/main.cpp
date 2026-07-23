@@ -39,6 +39,11 @@ static void gen_collect_callback(const char* token) {
     write_stdout_bytes(token);
 }
 
+static void gen_collect_only_callback(const char* token) {
+    if (!token) return;
+    gen_outbuf_global.append(token);
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
@@ -51,7 +56,7 @@ int main(int argc, char** argv) {
     int projection_layer = 0;
     bool chat_mode = false;
     const char* system_prompt = nullptr;
-    int max_history = 6;
+    int max_history = 12;
     float temperature = 1.0f;
     float top_p = 1.0f;
     int top_k = 8;
@@ -384,58 +389,7 @@ int main(int argc, char** argv) {
         return false;
     };
 
-    auto has_non_ascii = [](const std::string& s) {
-        for (unsigned char c : s) {
-            if (c & 0x80) return true;
-        }
-        return false;
-    };
-
-    auto contains_japanese = [](const std::string& s) {
-        size_t i = 0;
-        while (i < s.size()) {
-            unsigned char c0 = (unsigned char)s[i];
-            uint32_t cp = 0;
-            size_t adv = 1;
-            if (c0 < 0x80) {
-                cp = c0;
-            } else if ((c0 & 0xE0) == 0xC0 && i + 1 < s.size()) {
-                unsigned char c1 = (unsigned char)s[i + 1];
-                if ((c1 & 0xC0) == 0x80) {
-                    cp = ((uint32_t)(c0 & 0x1F) << 6) | (uint32_t)(c1 & 0x3F);
-                    adv = 2;
-                }
-            } else if ((c0 & 0xF0) == 0xE0 && i + 2 < s.size()) {
-                unsigned char c1 = (unsigned char)s[i + 1];
-                unsigned char c2 = (unsigned char)s[i + 2];
-                if ((c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80) {
-                    cp = ((uint32_t)(c0 & 0x0F) << 12) |
-                         ((uint32_t)(c1 & 0x3F) << 6) |
-                         (uint32_t)(c2 & 0x3F);
-                    adv = 3;
-                }
-            } else if ((c0 & 0xF8) == 0xF0 && i + 3 < s.size()) {
-                unsigned char c1 = (unsigned char)s[i + 1];
-                unsigned char c2 = (unsigned char)s[i + 2];
-                unsigned char c3 = (unsigned char)s[i + 3];
-                if ((c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80 && (c3 & 0xC0) == 0x80) {
-                    cp = ((uint32_t)(c0 & 0x07) << 18) |
-                         ((uint32_t)(c1 & 0x3F) << 12) |
-                         ((uint32_t)(c2 & 0x3F) << 6) |
-                         (uint32_t)(c3 & 0x3F);
-                    adv = 4;
-                }
-            }
-
-            if ((cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x4E00 && cp <= 0x9FFF)) {
-                return true;
-            }
-            i += adv;
-        }
-        return false;
-    };
-
-    auto should_store_assistant_text = [&](const std::string& text) {
+    auto should_store_assistant_text = [](const std::string& text) {
         if (text.empty()) return false;
         if (text.find("```") != std::string::npos) return false;
         if (text.find("Explanation:") != std::string::npos) return false;
@@ -459,9 +413,31 @@ int main(int argc, char** argv) {
         while (i < text.size() && std::isspace((unsigned char)text[i])) ++i;
         if (i < text.size() && (text[i] == '|' || text[i] == '<')) return false;
         if (non_space <= 2) return false;
-        if (alpha_num == 0 && non_space > 8 && !has_non_ascii(text)) return false;
+        if (alpha_num == 0 && non_space > 8) return false;
         if (symbol_like * 2 >= non_space) return false;
         return true;
+    };
+
+    auto looks_corrupted_reply = [](const std::string& text) {
+        if (text.empty()) return true;
+        if (text.find("<|") != std::string::npos) return true;
+        if (text.find("|<") != std::string::npos) return true;
+        if (text.find(":i:") != std::string::npos) return true;
+        size_t pipe_count = 0;
+        for (unsigned char c : text) {
+            if (c == '|') ++pipe_count;
+        }
+        if (pipe_count >= 2) return true;
+        return false;
+    };
+
+    auto starts_with_bad_chat_char = [](const std::string& text) {
+        size_t i = 0;
+        while (i < text.size() && std::isspace((unsigned char)text[i])) ++i;
+        if (i >= text.size()) return true;
+        char c = text[i];
+        return c == '|' || c == '<' || c == '>' || c == '[' || c == ']' ||
+               c == ':' || c == ';' || c == ',' || c == '.' || c == '\'' || c == '"';
     };
 
     auto looks_like_qwen_jinja_template = [](const char* tpl) {
@@ -523,14 +499,8 @@ int main(int argc, char** argv) {
                     append_qwen_message(prompt_text, "user", history[i]);
                     append_qwen_message(prompt_text, "assistant", history[i + 1]);
                 }
-                std::string user_turn = user_text ? user_text : "";
-                if (contains_japanese(user_turn)) {
-                    user_turn += "\n\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x81\xA7\xE5\x9B\x9E\xE7\xAD\x94\xE3\x81\x97\xE3\x81\xA6\xE3\x81\x8F\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80\x82";
-                } else if (has_non_ascii(user_turn)) {
-                    user_turn += "\nAnswer in the same language as this user message.";
-                }
                 prompt_text += "<|im_start|>user\n";
-                prompt_text += user_turn;
+                prompt_text += (user_text ? user_text : "");
                 prompt_text += "<|im_end|>\n";
                 prompt_text += "<|im_start|>assistant\n";
                 return prompt_text;
@@ -553,13 +523,7 @@ int main(int argc, char** argv) {
             assembled += history[i + 1];
             assembled += " </s><s>[INST] ";
         }
-        std::string user_turn = user_text ? user_text : "";
-        if (contains_japanese(user_turn)) {
-            user_turn += "\n\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E\xE3\x81\xA7\xE5\x9B\x9E\xE7\xAD\x94\xE3\x81\x97\xE3\x81\xA6\xE3\x81\x8F\xE3\x81\xA0\xE3\x81\x95\xE3\x81\x84\xE3\x80\x82";
-        } else if (has_non_ascii(user_turn)) {
-            user_turn += "\nAnswer in the same language as this user message.";
-        }
-        assembled += user_turn;
+        assembled += (user_text ? user_text : "");
         assembled += " [/INST]";
         return assembled;
     };
@@ -636,7 +600,8 @@ int main(int argc, char** argv) {
                     }
                     // push only the raw line into history as before
                     std::string sanitized = sanitize_assistant_text(gen_outbuf_global);
-                    if (!sanitized.empty() && !is_suspicious_assistant_text(sanitized) && should_store_assistant_text(sanitized)) {
+                    bool allow_store = !sanitized.empty() && !is_suspicious_assistant_text(sanitized) && should_store_assistant_text(sanitized);
+                    if (allow_store) {
                         history.push_back(line);
                         history.push_back(sanitized);
                     } else {
@@ -648,10 +613,32 @@ int main(int argc, char** argv) {
                 printf("assistant> ");
                 if (debug_attn_once) attention_set_debug_once(true);
                 minxfmr_reset(ctx);
-                minxfmr_generate(ctx, assembled.c_str(), gen_collect_callback, temperature, top_k);
+                minxfmr_generate(ctx, assembled.c_str(), gen_collect_only_callback, temperature, top_k);
+                std::string first_try = sanitize_assistant_text(gen_outbuf_global);
+                bool retry_needed = first_try.empty() || starts_with_bad_chat_char(first_try) || !should_store_assistant_text(first_try) || looks_corrupted_reply(first_try) || is_suspicious_assistant_text(first_try);
+                if (retry_needed) {
+                    fprintf(stderr, "[main] retrying turn with greedy fallback due to low-quality sampled reply\n");
+                    gen_outbuf_global.clear();
+                    minxfmr_reset(ctx);
+                    minxfmr_generate(ctx, assembled.c_str(), gen_collect_only_callback, 0.0f, 1);
+                }
+
+                std::string printable = sanitize_assistant_text(gen_outbuf_global);
+                if (printable.empty()) printable = gen_outbuf_global;
+                if (printable.empty() || starts_with_bad_chat_char(printable) || looks_corrupted_reply(printable) || is_suspicious_assistant_text(printable)) {
+                    printable = "Sorry, I could not generate a clean response. Please try again.";
+                }
+                gen_outbuf_global = printable;
+                if (!gen_outbuf_global.empty()) write_stdout_bytes(gen_outbuf_global.c_str());
                 printf("\n");
+
                 std::string sanitized = sanitize_assistant_text(gen_outbuf_global);
-                if (!sanitized.empty() && !is_suspicious_assistant_text(sanitized) && should_store_assistant_text(sanitized)) {
+                bool allow_store = !sanitized.empty() && !is_suspicious_assistant_text(sanitized) && should_store_assistant_text(sanitized);
+                if (allow_store && looks_corrupted_reply(sanitized)) {
+                    allow_store = false;
+                    fprintf(stderr, "[main] skipping history store due to corrupted reply pattern\n");
+                }
+                if (allow_store) {
                     history.push_back(line);
                     history.push_back(sanitized);
                 } else {
