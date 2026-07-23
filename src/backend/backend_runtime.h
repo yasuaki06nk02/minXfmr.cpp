@@ -27,5 +27,12 @@ bool backend_vec_dot_rows(const float* vec, const float* mat_rows, float* out, s
 bool backend_vec_dot_rows_ring(const float* vec, const float* ring, size_t head, size_t seq_max, size_t len, size_t K, size_t row_stride, float* out);
 bool backend_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* out, size_t Nrows, size_t Ncols, size_t row_stride);
 
+// Preload immutable tensors (typically model weights) to backend-resident memory.
+// Returns false when tensor is invalid or backend cannot preload it.
+bool backend_preload_tensor(const Tensor* t);
+
+// Release backend-side persistent resources (e.g., CUDA weight cache).
+void backend_release_resources();
+
 float* backend_request_workspace(size_t n);
 void backend_workspace_reset(bool shrink = false);

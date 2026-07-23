@@ -4,12 +4,21 @@
 #include <cublas_v2.h>
 
 #include <cstdio>
+#include <mutex>
+#include <unordered_map>
 
 namespace {
+
+struct CachedDeviceBuffer {
+    float* ptr = nullptr;
+    size_t elems = 0;
+};
 
 struct CudaState {
     cublasHandle_t handle = nullptr;
     bool ready = false;
+    std::unordered_map<const float*, CachedDeviceBuffer> persistent;
+    std::mutex mu;
 };
 
 CudaState& state() {
@@ -27,6 +36,13 @@ bool ensure_ready() {
 
     s.ready = true;
     return true;
+}
+
+void clear_persistent_buffers_locked(CudaState& s) {
+    for (auto& kv : s.persistent) {
+        if (kv.second.ptr) cudaFree(kv.second.ptr);
+    }
+    s.persistent.clear();
 }
 
 __global__ void matmul_rhs_transposed_kernel(
@@ -127,6 +143,33 @@ bool alloc_copy_to_device(const float* src, size_t n, float** dst) {
     return true;
 }
 
+bool get_or_upload_persistent(const float* src, size_t n, float** dst) {
+    if (!src || !dst) return false;
+    CudaState& s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+
+    auto it = s.persistent.find(src);
+    if (it != s.persistent.end()) {
+        if (it->second.elems == n && it->second.ptr != nullptr) {
+            *dst = it->second.ptr;
+            return true;
+        }
+        if (it->second.ptr) cudaFree(it->second.ptr);
+        s.persistent.erase(it);
+    }
+
+    float* d = nullptr;
+    if (cudaMalloc((void**)&d, n * sizeof(float)) != cudaSuccess) return false;
+    if (cudaMemcpy(d, src, n * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(d);
+        return false;
+    }
+
+    s.persistent[src] = CachedDeviceBuffer{d, n};
+    *dst = d;
+    return true;
+}
+
 bool copy_to_host(float* dst, const float* src, size_t n) {
     return cudaMemcpy(dst, src, n * sizeof(float), cudaMemcpyDeviceToHost) == cudaSuccess;
 }
@@ -135,6 +178,26 @@ bool copy_to_host(float* dst, const float* src, size_t n) {
 
 bool cuda_backend_is_available() {
     return ensure_ready();
+}
+
+void cuda_backend_release_resources() {
+    CudaState& s = state();
+    {
+        std::lock_guard<std::mutex> lock(s.mu);
+        clear_persistent_buffers_locked(s);
+    }
+    if (s.handle) {
+        cublasDestroy(s.handle);
+        s.handle = nullptr;
+    }
+    s.ready = false;
+}
+
+bool cuda_backend_preload_tensor(const Tensor* t) {
+    if (!ensure_ready()) return false;
+    if (!t || t->type != DataType::F32 || !t->data) return false;
+    float* d = nullptr;
+    return get_or_upload_persistent((const float*)t->data, t->rows * t->cols, &d);
 }
 
 bool cuda_backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
@@ -153,7 +216,7 @@ bool cuda_backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
     float* dC = nullptr;
 
     if (!alloc_copy_to_device((const float*)A->data, m * k, &dA)) return false;
-    if (!alloc_copy_to_device((const float*)B->data, k * n, &dB)) {
+    if (!get_or_upload_persistent((const float*)B->data, k * n, &dB)) {
         cudaFree(dA);
         return false;
     }
@@ -186,7 +249,6 @@ bool cuda_backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
     bool ok = (st == CUBLAS_STATUS_SUCCESS) && copy_to_host((float*)out->data, dC, m * n);
 
     cudaFree(dA);
-    cudaFree(dB);
     cudaFree(dC);
 
     return ok;
@@ -208,7 +270,7 @@ bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor
     float* dC = nullptr;
 
     if (!alloc_copy_to_device((const float*)A->data, m * k, &dA)) return false;
-    if (!alloc_copy_to_device((const float*)B->data, n * k, &dB)) {
+    if (!get_or_upload_persistent((const float*)B->data, n * k, &dB)) {
         cudaFree(dA);
         return false;
     }
@@ -227,7 +289,6 @@ bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor
               copy_to_host((float*)out->data, dC, m * n);
 
     cudaFree(dA);
-    cudaFree(dB);
     cudaFree(dC);
 
     return ok;
@@ -242,7 +303,7 @@ bool cuda_backend_matvec_strided(const float* vec, const float* mat, float* out,
     float* dOut = nullptr;
 
     if (!alloc_copy_to_device(vec, K, &dVec)) return false;
-    if (!alloc_copy_to_device(mat, K * mat_row_stride, &dMat)) {
+    if (!get_or_upload_persistent(mat, K * mat_row_stride, &dMat)) {
         cudaFree(dVec);
         return false;
     }
@@ -261,7 +322,6 @@ bool cuda_backend_matvec_strided(const float* vec, const float* mat, float* out,
               copy_to_host(out, dOut, N);
 
     cudaFree(dVec);
-    cudaFree(dMat);
     cudaFree(dOut);
 
     return ok;
@@ -271,18 +331,27 @@ bool cuda_backend_vec_dot_rows(const float* vec, const float* mat_rows, float* o
     if (!ensure_ready()) return false;
     if (!vec || !mat_rows || !out || K == 0 || Nrows == 0) return false;
 
+    // For tiny workloads, CUDA launch/copy overhead dominates; let CPU fallback handle these.
+    if (K * Nrows < 16384) return false;
+
     float* dVec = nullptr;
     float* dMat = nullptr;
     float* dOut = nullptr;
+    bool mat_cached = false;
 
     if (!alloc_copy_to_device(vec, K, &dVec)) return false;
-    if (!alloc_copy_to_device(mat_rows, Nrows * row_stride, &dMat)) {
-        cudaFree(dVec);
-        return false;
+    if (Nrows >= 256) {
+        mat_cached = get_or_upload_persistent(mat_rows, Nrows * row_stride, &dMat);
+    }
+    if (!mat_cached) {
+        if (!alloc_copy_to_device(mat_rows, Nrows * row_stride, &dMat)) {
+            cudaFree(dVec);
+            return false;
+        }
     }
     if (cudaMalloc((void**)&dOut, Nrows * sizeof(float)) != cudaSuccess) {
         cudaFree(dVec);
-        cudaFree(dMat);
+        if (!mat_cached) cudaFree(dMat);
         return false;
     }
 
@@ -295,7 +364,7 @@ bool cuda_backend_vec_dot_rows(const float* vec, const float* mat_rows, float* o
               copy_to_host(out, dOut, Nrows);
 
     cudaFree(dVec);
-    cudaFree(dMat);
+    if (!mat_cached) cudaFree(dMat);
     cudaFree(dOut);
 
     return ok;
@@ -304,6 +373,9 @@ bool cuda_backend_vec_dot_rows(const float* vec, const float* mat_rows, float* o
 bool cuda_backend_vec_dot_rows_ring(const float* vec, const float* ring, size_t head, size_t seq_max, size_t len, size_t K, size_t row_stride, float* out) {
     if (!ensure_ready()) return false;
     if (!vec || !ring || !out || K == 0 || len == 0 || seq_max == 0) return false;
+
+    // Decode-time ring operations are often tiny; prefer CPU for this range.
+    if (K * len < 16384) return false;
 
     float* dVec = nullptr;
     float* dRing = nullptr;
@@ -338,6 +410,8 @@ bool cuda_backend_vec_dot_rows_ring(const float* vec, const float* ring, size_t 
 bool cuda_backend_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* out, size_t Nrows, size_t Ncols, size_t row_stride) {
     if (!ensure_ready()) return false;
     if (!vec || !mat_rows || !out || Nrows == 0 || Ncols == 0) return false;
+
+    if (Nrows * Ncols < 16384) return false;
 
     float* dVec = nullptr;
     float* dMat = nullptr;

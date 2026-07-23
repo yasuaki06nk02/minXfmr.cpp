@@ -119,16 +119,37 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
     const float* bd = (const float*)B->data;
     float* od = (float*)out->data;
 
+#if defined(_OPENMP)
+    #pragma omp parallel for collapse(2)
+#endif
     for (size_t i = 0; i < m; ++i) {
         for (size_t j = 0; j < n; ++j) {
             const float* arow = ad + i * k;
             const float* brow = bd + j * k;
             float s = 0.0f;
+#if defined(_OPENMP) && !defined(_MSC_VER)
+            #pragma omp simd reduction(+:s)
+#endif
             for (size_t kk = 0; kk < k; ++kk) s += arow[kk] * brow[kk];
             od[i * n + j] = s;
         }
     }
     return true;
+}
+
+bool backend_preload_tensor(const Tensor* t) {
+    backend_initialize_from_env();
+#if defined(MINXFMR_ENABLE_CUDA)
+    if (g_backend_kind == BackendKind::CUDA) return cuda_backend_preload_tensor(t);
+#endif
+    (void)t;
+    return false;
+}
+
+void backend_release_resources() {
+#if defined(MINXFMR_ENABLE_CUDA)
+    cuda_backend_release_resources();
+#endif
 }
 
 bool backend_matvec_strided(const float* vec, const float* mat, float* out, size_t K, size_t N, size_t mat_row_stride) {

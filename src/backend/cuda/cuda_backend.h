@@ -3,6 +3,8 @@
 #include "../../tensor/tensor.h"
 
 bool cuda_backend_is_available();
+void cuda_backend_release_resources();
+bool cuda_backend_preload_tensor(const Tensor* t);
 
 bool cuda_backend_matmul(const Tensor* A, const Tensor* B, Tensor* out);
 bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out);

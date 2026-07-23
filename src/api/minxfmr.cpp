@@ -292,6 +292,34 @@ static void free_layer_weights(std::vector<Tensor*>& vec) {
     vec.clear();
 }
 
+static void preload_context_weights_to_backend(const minxfmr_context* ctx) {
+    if (!ctx || !backend_using_cuda()) return;
+
+    auto preload = [](const Tensor* t) {
+        if (t) (void)backend_preload_tensor(t);
+    };
+
+    preload(ctx->Wemb);
+    preload(ctx->Wq);
+    preload(ctx->Wk);
+    preload(ctx->Wv);
+    preload(ctx->Wout);
+    preload(ctx->Wnorm);
+
+    for (const Tensor* t : ctx->Wq_layers) preload(t);
+    for (const Tensor* t : ctx->Wk_layers) preload(t);
+    for (const Tensor* t : ctx->Wv_layers) preload(t);
+    for (const Tensor* t : ctx->Wo_layers) preload(t);
+    for (const Tensor* t : ctx->Wattn_norm_layers) preload(t);
+    for (const Tensor* t : ctx->Wffn_norm_layers) preload(t);
+    for (const Tensor* t : ctx->Wffn_gate_layers) preload(t);
+    for (const Tensor* t : ctx->Wffn_up_layers) preload(t);
+    for (const Tensor* t : ctx->Wffn_down_layers) preload(t);
+    for (const Tensor* t : ctx->Bq_layers) preload(t);
+    for (const Tensor* t : ctx->Bk_layers) preload(t);
+    for (const Tensor* t : ctx->Bv_layers) preload(t);
+}
+
 minxfmr_context* minxfmr_open(const char* model_path) {
     return minxfmr_open_with_layer(model_path, 0);
 }
@@ -735,6 +763,8 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     // Preallocate scores workspace for attention.
     // Length J = cached_rows + seq. Max value is approx seq_max.
     ctx->scores_workspace.assign(ctx->seq_max + 128, 0.0f);
+
+    preload_context_weights_to_backend(ctx);
 
     fprintf(stderr, "minxfmr: opened model %s\n", model_path);
     return ctx;
@@ -1270,6 +1300,7 @@ void minxfmr_reset(minxfmr_context* ctx) {
 
 void minxfmr_close(minxfmr_context* ctx) {
     if (!ctx) return;
+    backend_release_resources();
     if (ctx->cache) kvcache_free(ctx->cache);
     if (ctx->Wemb) tensor_free(ctx->Wemb);
     if (ctx->Wnorm) tensor_free(ctx->Wnorm);
