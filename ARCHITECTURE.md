@@ -301,6 +301,24 @@ Text
 
 ---
 
+# Flow and Code Mapping (Short)
+
+This quick map links architecture flow steps to core implementation files.
+
+| Flow step | Main file | Key function |
+| --- | --- | --- |
+| Prompt encode | src/tokenizer/tokenizer.cpp | tokenizer_encode |
+| Generation entry | src/api/minxfmr.cpp | minxfmr_generate |
+| Layer stack run | src/api/minxfmr.cpp | run_stack_forward |
+| Single layer math | src/transformer/transformer.cpp | transformer_forward_single_layer |
+| KV cache state | src/cache/kv_cache.cpp | kvcache_create, kvcache_append, kvcache_reset |
+| Backend dispatch | src/backend/backend_runtime.cpp | backend_matmul, backend_matmul_rhs_transposed |
+| GGUF load path | src/io/gguf_loader.cpp | gguf_try_load_* |
+
+For detailed step-by-step mapping, see 05_INFERENCE_FLOW.md.
+
+---
+
 # Generation Flow
 
 ```text

@@ -138,6 +138,33 @@ Repeat
 
 ---
 
+# Flow-to-Code Mapping
+
+This section maps each inference step to the current implementation files.
+
+| Flow Step | Main responsibility | Code location |
+| --- | --- | --- |
+| Entry point | Start one generation request | [src/api/minxfmr.cpp](src/api/minxfmr.cpp) (`minxfmr_generate`) |
+| Prompt encoding | Convert prompt text to token IDs | [src/tokenizer/tokenizer.cpp](src/tokenizer/tokenizer.cpp) (`tokenizer_encode`) |
+| Prompt prefill + token loop | Run prompt tokens, then autoregressive token steps | [src/api/minxfmr.cpp](src/api/minxfmr.cpp) (`minxfmr_generate`) |
+| Per-layer forward | Execute RMSNorm/Attention/FFN path | [src/transformer/transformer.cpp](src/transformer/transformer.cpp) (`transformer_forward_single_layer`) |
+| Stack execution | Run all layers and manage reusable buffers | [src/api/minxfmr.cpp](src/api/minxfmr.cpp) (`run_stack_forward`) |
+| KV cache append/reset | Store past K/V and reset per-call state | [src/cache/kv_cache.cpp](src/cache/kv_cache.cpp), [src/api/minxfmr.cpp](src/api/minxfmr.cpp) |
+| Logits projection | Multiply hidden state by output head | [src/api/minxfmr.cpp](src/api/minxfmr.cpp), [src/backend/backend_runtime.cpp](src/backend/backend_runtime.cpp) |
+| Backend dispatch | Route math to CPU/CUDA and fallback | [src/backend/backend_runtime.cpp](src/backend/backend_runtime.cpp) |
+| GGUF model load (open time) | Load metadata, tensors, tokenizer assets | [src/io/gguf_loader.cpp](src/io/gguf_loader.cpp), [src/api/minxfmr.cpp](src/api/minxfmr.cpp) (`minxfmr_open_with_layer`) |
+| Token callback output | Stream token text back to application | [src/api/minxfmr.cpp](src/api/minxfmr.cpp) (`minxfmr_generate` callback path) |
+
+Quick reading path for beginners:
+
+1. Read `minxfmr_generate` in [src/api/minxfmr.cpp](src/api/minxfmr.cpp)
+2. Follow calls to `tokenizer_encode` and `run_stack_forward`
+3. Open `transformer_forward_single_layer` in [src/transformer/transformer.cpp](src/transformer/transformer.cpp)
+4. Check KV behavior in [src/cache/kv_cache.cpp](src/cache/kv_cache.cpp)
+5. Check math dispatch in [src/backend/backend_runtime.cpp](src/backend/backend_runtime.cpp)
+
+---
+
 # Step 1: Prompt Encoding
 
 ## Input
