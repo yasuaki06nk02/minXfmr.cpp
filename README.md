@@ -191,6 +191,44 @@ $env:MINXFMR_BACKEND = "cuda"
 
 At startup, runtime logs the selected backend to stderr.
 
+When backend is `cuda`, quantized matmul kernels are controlled by `MINXFMR_CUDA_QUANT`.
+
+Supported values:
+
+* unset or `0` (default): disable experimental CUDA quantized matmul kernels and use CPU fallback for quantized weights
+* `1`: enable experimental CUDA quantized matmul kernels
+
+PowerShell examples:
+
+```powershell
+# Recommended default for stability
+Remove-Item Env:MINXFMR_CUDA_QUANT -ErrorAction SilentlyContinue
+$env:MINXFMR_BACKEND = "cuda"
+.\build\src\Release\minxfmr_cli.exe .\model.gguf --chat
+```
+
+```powershell
+# Experimental: force CUDA quantized kernels
+$env:MINXFMR_CUDA_QUANT = "1"
+$env:MINXFMR_BACKEND = "cuda"
+.\build\src\Release\minxfmr_cli.exe .\model.gguf --chat
+```
+
+Additional runtime environment variables used by current code:
+
+* `MINXFMR_CPU_THREADS`: CPU matmul thread count override (integer > 0)
+* `MINXFMR_MAX_GEN_TOKENS`: generation max token cap used by runtime loop
+* `MINXFMR_EMIT_JSON`: when set, emits JSON-formatted generation payload
+* `MINXFMR_VERBOSE_CACHE`: enables KV cache append debug logs
+
+Internal variables (usually set by CLI flags, not manual use):
+
+* `MINXFMR_TRANSPOSE_USER_OVERRIDE`
+* `MINXFMR_TRANSPOSE_WQ`
+* `MINXFMR_TRANSPOSE_WK`
+* `MINXFMR_TRANSPOSE_WV`
+* `MINXFMR_TRANSPOSE_WO`
+
 ---
 
 # Supported Model Format (MVP)
