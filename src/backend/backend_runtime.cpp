@@ -237,18 +237,22 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
         const uint8_t* bdq = (const uint8_t*)B->data;
         const size_t blocks_per_row = k / TENSOR_Q4_K_QK_K;
 
-        for (size_t i = 0; i < m; ++i) {
-            const float* arow = ad + i * k;
-            for (size_t j = 0; j < n; ++j) {
-                const uint8_t* brow = bdq + j * row_bytes;
-                float s = 0.0f;
-                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
-                    s += dot_q4_k_block(
-                        brow + blk * TENSOR_Q4_K_BLOCK_SIZE,
-                        arow + blk * TENSOR_Q4_K_QK_K);
-                }
-                od[i * n + j] = s;
+        const long long work = (long long)(m * n);
+        #if defined(_OPENMP)
+            #pragma omp parallel for
+        #endif
+        for (long long idx = 0; idx < work; ++idx) {
+            const size_t iu = (size_t)(idx / (long long)n);
+            const size_t ju = (size_t)(idx % (long long)n);
+            const float* arow = ad + iu * k;
+            const uint8_t* brow = bdq + ju * row_bytes;
+            float s = 0.0f;
+            for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+                s += dot_q4_k_block(
+                    brow + blk * TENSOR_Q4_K_BLOCK_SIZE,
+                    arow + blk * TENSOR_Q4_K_QK_K);
             }
+            od[iu * n + ju] = s;
         }
         return true;
     }
@@ -261,18 +265,22 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
         const uint8_t* bdq = (const uint8_t*)B->data;
         const size_t blocks_per_row = k / TENSOR_Q5_0_QK;
 
-        for (size_t i = 0; i < m; ++i) {
-            const float* arow = ad + i * k;
-            for (size_t j = 0; j < n; ++j) {
-                const uint8_t* brow = bdq + j * row_bytes;
-                float s = 0.0f;
-                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
-                    s += dot_q5_0_block(
-                        brow + blk * TENSOR_Q5_0_BLOCK_SIZE,
-                        arow + blk * TENSOR_Q5_0_QK);
-                }
-                od[i * n + j] = s;
+        const long long work = (long long)(m * n);
+        #if defined(_OPENMP)
+            #pragma omp parallel for
+        #endif
+        for (long long idx = 0; idx < work; ++idx) {
+            const size_t iu = (size_t)(idx / (long long)n);
+            const size_t ju = (size_t)(idx % (long long)n);
+            const float* arow = ad + iu * k;
+            const uint8_t* brow = bdq + ju * row_bytes;
+            float s = 0.0f;
+            for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+                s += dot_q5_0_block(
+                    brow + blk * TENSOR_Q5_0_BLOCK_SIZE,
+                    arow + blk * TENSOR_Q5_0_QK);
             }
+            od[iu * n + ju] = s;
         }
         return true;
     }
@@ -285,31 +293,35 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
         const uint8_t* bdq = (const uint8_t*)B->data;
         const size_t blocks_per_row = k / TENSOR_Q8_0_QK;
 
-        for (size_t i = 0; i < m; ++i) {
-            const float* arow = ad + i * k;
-            for (size_t j = 0; j < n; ++j) {
-                const uint8_t* brow = bdq + j * row_bytes;
-                float s = 0.0f;
-                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
-                    s += dot_q8_0_block(
-                        brow + blk * TENSOR_Q8_0_BLOCK_SIZE,
-                        arow + blk * TENSOR_Q8_0_QK);
-                }
-                od[i * n + j] = s;
+        const long long work = (long long)(m * n);
+        #if defined(_OPENMP)
+            #pragma omp parallel for
+        #endif
+        for (long long idx = 0; idx < work; ++idx) {
+            const size_t iu = (size_t)(idx / (long long)n);
+            const size_t ju = (size_t)(idx % (long long)n);
+            const float* arow = ad + iu * k;
+            const uint8_t* brow = bdq + ju * row_bytes;
+            float s = 0.0f;
+            for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+                s += dot_q8_0_block(
+                    brow + blk * TENSOR_Q8_0_BLOCK_SIZE,
+                    arow + blk * TENSOR_Q8_0_QK);
             }
+            od[iu * n + ju] = s;
         }
         return true;
     }
 
     const float* bd = (const float*)B->data;
 
+    const long long work = (long long)(m * n);
 #if defined(_OPENMP)
-    #pragma omp parallel for collapse(2)
+    #pragma omp parallel for
 #endif
-    for (long long i = 0; i < (long long)m; ++i) {
-        for (long long j = 0; j < (long long)n; ++j) {
-            const size_t iu = (size_t)i;
-            const size_t ju = (size_t)j;
+    for (long long idx = 0; idx < work; ++idx) {
+            const size_t iu = (size_t)(idx / (long long)n);
+            const size_t ju = (size_t)(idx % (long long)n);
             const float* arow = ad + iu * k;
             const float* brow = bd + ju * k;
             float s = 0.0f;
@@ -318,7 +330,6 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
 #endif
             for (size_t kk = 0; kk < k; ++kk) s += arow[kk] * brow[kk];
             od[iu * n + ju] = s;
-        }
     }
     return true;
 }

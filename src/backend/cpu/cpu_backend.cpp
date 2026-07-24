@@ -102,6 +102,31 @@ static void dequant_q8_0_block(const uint8_t* blk, float* dst32) {
     for (int i = 0; i < 32; ++i) dst32[i] = d * (float)qs[i];
 }
 
+struct CpuMatmulThreadConfig {
+    unsigned int nthreads;
+    bool split_cols;
+};
+
+static CpuMatmulThreadConfig cpu_matmul_thread_config(size_t m, size_t n) {
+    CpuMatmulThreadConfig cfg{};
+    cfg.nthreads = std::thread::hardware_concurrency();
+    if (cfg.nthreads == 0) cfg.nthreads = 1;
+
+    const char* env_th = std::getenv("MINXFMR_CPU_THREADS");
+    if (env_th) {
+        int v = std::atoi(env_th);
+        if (v > 0) cfg.nthreads = (unsigned int)v;
+    }
+
+    cfg.split_cols = (m < n);
+    if (cfg.split_cols) {
+        if ((size_t)cfg.nthreads > n) cfg.nthreads = (unsigned int)std::max<size_t>(1, n);
+    } else {
+        if ((size_t)cfg.nthreads > m) cfg.nthreads = (unsigned int)std::max<size_t>(1, m);
+    }
+    return cfg;
+}
+
 // Simple, safe threaded matmul. Controlled by env MINXFMR_CPU_THREADS (if set),
 // otherwise uses hardware_concurrency(). Splits work by output rows.
 bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
@@ -127,23 +152,75 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
         const size_t blocks_per_row = n / TENSOR_Q4_K_QK_K;
 
         std::memset(o, 0, sizeof(float) * m * n);
-        float tmp[TENSOR_Q4_K_QK_K];
+        CpuMatmulThreadConfig cfg = cpu_matmul_thread_config(m, n);
 
-        for (size_t i = 0; i < m; ++i) {
-            float* orow = o + i * n;
-            const float* arow = a + i * k;
-
+        auto row_worker = [&](size_t row_start, size_t row_end) {
+            float tmp[TENSOR_Q4_K_QK_K];
             for (size_t kk = 0; kk < k; ++kk) {
-                const float av = arow[kk];
                 const uint8_t* brow = bq + kk * row_bytes;
-
                 for (size_t blk = 0; blk < blocks_per_row; ++blk) {
                     dequant_q4_k_block(brow + blk * TENSOR_Q4_K_BLOCK_SIZE, tmp);
-                    float* out_blk = orow + blk * TENSOR_Q4_K_QK_K;
-                    for (size_t t = 0; t < TENSOR_Q4_K_QK_K; ++t) out_blk[t] += av * tmp[t];
+                    for (size_t i = row_start; i < row_end; ++i) {
+                        const float av = a[i * k + kk];
+                        float* out_blk = o + i * n + blk * TENSOR_Q4_K_QK_K;
+                        for (size_t t = 0; t < TENSOR_Q4_K_QK_K; ++t) out_blk[t] += av * tmp[t];
+                    }
                 }
             }
+        };
+
+        auto col_worker = [&](size_t block_start, size_t block_end) {
+            float tmp[TENSOR_Q4_K_QK_K];
+            for (size_t kk = 0; kk < k; ++kk) {
+                const uint8_t* brow = bq + kk * row_bytes;
+                for (size_t blk = block_start; blk < block_end; ++blk) {
+                    dequant_q4_k_block(brow + blk * TENSOR_Q4_K_BLOCK_SIZE, tmp);
+                    for (size_t i = 0; i < m; ++i) {
+                        const float av = a[i * k + kk];
+                        float* out_blk = o + i * n + blk * TENSOR_Q4_K_QK_K;
+                        for (size_t t = 0; t < TENSOR_Q4_K_QK_K; ++t) out_blk[t] += av * tmp[t];
+                    }
+                }
+            }
+        };
+
+        if (cfg.nthreads <= 1) {
+            row_worker(0, m);
+            return true;
         }
+
+        std::vector<std::thread> threads;
+        threads.reserve(cfg.nthreads);
+
+        if (!cfg.split_cols) {
+            size_t rows_per = m / cfg.nthreads;
+            size_t rem = m % cfg.nthreads;
+            size_t cur = 0;
+            for (unsigned int t = 0; t < cfg.nthreads; ++t) {
+                size_t rs = cur;
+                size_t re = rs + rows_per + (t < rem ? 1 : 0);
+                cur = re;
+                if (rs >= re) break;
+                threads.emplace_back(row_worker, rs, re);
+            }
+        } else {
+            unsigned int block_threads = cfg.nthreads;
+            if ((size_t)block_threads > blocks_per_row) {
+                block_threads = (unsigned int)std::max<size_t>(1, blocks_per_row);
+            }
+            size_t blocks_per = blocks_per_row / block_threads;
+            size_t rem = blocks_per_row % block_threads;
+            size_t cur_blk = 0;
+            for (unsigned int t = 0; t < block_threads; ++t) {
+                size_t bs = cur_blk;
+                size_t be = bs + blocks_per + (t < rem ? 1 : 0);
+                cur_blk = be;
+                if (bs >= be) break;
+                threads.emplace_back(col_worker, bs, be);
+            }
+        }
+
+        for (auto& th : threads) th.join();
         return true;
     }
 
@@ -210,26 +287,9 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
     // zero out output
     std::memset(o, 0, sizeof(float) * m * n);
 
-    unsigned int nthreads = std::thread::hardware_concurrency();
-    if (nthreads == 0) nthreads = 1;
-    const char* env_th = std::getenv("MINXFMR_CPU_THREADS");
-    if (env_th) {
-        int v = std::atoi(env_th);
-        if (v > 0) nthreads = (unsigned int)v;
-    }
-
-    // Decide whether to split work by rows (output rows) or columns (output cols).
-    // Splitting by rows is efficient when m (rows) is large. When m is small
-    // (e.g. m==1 during decode), split by columns so we can still use threads.
-    bool split_cols = (m < n);
-
-    if (split_cols) {
-        // clamp to at most n threads when splitting columns
-        if ((size_t)nthreads > n) nthreads = (unsigned int)std::max<size_t>(1, n);
-    } else {
-        // clamp to at most m threads when splitting rows
-        if ((size_t)nthreads > m) nthreads = (unsigned int)std::max<size_t>(1, m);
-    }
+    CpuMatmulThreadConfig cfg = cpu_matmul_thread_config(m, n);
+    unsigned int nthreads = cfg.nthreads;
+    bool split_cols = cfg.split_cols;
 
     if (nthreads <= 1) {
         for (size_t i = 0; i < m; ++i) {
