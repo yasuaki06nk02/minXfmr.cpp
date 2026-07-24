@@ -332,6 +332,13 @@ static bool normalize_linear_inplace(Tensor*& t, size_t in_dim, bool transpose_s
     return false;
 }
 
+static bool quantized_square_needs_runtime_transpose(const Tensor* t, size_t in_dim, bool desired_transpose) {
+    if (!desired_transpose || !t) return false;
+    if (in_dim == 0) return false;
+    if (t->type == DataType::F32) return false;
+    return (t->rows == in_dim && t->cols == in_dim);
+}
+
 static bool arch_uses_square_transpose(const std::string& arch_lc) {
     // Architectures whose exported square attention matrices are commonly laid out
     // in the opposite orientation for this runtime.
@@ -922,7 +929,29 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
             "[minxfmr] normalized ffn weights at load: gate=%zu up=%zu down=%zu bad=%zu\n",
             n_ffn_gate, n_ffn_up, n_ffn_down, bad_ffn);
 
-        transformer_set_transpose_square_weights_for_all(false, false, false, false);
+        // Keep runtime square-transpose enabled only for quantized square matrices
+        // that could not be physically transposed at load-time.
+        bool rt_wq = false;
+        bool rt_wk = false;
+        bool rt_wv = false;
+        bool rt_wo = false;
+        for (size_t l = 0; l < ctx->n_layer; ++l) {
+            if (quantized_square_needs_runtime_transpose(ctx->Wq_layers[l], ctx->model_dim, desired_transpose_wq)) rt_wq = true;
+            if (quantized_square_needs_runtime_transpose(ctx->Wk_layers[l], ctx->model_dim, desired_transpose_wk)) rt_wk = true;
+            if (quantized_square_needs_runtime_transpose(ctx->Wv_layers[l], ctx->model_dim, desired_transpose_wv)) rt_wv = true;
+            if (quantized_square_needs_runtime_transpose(ctx->Wo_layers[l], ctx->model_dim, desired_transpose_wo)) rt_wo = true;
+        }
+        if (quantized_square_needs_runtime_transpose(ctx->Wq, ctx->model_dim, desired_transpose_wq)) rt_wq = true;
+        if (quantized_square_needs_runtime_transpose(ctx->Wk, ctx->model_dim, desired_transpose_wk)) rt_wk = true;
+        if (quantized_square_needs_runtime_transpose(ctx->Wv, ctx->model_dim, desired_transpose_wv)) rt_wv = true;
+
+        transformer_set_transpose_square_weights_for_all(rt_wq, rt_wk, rt_wv, rt_wo);
+        fprintf(stderr,
+            "[minxfmr] runtime square transpose after normalization: wq=%s wk=%s wv=%s wo=%s\n",
+            rt_wq ? "on" : "off",
+            rt_wk ? "on" : "off",
+            rt_wv ? "on" : "off",
+            rt_wo ? "on" : "off");
     }
 
     // optional chat metadata

@@ -490,7 +490,6 @@ int main(int argc, char** argv) {
             if (looks_like_qwen_jinja_template(template_text)) {
                 if (used_auto_qwen) *used_auto_qwen = true;
                 std::string prompt_text;
-                prompt_text += "<|endoftext|>";
                 const char* sys = (system_text && system_text[0] != '\0')
                     ? system_text
                     : "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. Reply in the same language as the user.";
