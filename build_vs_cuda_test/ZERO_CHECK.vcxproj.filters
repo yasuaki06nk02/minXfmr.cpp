@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="18.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="C:\Users\admin\Documents\minXfmr.cpp\build_vs_cuda_test\CMakeFiles\58cb7ed69a9c26a1078ff4e0111d3485\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{6555387F-DC57-3C64-B343-FE3A658B2911}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>
