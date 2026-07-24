@@ -108,12 +108,16 @@ static float dot_q5_0_block(const uint8_t* blk, const float* x32) {
     hmask |= (uint32_t)qh[3] << 24;
 
     float acc = 0.0f;
-    for (int i = 0; i < 32; ++i) {
-        const uint8_t ql = qs[i >> 1];
-        const int low = (i & 1) ? (int)(ql >> 4) : (int)(ql & 0x0F);
-        const int high = (int)((hmask >> i) & 1u);
-        const int q = (high << 4) | low;
-        acc += x32[i] * (d * (float)(q - 16));
+    for (int i = 0; i < 16; ++i) {
+        const uint8_t ql = qs[i];
+        const int low0 = (int)(ql & 0x0F);
+        const int low1 = (int)(ql >> 4);
+        const int high0 = (int)((hmask >> i) & 1u);
+        const int high1 = (int)((hmask >> (i + 16)) & 1u);
+        const int q0 = (high0 << 4) | low0;
+        const int q1 = (high1 << 4) | low1;
+        acc += x32[i] * (d * (float)(q0 - 16));
+        acc += x32[i + 16] * (d * (float)(q1 - 16));
     }
     return acc;
 }

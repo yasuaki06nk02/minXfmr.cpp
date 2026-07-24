@@ -44,6 +44,14 @@ static void gen_collect_only_callback(const char* token) {
     gen_outbuf_global.append(token);
 }
 
+static std::string utf8_truncate_for_history(const std::string& text, size_t max_bytes) {
+    if (text.size() <= max_bytes) return text;
+    size_t end = max_bytes;
+    while (end > 0 && (((unsigned char)text[end]) & 0xC0) == 0x80) --end;
+    if (end == 0) return std::string();
+    return text.substr(0, end);
+}
+
 int main(int argc, char** argv) {
 #ifdef _WIN32
     SetConsoleOutputCP(CP_UTF8);
@@ -61,6 +69,7 @@ int main(int argc, char** argv) {
     float top_p = 1.0f;
     int top_k = 8;
     int max_gen_tokens = 128;
+    const std::string clean_fallback = "Sorry, I could not generate a clean response. Please try again.";
     const char* stop_token = nullptr;
     const char* log_file = nullptr;
     bool run_selftest = false;
@@ -602,6 +611,7 @@ int main(int argc, char** argv) {
                     std::string sanitized = sanitize_assistant_text(gen_outbuf_global);
                     bool allow_store = !sanitized.empty() && !is_suspicious_assistant_text(sanitized) && should_store_assistant_text(sanitized);
                     if (allow_store) {
+                        sanitized = utf8_truncate_for_history(sanitized, 320);
                         history.push_back(line);
                         history.push_back(sanitized);
                     } else {
@@ -634,11 +644,15 @@ int main(int argc, char** argv) {
 
                 std::string sanitized = sanitize_assistant_text(gen_outbuf_global);
                 bool allow_store = !sanitized.empty() && !is_suspicious_assistant_text(sanitized) && should_store_assistant_text(sanitized);
+                if (allow_store && sanitized == clean_fallback) {
+                    allow_store = false;
+                }
                 if (allow_store && looks_corrupted_reply(sanitized)) {
                     allow_store = false;
                     fprintf(stderr, "[main] skipping history store due to corrupted reply pattern\n");
                 }
                 if (allow_store) {
+                    sanitized = utf8_truncate_for_history(sanitized, 320);
                     history.push_back(line);
                     history.push_back(sanitized);
                 } else {

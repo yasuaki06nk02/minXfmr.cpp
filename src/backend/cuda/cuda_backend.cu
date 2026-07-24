@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
+#include <cstdlib>
 #include <cstdio>
 #include <mutex>
 #include <unordered_map>
@@ -24,6 +25,17 @@ struct CudaState {
 CudaState& state() {
     static CudaState s;
     return s;
+}
+
+bool cuda_quant_kernels_enabled() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* v = std::getenv("MINXFMR_CUDA_QUANT");
+    mode = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
+    if (mode == 0) {
+        std::fprintf(stderr, "[cuda] quantized matmul kernels disabled by default; falling back to CPU for quantized weights (set MINXFMR_CUDA_QUANT=1 to enable experimental CUDA quant kernels)\n");
+    }
+    return mode == 1;
 }
 
 bool ensure_ready() {
@@ -125,12 +137,16 @@ __device__ __forceinline__ void dequant_q5_0_block_device(const uint8_t* blk, fl
     hmask |= (uint32_t)qh[3] << 24;
 
     #pragma unroll
-    for (int i = 0; i < 32; ++i) {
-        const uint8_t ql = qs[i >> 1];
-        const int low = (i & 1) ? (int)(ql >> 4) : (int)(ql & 0x0F);
-        const int high = (int)((hmask >> i) & 1u);
-        const int q = (high << 4) | low;
-        dst32[i] = d * (float)(q - 16);
+    for (int i = 0; i < 16; ++i) {
+        const uint8_t ql = qs[i];
+        const int low0 = (int)(ql & 0x0F);
+        const int low1 = (int)(ql >> 4);
+        const int high0 = (int)((hmask >> i) & 1u);
+        const int high1 = (int)((hmask >> (i + 16)) & 1u);
+        const int q0 = (high0 << 4) | low0;
+        const int q1 = (high1 << 4) | low1;
+        dst32[i] = d * (float)(q0 - 16);
+        dst32[i + 16] = d * (float)(q1 - 16);
     }
 }
 
@@ -418,6 +434,8 @@ bool cuda_backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
         return ok;
     }
 
+    if (!cuda_quant_kernels_enabled()) return false;
+
     size_t row_bytes = 0;
     size_t block_elems = 0;
     size_t block_bytes = 0;
@@ -527,6 +545,8 @@ bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor
         cudaFree(dC);
         return ok;
     }
+
+    if (!cuda_quant_kernels_enabled()) return false;
 
     size_t row_bytes = 0;
     size_t block_elems = 0;
