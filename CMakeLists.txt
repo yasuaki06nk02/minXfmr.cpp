@@ -27,10 +27,17 @@ endif()
 # Compiler warnings / optimization
 # =========================================================
 if(MSVC)
-    add_compile_options(/W4 /permissive-)
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:/W4>
+        $<$<COMPILE_LANGUAGE:CXX>:/permissive->
+    )
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 else()
-    add_compile_options(-Wall -Wextra -Wpedantic)
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:-Wall>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wextra>
+        $<$<COMPILE_LANGUAGE:CXX>:-Wpedantic>
+    )
 endif()
 
 # =========================================================
@@ -39,6 +46,25 @@ endif()
 set(MINXFMR_CUDA_AVAILABLE OFF)
 
 if(MINXFMR_ENABLE_CUDA)
+    # On Windows, check_language(CUDA) can miss nvcc even when installed.
+    # Pre-resolve the compiler from common env vars / PATH so detection is stable.
+    if(NOT DEFINED CMAKE_CUDA_COMPILER OR NOT CMAKE_CUDA_COMPILER)
+        if(DEFINED ENV{CUDACXX} AND NOT "$ENV{CUDACXX}" STREQUAL "")
+            set(CMAKE_CUDA_COMPILER "$ENV{CUDACXX}" CACHE FILEPATH "CUDA compiler" FORCE)
+        else()
+            find_program(MINXFMR_NVCC_EXECUTABLE
+                NAMES nvcc
+                HINTS
+                    "$ENV{CUDA_PATH}/bin"
+                    "$ENV{CUDA_BIN_PATH}"
+                PATH_SUFFIXES bin
+            )
+            if(MINXFMR_NVCC_EXECUTABLE)
+                set(CMAKE_CUDA_COMPILER "${MINXFMR_NVCC_EXECUTABLE}" CACHE FILEPATH "CUDA compiler" FORCE)
+            endif()
+        endif()
+    endif()
+
     include(CheckLanguage)
     check_language(CUDA)
 

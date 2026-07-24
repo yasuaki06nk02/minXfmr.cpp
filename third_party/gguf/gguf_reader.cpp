@@ -561,6 +561,52 @@ bool gguf_read_f32_tensor(const GGUF_File& f, const GGUF_TensorInfo& info, Tenso
     return false;
 }
 
+bool gguf_dequant_q5_0(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out) {
+    out = nullptr;
+
+    // Keep Q5_0 tensors packed in memory. Dequant is handled in matmul kernels.
+    if (info.ggml_type != 6) return false;
+
+    const uint32_t rows = info.rows;
+    const uint32_t cols = info.cols;
+
+    const size_t row_bytes = tensor_q5_0_row_bytes(cols);
+    if (rows == 0 || cols == 0 || row_bytes == 0) {
+        return false;
+    }
+
+    const size_t need = (size_t)rows * row_bytes;
+    if (info.offset + need > f.data.size()) {
+        return false;
+    }
+
+    out = tensor_create_q5_0_from_bytes(rows, cols, f.data.data() + info.offset, need);
+    return out != nullptr;
+}
+
+bool gguf_dequant_q8_0(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out) {
+    out = nullptr;
+
+    // Keep Q8_0 tensors packed in memory. Dequant is handled in matmul kernels.
+    if (info.ggml_type != 8) return false;
+
+    const uint32_t rows = info.rows;
+    const uint32_t cols = info.cols;
+
+    const size_t row_bytes = tensor_q8_0_row_bytes(cols);
+    if (rows == 0 || cols == 0 || row_bytes == 0) {
+        return false;
+    }
+
+    const size_t need = (size_t)rows * row_bytes;
+    if (info.offset + need > f.data.size()) {
+        return false;
+    }
+
+    out = tensor_create_q8_0_from_bytes(rows, cols, f.data.data() + info.offset, need);
+    return out != nullptr;
+}
+
 bool gguf_dequant_q4_k_m(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out) {
     out = nullptr;
 
@@ -669,6 +715,8 @@ bool gguf_read_tensor(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& 
     // Try direct f32/f16 read
     if (gguf_read_f32_tensor(f, info, out)) return true;
     // Try known dequant paths
+    if (gguf_dequant_q5_0(f, info, out)) return true;
+    if (gguf_dequant_q8_0(f, info, out)) return true;
     if (gguf_dequant_q4_k_m(f, info, out)) return true;
     if (gguf_dequant_q6_k(f, info, out)) return true;
     // Unsupported type

@@ -93,6 +93,44 @@ static float dot_q4_k_block(const uint8_t* blk, const float* x256) {
     return acc;
 }
 
+static float dot_q5_0_block(const uint8_t* blk, const float* x32) {
+    uint16_t hd = 0;
+    std::memcpy(&hd, blk, sizeof(hd));
+    const float d = fp16_to_fp32_local(hd);
+
+    const uint8_t* qh = blk + 2;
+    const uint8_t* qs = blk + 6;
+
+    uint32_t hmask = 0;
+    hmask |= (uint32_t)qh[0];
+    hmask |= (uint32_t)qh[1] << 8;
+    hmask |= (uint32_t)qh[2] << 16;
+    hmask |= (uint32_t)qh[3] << 24;
+
+    float acc = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+        const uint8_t ql = qs[i >> 1];
+        const int low = (i & 1) ? (int)(ql >> 4) : (int)(ql & 0x0F);
+        const int high = (int)((hmask >> i) & 1u);
+        const int q = (high << 4) | low;
+        acc += x32[i] * (d * (float)(q - 16));
+    }
+    return acc;
+}
+
+static float dot_q8_0_block(const uint8_t* blk, const float* x32) {
+    uint16_t hd = 0;
+    std::memcpy(&hd, blk, sizeof(hd));
+    const float d = fp16_to_fp32_local(hd);
+    const int8_t* qs = (const int8_t*)(blk + 2);
+
+    float acc = 0.0f;
+    for (int i = 0; i < 32; ++i) {
+        acc += x32[i] * (d * (float)qs[i]);
+    }
+    return acc;
+}
+
 static bool try_enable_cuda() {
 #if defined(MINXFMR_ENABLE_CUDA)
     if (!cuda_backend_is_available()) return false;
@@ -180,7 +218,7 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
 
     if (!A || !B || !out) return false;
     if (A->type != DataType::F32 || out->type != DataType::F32) return false;
-    if (B->type != DataType::F32 && B->type != DataType::Q4_K) return false;
+    if (B->type != DataType::F32 && B->type != DataType::Q4_K && B->type != DataType::Q5_0 && B->type != DataType::Q8_0) return false;
     if (A->cols != B->cols) return false;
     if (out->rows != A->rows || out->cols != B->rows) return false;
 
@@ -215,21 +253,71 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
         return true;
     }
 
+    if (B->type == DataType::Q5_0) {
+        const size_t row_bytes = tensor_q5_0_row_bytes(k);
+        if (row_bytes == 0) return false;
+        if (B->bytes < B->rows * row_bytes) return false;
+
+        const uint8_t* bdq = (const uint8_t*)B->data;
+        const size_t blocks_per_row = k / TENSOR_Q5_0_QK;
+
+        for (size_t i = 0; i < m; ++i) {
+            const float* arow = ad + i * k;
+            for (size_t j = 0; j < n; ++j) {
+                const uint8_t* brow = bdq + j * row_bytes;
+                float s = 0.0f;
+                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+                    s += dot_q5_0_block(
+                        brow + blk * TENSOR_Q5_0_BLOCK_SIZE,
+                        arow + blk * TENSOR_Q5_0_QK);
+                }
+                od[i * n + j] = s;
+            }
+        }
+        return true;
+    }
+
+    if (B->type == DataType::Q8_0) {
+        const size_t row_bytes = tensor_q8_0_row_bytes(k);
+        if (row_bytes == 0) return false;
+        if (B->bytes < B->rows * row_bytes) return false;
+
+        const uint8_t* bdq = (const uint8_t*)B->data;
+        const size_t blocks_per_row = k / TENSOR_Q8_0_QK;
+
+        for (size_t i = 0; i < m; ++i) {
+            const float* arow = ad + i * k;
+            for (size_t j = 0; j < n; ++j) {
+                const uint8_t* brow = bdq + j * row_bytes;
+                float s = 0.0f;
+                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+                    s += dot_q8_0_block(
+                        brow + blk * TENSOR_Q8_0_BLOCK_SIZE,
+                        arow + blk * TENSOR_Q8_0_QK);
+                }
+                od[i * n + j] = s;
+            }
+        }
+        return true;
+    }
+
     const float* bd = (const float*)B->data;
 
 #if defined(_OPENMP)
     #pragma omp parallel for collapse(2)
 #endif
-    for (size_t i = 0; i < m; ++i) {
-        for (size_t j = 0; j < n; ++j) {
-            const float* arow = ad + i * k;
-            const float* brow = bd + j * k;
+    for (long long i = 0; i < (long long)m; ++i) {
+        for (long long j = 0; j < (long long)n; ++j) {
+            const size_t iu = (size_t)i;
+            const size_t ju = (size_t)j;
+            const float* arow = ad + iu * k;
+            const float* brow = bd + ju * k;
             float s = 0.0f;
 #if defined(_OPENMP) && !defined(_MSC_VER)
             #pragma omp simd reduction(+:s)
 #endif
             for (size_t kk = 0; kk < k; ++kk) s += arow[kk] * brow[kk];
-            od[i * n + j] = s;
+            od[iu * n + ju] = s;
         }
     }
     return true;

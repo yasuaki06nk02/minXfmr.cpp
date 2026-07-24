@@ -24,7 +24,7 @@ if(MINXFMR_CUDA_AVAILABLE)
     set_target_properties(minxfmr PROPERTIES
         CUDA_STANDARD 14
         CUDA_STANDARD_REQUIRED ON
-        CUDA_SEPARABLE_COMPILATION ON
+        CUDA_SEPARABLE_COMPILATION OFF
     )
 endif()
 
@@ -49,13 +49,13 @@ endif()
 
 if(MSVC)
     target_compile_options(minxfmr PRIVATE
-        $<$<NOT:$<CONFIG:Debug>>:/O2>
-        $<$<NOT:$<CONFIG:Debug>>:/arch:AVX2>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CONFIG:Debug>>>:/O2>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CONFIG:Debug>>>:/arch:AVX2>
     )
 else()
     target_compile_options(minxfmr PRIVATE
-        $<$<NOT:$<CONFIG:Debug>>:-O3>
-        $<$<NOT:$<CONFIG:Debug>>:-march=native>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CONFIG:Debug>>>:-O3>
+        $<$<AND:$<COMPILE_LANGUAGE:CXX>,$<NOT:$<CONFIG:Debug>>>:-march=native>
     )
 endif()
 

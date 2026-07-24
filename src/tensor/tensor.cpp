@@ -74,6 +74,16 @@ size_t tensor_q4_k_row_bytes(size_t cols) {
     return (cols / TENSOR_Q4_K_QK_K) * TENSOR_Q4_K_BLOCK_SIZE;
 }
 
+size_t tensor_q5_0_row_bytes(size_t cols) {
+    if (cols == 0 || (cols % TENSOR_Q5_0_QK) != 0) return 0;
+    return (cols / TENSOR_Q5_0_QK) * TENSOR_Q5_0_BLOCK_SIZE;
+}
+
+size_t tensor_q8_0_row_bytes(size_t cols) {
+    if (cols == 0 || (cols % TENSOR_Q8_0_QK) != 0) return 0;
+    return (cols / TENSOR_Q8_0_QK) * TENSOR_Q8_0_BLOCK_SIZE;
+}
+
 Tensor* tensor_create_f32(size_t rows, size_t cols) {
     Tensor* t = tensor_create_f32_noinit(rows, cols);
     if (!t) return nullptr;
@@ -134,6 +144,68 @@ Tensor* tensor_create_q4_k_from_bytes(size_t rows, size_t cols, const uint8_t* p
 
     impl->t.data = impl->storage;
     impl->t.type = DataType::Q4_K;
+    impl->t.rows = rows;
+    impl->t.cols = cols;
+    impl->t.bytes = need;
+    return &impl->t;
+}
+
+Tensor* tensor_create_q5_0_from_bytes(size_t rows, size_t cols, const uint8_t* packed, size_t packed_bytes) {
+    if (rows == 0 || cols == 0 || packed == nullptr) return nullptr;
+
+    const size_t row_bytes = tensor_q5_0_row_bytes(cols);
+    if (row_bytes == 0) return nullptr;
+
+    const size_t need = rows * row_bytes;
+    if (packed_bytes < need) return nullptr;
+
+    TensorImpl* impl = new (std::nothrow) TensorImpl();
+    if (!impl) return nullptr;
+
+#ifdef _WIN32
+    impl->storage = _aligned_malloc(need, 64);
+    if (!impl->storage) { delete impl; return nullptr; }
+#else
+    void* p = nullptr;
+    if (posix_memalign(&p, 64, need) != 0) { delete impl; return nullptr; }
+    impl->storage = p;
+#endif
+
+    std::memcpy(impl->storage, packed, need);
+
+    impl->t.data = impl->storage;
+    impl->t.type = DataType::Q5_0;
+    impl->t.rows = rows;
+    impl->t.cols = cols;
+    impl->t.bytes = need;
+    return &impl->t;
+}
+
+Tensor* tensor_create_q8_0_from_bytes(size_t rows, size_t cols, const uint8_t* packed, size_t packed_bytes) {
+    if (rows == 0 || cols == 0 || packed == nullptr) return nullptr;
+
+    const size_t row_bytes = tensor_q8_0_row_bytes(cols);
+    if (row_bytes == 0) return nullptr;
+
+    const size_t need = rows * row_bytes;
+    if (packed_bytes < need) return nullptr;
+
+    TensorImpl* impl = new (std::nothrow) TensorImpl();
+    if (!impl) return nullptr;
+
+#ifdef _WIN32
+    impl->storage = _aligned_malloc(need, 64);
+    if (!impl->storage) { delete impl; return nullptr; }
+#else
+    void* p = nullptr;
+    if (posix_memalign(&p, 64, need) != 0) { delete impl; return nullptr; }
+    impl->storage = p;
+#endif
+
+    std::memcpy(impl->storage, packed, need);
+
+    impl->t.data = impl->storage;
+    impl->t.type = DataType::Q8_0;
     impl->t.rows = rows;
     impl->t.cols = cols;
     impl->t.bytes = need;

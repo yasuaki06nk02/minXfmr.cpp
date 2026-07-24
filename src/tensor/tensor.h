@@ -7,6 +7,10 @@ enum class DataType {
     F32,
     // Packed GGUF Q4_K blocks.
     Q4_K,
+    // Packed GGUF Q5_0 blocks.
+    Q5_0,
+    // Packed GGUF Q8_0 blocks.
+    Q8_0,
 };
 
 struct Tensor {
@@ -44,13 +48,25 @@ Tensor* tensor_create_f32_noinit(size_t rows, size_t cols);
 Tensor* tensor_create_f32_view(size_t rows, size_t cols, float* buffer);
 // Create a packed GGML Q4_K tensor and copy raw block data into owned storage.
 Tensor* tensor_create_q4_k_from_bytes(size_t rows, size_t cols, const uint8_t* packed, size_t packed_bytes);
+// Create a packed GGML Q5_0 tensor and copy raw block data into owned storage.
+Tensor* tensor_create_q5_0_from_bytes(size_t rows, size_t cols, const uint8_t* packed, size_t packed_bytes);
+// Create a packed GGML Q8_0 tensor and copy raw block data into owned storage.
+Tensor* tensor_create_q8_0_from_bytes(size_t rows, size_t cols, const uint8_t* packed, size_t packed_bytes);
 
 // Q4_K constants used by GGUF and CPU backend paths.
 constexpr size_t TENSOR_Q4_K_QK_K = 256;
 constexpr size_t TENSOR_Q4_K_BLOCK_SIZE = 2 + 2 + 12 + (TENSOR_Q4_K_QK_K / 2);
+constexpr size_t TENSOR_Q5_0_QK = 32;
+constexpr size_t TENSOR_Q5_0_BLOCK_SIZE = 2 + 4 + (TENSOR_Q5_0_QK / 2);
+constexpr size_t TENSOR_Q8_0_QK = 32;
+constexpr size_t TENSOR_Q8_0_BLOCK_SIZE = 2 + TENSOR_Q8_0_QK;
 
 // Returns 0 when cols is not representable by Q4_K blocks.
 size_t tensor_q4_k_row_bytes(size_t cols);
+// Returns 0 when cols is not representable by Q5_0 blocks.
+size_t tensor_q5_0_row_bytes(size_t cols);
+// Returns 0 when cols is not representable by Q8_0 blocks.
+size_t tensor_q8_0_row_bytes(size_t cols);
 
 void tensor_free(Tensor* t);
 

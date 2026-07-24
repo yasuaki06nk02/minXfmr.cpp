@@ -71,12 +71,43 @@ static void dequant_q4_k_block(const uint8_t* blk, float* dst256) {
     }
 }
 
+static void dequant_q5_0_block(const uint8_t* blk, float* dst32) {
+    uint16_t hd = 0;
+    std::memcpy(&hd, blk, sizeof(hd));
+    const float d = fp16_to_fp32_local(hd);
+
+    const uint8_t* qh = blk + 2;  // 32 high bits
+    const uint8_t* qs = blk + 6;  // 32 low 4-bit quants (packed into 16 bytes)
+
+    uint32_t hmask = 0;
+    hmask |= (uint32_t)qh[0];
+    hmask |= (uint32_t)qh[1] << 8;
+    hmask |= (uint32_t)qh[2] << 16;
+    hmask |= (uint32_t)qh[3] << 24;
+
+    for (int i = 0; i < 32; ++i) {
+        const uint8_t ql = qs[i >> 1];
+        const int low = (i & 1) ? (int)(ql >> 4) : (int)(ql & 0x0F);
+        const int high = (int)((hmask >> i) & 1u);
+        const int q = (high << 4) | low; // [0..31]
+        dst32[i] = d * (float)(q - 16);
+    }
+}
+
+static void dequant_q8_0_block(const uint8_t* blk, float* dst32) {
+    uint16_t hd = 0;
+    std::memcpy(&hd, blk, sizeof(hd));
+    const float d = fp16_to_fp32_local(hd);
+    const int8_t* qs = (const int8_t*)(blk + 2);
+    for (int i = 0; i < 32; ++i) dst32[i] = d * (float)qs[i];
+}
+
 // Simple, safe threaded matmul. Controlled by env MINXFMR_CPU_THREADS (if set),
 // otherwise uses hardware_concurrency(). Splits work by output rows.
 bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
     if (!A || !B || !out) return false;
     if (A->type != DataType::F32 || out->type != DataType::F32) return false;
-    if (B->type != DataType::F32 && B->type != DataType::Q4_K) return false;
+    if (B->type != DataType::F32 && B->type != DataType::Q4_K && B->type != DataType::Q5_0 && B->type != DataType::Q8_0) return false;
     size_t m = A->rows;
     size_t k = A->cols;
     size_t kb = B->rows;
@@ -110,6 +141,64 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
                     dequant_q4_k_block(brow + blk * TENSOR_Q4_K_BLOCK_SIZE, tmp);
                     float* out_blk = orow + blk * TENSOR_Q4_K_QK_K;
                     for (size_t t = 0; t < TENSOR_Q4_K_QK_K; ++t) out_blk[t] += av * tmp[t];
+                }
+            }
+        }
+        return true;
+    }
+
+    if (B->type == DataType::Q5_0) {
+        const size_t row_bytes = tensor_q5_0_row_bytes(n);
+        if (row_bytes == 0) return false;
+        if (B->bytes < B->rows * row_bytes) return false;
+
+        const uint8_t* bq = (const uint8_t*)B->data;
+        const size_t blocks_per_row = n / TENSOR_Q5_0_QK;
+
+        std::memset(o, 0, sizeof(float) * m * n);
+        float tmp[TENSOR_Q5_0_QK];
+
+        for (size_t i = 0; i < m; ++i) {
+            float* orow = o + i * n;
+            const float* arow = a + i * k;
+
+            for (size_t kk = 0; kk < k; ++kk) {
+                const float av = arow[kk];
+                const uint8_t* brow = bq + kk * row_bytes;
+
+                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+                    dequant_q5_0_block(brow + blk * TENSOR_Q5_0_BLOCK_SIZE, tmp);
+                    float* out_blk = orow + blk * TENSOR_Q5_0_QK;
+                    for (size_t t = 0; t < TENSOR_Q5_0_QK; ++t) out_blk[t] += av * tmp[t];
+                }
+            }
+        }
+        return true;
+    }
+
+    if (B->type == DataType::Q8_0) {
+        const size_t row_bytes = tensor_q8_0_row_bytes(n);
+        if (row_bytes == 0) return false;
+        if (B->bytes < B->rows * row_bytes) return false;
+
+        const uint8_t* bq = (const uint8_t*)B->data;
+        const size_t blocks_per_row = n / TENSOR_Q8_0_QK;
+
+        std::memset(o, 0, sizeof(float) * m * n);
+        float tmp[TENSOR_Q8_0_QK];
+
+        for (size_t i = 0; i < m; ++i) {
+            float* orow = o + i * n;
+            const float* arow = a + i * k;
+
+            for (size_t kk = 0; kk < k; ++kk) {
+                const float av = arow[kk];
+                const uint8_t* brow = bq + kk * row_bytes;
+
+                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+                    dequant_q8_0_block(brow + blk * TENSOR_Q8_0_BLOCK_SIZE, tmp);
+                    float* out_blk = orow + blk * TENSOR_Q8_0_QK;
+                    for (size_t t = 0; t < TENSOR_Q8_0_QK; ++t) out_blk[t] += av * tmp[t];
                 }
             }
         }

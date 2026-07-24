@@ -64,6 +64,8 @@ void gguf_close(GGUF_File& f);
 bool gguf_find_tensor(const GGUF_File& f, const char* name, GGUF_TensorInfo& out);
 bool gguf_find_tensor_any(const GGUF_File& f, const char* const* names, size_t count, GGUF_TensorInfo& out);
 bool gguf_read_f32_tensor(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out);
+bool gguf_dequant_q5_0(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out);
+bool gguf_dequant_q8_0(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out);
 bool gguf_dequant_q4_k_m(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out);
 bool gguf_dequant_q6_k(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out);
 // Unified tensor loader: reads a tensor and returns a newly-allocated Tensor* in `out`.

@@ -53,7 +53,7 @@ static bool cache_append_log_enabled() {
 static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out, bool transpose_square) {
     out = nullptr;
     if (!in || !W || in->type != DataType::F32) return false;
-    if (W->type != DataType::F32 && W->type != DataType::Q4_K) return false;
+    if (W->type != DataType::F32 && W->type != DataType::Q4_K && W->type != DataType::Q5_0 && W->type != DataType::Q8_0) return false;
     const size_t d_in = in->cols;
 
     // Some checkpoints store square matrices in the opposite orientation.
