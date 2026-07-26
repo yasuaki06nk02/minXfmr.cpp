@@ -85,16 +85,12 @@ static void dequant_q5_0_block(const uint8_t* blk, float* dst32) {
     hmask |= (uint32_t)qh[2] << 16;
     hmask |= (uint32_t)qh[3] << 24;
 
-    for (int i = 0; i < 16; ++i) {
-        const uint8_t ql = qs[i];
-        const int low0 = (int)(ql & 0x0F);
-        const int low1 = (int)(ql >> 4);
-        const int high0 = (int)((hmask >> i) & 1u);
-        const int high1 = (int)((hmask >> (i + 16)) & 1u);
-        const int q0 = (high0 << 4) | low0; // element i
-        const int q1 = (high1 << 4) | low1; // element i + 16
-        dst32[i] = d * (float)(q0 - 16);
-        dst32[i + 16] = d * (float)(q1 - 16);
+    for (int i = 0; i < 32; ++i) {
+        const uint8_t ql = qs[i >> 1];
+        const int low = (i & 1) ? (int)(ql >> 4) : (int)(ql & 0x0F);
+        const int high = (int)((hmask >> i) & 1u);
+        const int q = (high << 4) | low; // [0..31]
+        dst32[i] = d * (float)(q - 16);
     }
 }
 
@@ -131,6 +127,89 @@ static CpuMatmulThreadConfig cpu_matmul_thread_config(size_t m, size_t n) {
     return cfg;
 }
 
+template <size_t BlockElems, size_t BlockSize, typename DequantFn>
+static void cpu_matmul_quantized_weight_stationary(
+    const float* a,
+    const uint8_t* bq,
+    float* o,
+    size_t m,
+    size_t k,
+    size_t n,
+    size_t row_bytes,
+    size_t blocks_per_row,
+    DequantFn dequant_block) {
+    std::memset(o, 0, sizeof(float) * m * n);
+    CpuMatmulThreadConfig cfg = cpu_matmul_thread_config(m, n);
+
+    auto row_worker = [&](size_t row_start, size_t row_end) {
+        float tmp[BlockElems];
+        for (size_t kk = 0; kk < k; ++kk) {
+            const uint8_t* brow = bq + kk * row_bytes;
+            for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+                dequant_block(brow + blk * BlockSize, tmp);
+                for (size_t i = row_start; i < row_end; ++i) {
+                    const float av = a[i * k + kk];
+                    float* out_blk = o + i * n + blk * BlockElems;
+                    for (size_t t = 0; t < BlockElems; ++t) out_blk[t] += av * tmp[t];
+                }
+            }
+        }
+    };
+
+    auto col_worker = [&](size_t block_start, size_t block_end) {
+        float tmp[BlockElems];
+        for (size_t kk = 0; kk < k; ++kk) {
+            const uint8_t* brow = bq + kk * row_bytes;
+            for (size_t blk = block_start; blk < block_end; ++blk) {
+                dequant_block(brow + blk * BlockSize, tmp);
+                for (size_t i = 0; i < m; ++i) {
+                    const float av = a[i * k + kk];
+                    float* out_blk = o + i * n + blk * BlockElems;
+                    for (size_t t = 0; t < BlockElems; ++t) out_blk[t] += av * tmp[t];
+                }
+            }
+        }
+    };
+
+    if (cfg.nthreads <= 1) {
+        row_worker(0, m);
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve(cfg.nthreads);
+
+    if (!cfg.split_cols) {
+        size_t rows_per = m / cfg.nthreads;
+        size_t rem = m % cfg.nthreads;
+        size_t cur = 0;
+        for (unsigned int t = 0; t < cfg.nthreads; ++t) {
+            size_t rs = cur;
+            size_t re = rs + rows_per + (t < rem ? 1 : 0);
+            cur = re;
+            if (rs >= re) break;
+            threads.emplace_back(row_worker, rs, re);
+        }
+    } else {
+        unsigned int block_threads = cfg.nthreads;
+        if ((size_t)block_threads > blocks_per_row) {
+            block_threads = (unsigned int)std::max<size_t>(1, blocks_per_row);
+        }
+        size_t blocks_per = blocks_per_row / block_threads;
+        size_t rem = blocks_per_row % block_threads;
+        size_t cur_blk = 0;
+        for (unsigned int t = 0; t < block_threads; ++t) {
+            size_t bs = cur_blk;
+            size_t be = bs + blocks_per + (t < rem ? 1 : 0);
+            cur_blk = be;
+            if (bs >= be) break;
+            threads.emplace_back(col_worker, bs, be);
+        }
+    }
+
+    for (auto& th : threads) th.join();
+}
+
 // Simple, safe threaded matmul. Controlled by env MINXFMR_CPU_THREADS (if set),
 // otherwise uses hardware_concurrency(). Splits work by output rows.
 bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
@@ -155,76 +234,16 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
         const uint8_t* bq = (const uint8_t*)B->data;
         const size_t blocks_per_row = n / TENSOR_Q4_K_QK_K;
 
-        std::memset(o, 0, sizeof(float) * m * n);
-        CpuMatmulThreadConfig cfg = cpu_matmul_thread_config(m, n);
-
-        auto row_worker = [&](size_t row_start, size_t row_end) {
-            float tmp[TENSOR_Q4_K_QK_K];
-            for (size_t kk = 0; kk < k; ++kk) {
-                const uint8_t* brow = bq + kk * row_bytes;
-                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
-                    dequant_q4_k_block(brow + blk * TENSOR_Q4_K_BLOCK_SIZE, tmp);
-                    for (size_t i = row_start; i < row_end; ++i) {
-                        const float av = a[i * k + kk];
-                        float* out_blk = o + i * n + blk * TENSOR_Q4_K_QK_K;
-                        for (size_t t = 0; t < TENSOR_Q4_K_QK_K; ++t) out_blk[t] += av * tmp[t];
-                    }
-                }
-            }
-        };
-
-        auto col_worker = [&](size_t block_start, size_t block_end) {
-            float tmp[TENSOR_Q4_K_QK_K];
-            for (size_t kk = 0; kk < k; ++kk) {
-                const uint8_t* brow = bq + kk * row_bytes;
-                for (size_t blk = block_start; blk < block_end; ++blk) {
-                    dequant_q4_k_block(brow + blk * TENSOR_Q4_K_BLOCK_SIZE, tmp);
-                    for (size_t i = 0; i < m; ++i) {
-                        const float av = a[i * k + kk];
-                        float* out_blk = o + i * n + blk * TENSOR_Q4_K_QK_K;
-                        for (size_t t = 0; t < TENSOR_Q4_K_QK_K; ++t) out_blk[t] += av * tmp[t];
-                    }
-                }
-            }
-        };
-
-        if (cfg.nthreads <= 1) {
-            row_worker(0, m);
-            return true;
-        }
-
-        std::vector<std::thread> threads;
-        threads.reserve(cfg.nthreads);
-
-        if (!cfg.split_cols) {
-            size_t rows_per = m / cfg.nthreads;
-            size_t rem = m % cfg.nthreads;
-            size_t cur = 0;
-            for (unsigned int t = 0; t < cfg.nthreads; ++t) {
-                size_t rs = cur;
-                size_t re = rs + rows_per + (t < rem ? 1 : 0);
-                cur = re;
-                if (rs >= re) break;
-                threads.emplace_back(row_worker, rs, re);
-            }
-        } else {
-            unsigned int block_threads = cfg.nthreads;
-            if ((size_t)block_threads > blocks_per_row) {
-                block_threads = (unsigned int)std::max<size_t>(1, blocks_per_row);
-            }
-            size_t blocks_per = blocks_per_row / block_threads;
-            size_t rem = blocks_per_row % block_threads;
-            size_t cur_blk = 0;
-            for (unsigned int t = 0; t < block_threads; ++t) {
-                size_t bs = cur_blk;
-                size_t be = bs + blocks_per + (t < rem ? 1 : 0);
-                cur_blk = be;
-                if (bs >= be) break;
-                threads.emplace_back(col_worker, bs, be);
-            }
-        }
-
-        for (auto& th : threads) th.join();
+        cpu_matmul_quantized_weight_stationary<TENSOR_Q4_K_QK_K, TENSOR_Q4_K_BLOCK_SIZE>(
+            a,
+            bq,
+            o,
+            m,
+            k,
+            n,
+            row_bytes,
+            blocks_per_row,
+            dequant_q4_k_block);
         return true;
     }
 
@@ -236,24 +255,16 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
         const uint8_t* bq = (const uint8_t*)B->data;
         const size_t blocks_per_row = n / TENSOR_Q5_0_QK;
 
-        std::memset(o, 0, sizeof(float) * m * n);
-        float tmp[TENSOR_Q5_0_QK];
-
-        for (size_t i = 0; i < m; ++i) {
-            float* orow = o + i * n;
-            const float* arow = a + i * k;
-
-            for (size_t kk = 0; kk < k; ++kk) {
-                const float av = arow[kk];
-                const uint8_t* brow = bq + kk * row_bytes;
-
-                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
-                    dequant_q5_0_block(brow + blk * TENSOR_Q5_0_BLOCK_SIZE, tmp);
-                    float* out_blk = orow + blk * TENSOR_Q5_0_QK;
-                    for (size_t t = 0; t < TENSOR_Q5_0_QK; ++t) out_blk[t] += av * tmp[t];
-                }
-            }
-        }
+        cpu_matmul_quantized_weight_stationary<TENSOR_Q5_0_QK, TENSOR_Q5_0_BLOCK_SIZE>(
+            a,
+            bq,
+            o,
+            m,
+            k,
+            n,
+            row_bytes,
+            blocks_per_row,
+            dequant_q5_0_block);
         return true;
     }
 
@@ -265,24 +276,16 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
         const uint8_t* bq = (const uint8_t*)B->data;
         const size_t blocks_per_row = n / TENSOR_Q8_0_QK;
 
-        std::memset(o, 0, sizeof(float) * m * n);
-        float tmp[TENSOR_Q8_0_QK];
-
-        for (size_t i = 0; i < m; ++i) {
-            float* orow = o + i * n;
-            const float* arow = a + i * k;
-
-            for (size_t kk = 0; kk < k; ++kk) {
-                const float av = arow[kk];
-                const uint8_t* brow = bq + kk * row_bytes;
-
-                for (size_t blk = 0; blk < blocks_per_row; ++blk) {
-                    dequant_q8_0_block(brow + blk * TENSOR_Q8_0_BLOCK_SIZE, tmp);
-                    float* out_blk = orow + blk * TENSOR_Q8_0_QK;
-                    for (size_t t = 0; t < TENSOR_Q8_0_QK; ++t) out_blk[t] += av * tmp[t];
-                }
-            }
-        }
+        cpu_matmul_quantized_weight_stationary<TENSOR_Q8_0_QK, TENSOR_Q8_0_BLOCK_SIZE>(
+            a,
+            bq,
+            o,
+            m,
+            k,
+            n,
+            row_bytes,
+            blocks_per_row,
+            dequant_q8_0_block);
         return true;
     }
 
