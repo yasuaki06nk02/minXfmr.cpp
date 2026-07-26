@@ -210,27 +210,37 @@ __global__ void matmul_quant_kernel(
     size_t row_bytes) {
     const size_t row = (size_t)blockIdx.y * blockDim.y + threadIdx.y;
     const size_t col = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (row >= m || col >= n) return;
+    const bool active = (row < m) && (col < n);
 
-    const float* arow = A + row * k;
-    const size_t block = col / BlockElems;
+    const size_t block_col0 = (size_t)blockIdx.x * blockDim.x;
+    const size_t block = block_col0 / BlockElems;
     const size_t offset = col % BlockElems;
     float acc = 0.0f;
-    float tile[BlockElems];
+    __shared__ float tile[BlockElems];
 
     for (size_t kk = 0; kk < k; ++kk) {
         const uint8_t* brow = B + kk * row_bytes + block * BlockSize;
-        if constexpr (BlockElems == TENSOR_Q4_K_QK_K) {
-            dequant_q4_k_block_device(brow, tile);
-        } else if constexpr (BlockElems == TENSOR_Q5_0_QK) {
-            dequant_q5_0_block_device(brow, tile);
-        } else {
-            dequant_q8_0_block_device(brow, tile);
+
+        // Decode one quant block per CTA, then reuse it across all threads.
+        if (threadIdx.x == 0 && threadIdx.y == 0) {
+            if constexpr (BlockElems == TENSOR_Q4_K_QK_K) {
+                dequant_q4_k_block_device(brow, tile);
+            } else if constexpr (BlockElems == TENSOR_Q5_0_QK) {
+                dequant_q5_0_block_device(brow, tile);
+            } else {
+                dequant_q8_0_block_device(brow, tile);
+            }
         }
-        acc += arow[kk] * tile[offset];
+        __syncthreads();
+
+        if (active) {
+            const float* arow = A + row * k;
+            acc += arow[kk] * tile[offset];
+        }
+        __syncthreads();
     }
 
-    C[row * n + col] = acc;
+    if (active) C[row * n + col] = acc;
 }
 
 template <size_t BlockElems, size_t BlockSize>
