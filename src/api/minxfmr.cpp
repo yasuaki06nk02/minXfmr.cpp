@@ -294,6 +294,16 @@ static bool env_enabled(const char* key) {
     return v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T';
 }
 
+// Enable verbose per-token generation logs when MINXFMR_VERBOSE_GEN=1.
+static bool gen_verbose_enabled() {
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char* v = std::getenv("MINXFMR_VERBOSE_GEN");
+        enabled = (v && v[0] == '1') ? 1 : 0;
+    }
+    return enabled == 1;
+}
+
 static bool transpose_square_inplace(Tensor*& t) {
     if (!t || t->type != DataType::F32) return true;
     if (t->rows != t->cols) return true;
@@ -1104,8 +1114,10 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     std::string last_emitted_raw_tok;
     int repeat_run = 0;
     for (t = 0; t < max_steps; ++t) {
-        fprintf(stderr, "[minxfmr] gen loop step=%d last=%d emitted=%d\n", t, last, gen_tokens_emitted);
-        fflush(stderr);
+        if (gen_verbose_enabled()) {
+            fprintf(stderr, "[minxfmr] gen loop step=%d last=%d emitted=%d\n", t, last, gen_tokens_emitted);
+            fflush(stderr);
+        }
         Tensor* in = nullptr;
         Tensor* out = nullptr;
         int next = 0;
@@ -1311,9 +1323,11 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             }
         }
 
-        fprintf(stderr, "[minxfmr] step=%d selected id=%d logit=%f sampler=%s k=%d raw_tok='%s' preview='%s' pending_bytes=%zu pending_fragments=%zu\n",
-            t, next, chosen_logit, sampler_greedy ? "greedy" : "sample", k_use, raw_tok.c_str(), preview.c_str(), pending_bytes.size(), pending_token_buf.size());
-        fflush(stderr);
+        if (gen_verbose_enabled()) {
+            fprintf(stderr, "[minxfmr] step=%d selected id=%d logit=%f sampler=%s k=%d raw_tok='%s' preview='%s' pending_bytes=%zu pending_fragments=%zu\n",
+                t, next, chosen_logit, sampler_greedy ? "greedy" : "sample", k_use, raw_tok.c_str(), preview.c_str(), pending_bytes.size(), pending_token_buf.size());
+            fflush(stderr);
+        }
 
         if (!raw_tok.empty() && raw_tok == last_emitted_raw_tok) {
             ++repeat_run;
