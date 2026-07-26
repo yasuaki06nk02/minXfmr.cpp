@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace {
 
@@ -14,11 +15,19 @@ struct CachedDeviceBuffer {
     void* ptr = nullptr;
     size_t bytes = 0;
 };
+struct CachedDequantBuffer {
+    float* ptr = nullptr;
+    size_t rows = 0;
+    size_t cols = 0;
+    size_t src_bytes = 0;
+    DataType src_type = DataType::F32;
+};
 
 struct CudaState {
     cublasHandle_t handle = nullptr;
     bool ready = false;
     std::unordered_map<const void*, CachedDeviceBuffer> persistent;
+    std::unordered_map<const void*, CachedDequantBuffer> dequant_f32;
     std::mutex mu;
 };
 
@@ -55,6 +64,111 @@ void clear_persistent_buffers_locked(CudaState& s) {
         if (kv.second.ptr) cudaFree(kv.second.ptr);
     }
     s.persistent.clear();
+    for (auto& kv : s.dequant_f32) {
+        if (kv.second.ptr) cudaFree(kv.second.ptr);
+    }
+    s.dequant_f32.clear();
+}
+
+static float fp16_to_fp32_host(uint16_t h) {
+    uint32_t s = (h >> 15) & 1;
+    uint32_t e = (h >> 10) & 0x1f;
+    uint32_t f = h & 0x3ff;
+    uint32_t out;
+    if (e == 0) {
+        if (f == 0) {
+            out = s << 31;
+        } else {
+            e = 1;
+            while ((f & 0x400) == 0) { f <<= 1; --e; }
+            f &= 0x3ff;
+            out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+        }
+    } else if (e == 31) {
+        out = (s << 31) | 0x7f800000 | (f << 13);
+    } else {
+        out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+    }
+    float v;
+    std::memcpy(&v, &out, sizeof(v));
+    return v;
+}
+
+static inline void get_scale_min_k4_host(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+static void dequant_q4_k_block_host(const uint8_t* blk, float* dst256) {
+    uint16_t hd = 0;
+    uint16_t hm = 0;
+    std::memcpy(&hd, blk + 0, sizeof(hd));
+    std::memcpy(&hm, blk + 2, sizeof(hm));
+    const float d = fp16_to_fp32_host(hd);
+    const float dmin = fp16_to_fp32_host(hm);
+
+    const uint8_t* scales = blk + 4;
+    const uint8_t* q = blk + 16;
+
+    int is = 0;
+    for (int j = 0; j < (int)TENSOR_Q4_K_QK_K; j += 64) {
+        uint8_t sc = 0;
+        uint8_t m = 0;
+
+        get_scale_min_k4_host(is + 0, scales, sc, m);
+        const float d1 = d * sc;
+        const float m1 = dmin * m;
+
+        get_scale_min_k4_host(is + 1, scales, sc, m);
+        const float d2 = d * sc;
+        const float m2 = dmin * m;
+
+        for (int l = 0; l < 32; ++l) dst256[j + l] = d1 * (q[l] & 0xF) - m1;
+        for (int l = 0; l < 32; ++l) dst256[j + 32 + l] = d2 * (q[l] >> 4) - m2;
+
+        q += 32;
+        is += 2;
+    }
+}
+
+static void dequant_q5_0_block_host(const uint8_t* blk, float* dst32) {
+    uint16_t hd = 0;
+    std::memcpy(&hd, blk, sizeof(hd));
+    const float d = fp16_to_fp32_host(hd);
+
+    const uint8_t* qh = blk + 2;
+    const uint8_t* qs = blk + 6;
+
+    uint32_t hmask = 0;
+    hmask |= (uint32_t)qh[0];
+    hmask |= (uint32_t)qh[1] << 8;
+    hmask |= (uint32_t)qh[2] << 16;
+    hmask |= (uint32_t)qh[3] << 24;
+
+    for (int i = 0; i < 16; ++i) {
+        const uint8_t ql = qs[i];
+        const int low0 = (int)(ql & 0x0F);
+        const int low1 = (int)(ql >> 4);
+        const int high0 = (int)((hmask >> i) & 1u);
+        const int high1 = (int)((hmask >> (i + 16)) & 1u);
+        const int q0 = (high0 << 4) | low0;
+        const int q1 = (high1 << 4) | low1;
+        dst32[i] = d * (float)(q0 - 16);
+        dst32[i + 16] = d * (float)(q1 - 16);
+    }
+}
+
+static void dequant_q8_0_block_host(const uint8_t* blk, float* dst32) {
+    uint16_t hd = 0;
+    std::memcpy(&hd, blk, sizeof(hd));
+    const float d = fp16_to_fp32_host(hd);
+    const int8_t* qs = (const int8_t*)(blk + 2);
+    for (int i = 0; i < 32; ++i) dst32[i] = d * (float)qs[i];
 }
 
 __device__ __forceinline__ uint16_t load_u16(const uint8_t* p) {
@@ -157,6 +271,86 @@ __device__ __forceinline__ void dequant_q8_0_block_device(const uint8_t* blk, fl
     for (int i = 0; i < 32; ++i) dst32[i] = d * (float)qs[i];
 }
 
+__global__ void dequant_q4_k_matrix_kernel(const uint8_t* src, float* dst, size_t rows, size_t cols, size_t row_bytes) {
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t total = rows * cols;
+    if (idx >= total) return;
+
+    const size_t r = idx / cols;
+    const size_t c = idx % cols;
+
+    const size_t blk = c / TENSOR_Q4_K_QK_K;
+    const size_t within = c % TENSOR_Q4_K_QK_K;
+    const uint8_t* blk_ptr = src + r * row_bytes + blk * TENSOR_Q4_K_BLOCK_SIZE;
+
+    const float d = fp16_to_fp32_device(load_u16(blk_ptr + 0));
+    const float dmin = fp16_to_fp32_device(load_u16(blk_ptr + 2));
+    const uint8_t* scales = blk_ptr + 4;
+    const uint8_t* q = blk_ptr + 16;
+
+    const int seg = (int)(within / 64);
+    const int pos = (int)(within % 64);
+    const int is = seg * 2;
+    const uint8_t* qseg = q + seg * 32;
+
+    uint8_t sc = 0;
+    uint8_t m = 0;
+    if (pos < 32) {
+        get_scale_min_k4_device(is + 0, scales, sc, m);
+        dst[idx] = (d * (float)sc) * (float)(qseg[pos] & 0xFu) - (dmin * (float)m);
+    } else {
+        const int p = pos - 32;
+        get_scale_min_k4_device(is + 1, scales, sc, m);
+        dst[idx] = (d * (float)sc) * (float)(qseg[p] >> 4) - (dmin * (float)m);
+    }
+}
+
+__global__ void dequant_q5_0_matrix_kernel(const uint8_t* src, float* dst, size_t rows, size_t cols, size_t row_bytes) {
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t total = rows * cols;
+    if (idx >= total) return;
+
+    const size_t r = idx / cols;
+    const size_t c = idx % cols;
+
+    const size_t blk = c / TENSOR_Q5_0_QK;
+    const size_t within = c % TENSOR_Q5_0_QK;
+    const uint8_t* blk_ptr = src + r * row_bytes + blk * TENSOR_Q5_0_BLOCK_SIZE;
+
+    const float d = fp16_to_fp32_device(load_u16(blk_ptr + 0));
+    const uint8_t* qh = blk_ptr + 2;
+    const uint8_t* qs = blk_ptr + 6;
+
+    uint32_t hmask = 0;
+    hmask |= (uint32_t)qh[0];
+    hmask |= (uint32_t)qh[1] << 8;
+    hmask |= (uint32_t)qh[2] << 16;
+    hmask |= (uint32_t)qh[3] << 24;
+
+    const int wi = (int)within;
+    const int low = (wi < 16) ? (int)(qs[wi] & 0x0F) : (int)(qs[wi - 16] >> 4);
+    const int high = (int)((hmask >> wi) & 1u);
+    const int qv = (high << 4) | low;
+    dst[idx] = d * (float)(qv - 16);
+}
+
+__global__ void dequant_q8_0_matrix_kernel(const uint8_t* src, float* dst, size_t rows, size_t cols, size_t row_bytes) {
+    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t total = rows * cols;
+    if (idx >= total) return;
+
+    const size_t r = idx / cols;
+    const size_t c = idx % cols;
+
+    const size_t blk = c / TENSOR_Q8_0_QK;
+    const size_t within = c % TENSOR_Q8_0_QK;
+    const uint8_t* blk_ptr = src + r * row_bytes + blk * TENSOR_Q8_0_BLOCK_SIZE;
+
+    const float d = fp16_to_fp32_device(load_u16(blk_ptr + 0));
+    const int8_t* qs = (const int8_t*)(blk_ptr + 2);
+    dst[idx] = d * (float)qs[within];
+}
+
 bool alloc_copy_to_device(const void* src, size_t bytes, void** dst) {
     if (!src || !dst || bytes == 0) return false;
     if (cudaMalloc(dst, bytes) != cudaSuccess) return false;
@@ -197,6 +391,89 @@ bool get_or_upload_persistent(const void* src, size_t bytes, void** dst) {
 
 bool copy_to_host(void* dst, const void* src, size_t bytes) {
     return cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
+}
+bool get_or_build_persistent_dequant_f32(const Tensor* t, float** dst) {
+    if (!t || !dst || !t->data || t->bytes == 0) return false;
+    if (!(t->type == DataType::Q4_K || t->type == DataType::Q5_0 || t->type == DataType::Q8_0)) return false;
+
+    {
+        CudaState& s = state();
+        std::lock_guard<std::mutex> lock(s.mu);
+        auto it = s.dequant_f32.find(t->data);
+        if (it != s.dequant_f32.end()) {
+            const CachedDequantBuffer& e = it->second;
+            if (e.ptr && e.rows == t->rows && e.cols == t->cols && e.src_bytes == t->bytes && e.src_type == t->type) {
+                *dst = e.ptr;
+                return true;
+            }
+            if (e.ptr) cudaFree(e.ptr);
+            s.dequant_f32.erase(it);
+        }
+    }
+
+    size_t row_bytes = 0;
+    switch (t->type) {
+        case DataType::Q4_K:
+            row_bytes = tensor_q4_k_row_bytes(t->cols);
+            break;
+        case DataType::Q5_0:
+            row_bytes = tensor_q5_0_row_bytes(t->cols);
+            break;
+        case DataType::Q8_0:
+            row_bytes = tensor_q8_0_row_bytes(t->cols);
+            break;
+        default:
+            return false;
+    }
+    if (row_bytes == 0 || t->bytes < t->rows * row_bytes) return false;
+
+    std::vector<float> host(t->rows * t->cols);
+    const uint8_t* src = (const uint8_t*)t->data;
+    if (t->type == DataType::Q4_K) {
+        const size_t blocks_per_row = t->cols / TENSOR_Q4_K_QK_K;
+        for (size_t r = 0; r < t->rows; ++r) {
+            const uint8_t* rowp = src + r * row_bytes;
+            float* outp = host.data() + r * t->cols;
+            for (size_t b = 0; b < blocks_per_row; ++b) {
+                dequant_q4_k_block_host(rowp + b * TENSOR_Q4_K_BLOCK_SIZE, outp + b * TENSOR_Q4_K_QK_K);
+            }
+        }
+    } else if (t->type == DataType::Q5_0) {
+        const size_t blocks_per_row = t->cols / TENSOR_Q5_0_QK;
+        for (size_t r = 0; r < t->rows; ++r) {
+            const uint8_t* rowp = src + r * row_bytes;
+            float* outp = host.data() + r * t->cols;
+            for (size_t b = 0; b < blocks_per_row; ++b) {
+                dequant_q5_0_block_host(rowp + b * TENSOR_Q5_0_BLOCK_SIZE, outp + b * TENSOR_Q5_0_QK);
+            }
+        }
+    } else {
+        const size_t blocks_per_row = t->cols / TENSOR_Q8_0_QK;
+        for (size_t r = 0; r < t->rows; ++r) {
+            const uint8_t* rowp = src + r * row_bytes;
+            float* outp = host.data() + r * t->cols;
+            for (size_t b = 0; b < blocks_per_row; ++b) {
+                dequant_q8_0_block_host(rowp + b * TENSOR_Q8_0_BLOCK_SIZE, outp + b * TENSOR_Q8_0_QK);
+            }
+        }
+    }
+
+    float* dF = nullptr;
+    const size_t total = t->rows * t->cols;
+    if (cudaMalloc((void**)&dF, total * sizeof(float)) != cudaSuccess) return false;
+
+    if (cudaMemcpy(dF, host.data(), total * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(dF);
+        return false;
+    }
+
+    {
+        CudaState& s = state();
+        std::lock_guard<std::mutex> lock(s.mu);
+        s.dequant_f32[t->data] = CachedDequantBuffer{dF, t->rows, t->cols, t->bytes, t->type};
+    }
+    *dst = dF;
+    return true;
 }
 
 template <size_t BlockElems, size_t BlockSize>
@@ -415,7 +692,6 @@ bool cuda_backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
         }
         if (cudaMalloc(&dC, m * n * sizeof(float)) != cudaSuccess) {
             cudaFree(dA);
-            cudaFree(dB);
             return false;
         }
 
@@ -446,64 +722,40 @@ bool cuda_backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
 
     if (!cuda_quant_kernels_enabled()) return false;
 
-    size_t row_bytes = 0;
-    size_t block_elems = 0;
-    size_t block_bytes = 0;
-
-    switch (B->type) {
-        case DataType::Q4_K:
-            row_bytes = tensor_q4_k_row_bytes(n);
-            block_elems = TENSOR_Q4_K_QK_K;
-            block_bytes = TENSOR_Q4_K_BLOCK_SIZE;
-            break;
-        case DataType::Q5_0:
-            row_bytes = tensor_q5_0_row_bytes(n);
-            block_elems = TENSOR_Q5_0_QK;
-            block_bytes = TENSOR_Q5_0_BLOCK_SIZE;
-            break;
-        case DataType::Q8_0:
-            row_bytes = tensor_q8_0_row_bytes(n);
-            block_elems = TENSOR_Q8_0_QK;
-            block_bytes = TENSOR_Q8_0_BLOCK_SIZE;
-            break;
-        default:
-            return false;
-    }
-
-    if (row_bytes == 0 || (n % block_elems) != 0) return false;
-    if (B->bytes < B->rows * row_bytes) return false;
+    if (B->type != DataType::Q4_K && B->type != DataType::Q5_0 && B->type != DataType::Q8_0) return false;
 
     void* dA = nullptr;
-    void* dB = nullptr;
+    float* dBf = nullptr;
     void* dC = nullptr;
     if (!alloc_copy_to_device(A->data, A->bytes, &dA)) return false;
-    if (!get_or_upload_persistent(B->data, B->bytes, &dB)) {
+    if (!get_or_build_persistent_dequant_f32(B, &dBf)) {
         cudaFree(dA);
         return false;
     }
     if (cudaMalloc(&dC, m * n * sizeof(float)) != cudaSuccess) {
         cudaFree(dA);
-        cudaFree(dB);
         return false;
     }
 
-    dim3 block(16, 16);
-    dim3 grid((unsigned int)((n + block.x - 1) / block.x), (unsigned int)((m + block.y - 1) / block.y));
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    cublasStatus_t st = cublasSgemm(
+        state().handle,
+        CUBLAS_OP_N,
+        CUBLAS_OP_N,
+        (int)n,
+        (int)m,
+        (int)k,
+        &alpha,
+        (const float*)dBf,
+        (int)n,
+        (const float*)dA,
+        (int)k,
+        &beta,
+        (float*)dC,
+        (int)n);
 
-    if (B->type == DataType::Q4_K) {
-        matmul_quant_kernel<TENSOR_Q4_K_QK_K, TENSOR_Q4_K_BLOCK_SIZE><<<grid, block>>>(
-            (const float*)dA, (const uint8_t*)dB, (float*)dC, m, n, k, row_bytes);
-    } else if (B->type == DataType::Q5_0) {
-        matmul_quant_kernel<TENSOR_Q5_0_QK, TENSOR_Q5_0_BLOCK_SIZE><<<grid, block>>>(
-            (const float*)dA, (const uint8_t*)dB, (float*)dC, m, n, k, row_bytes);
-    } else {
-        matmul_quant_kernel<TENSOR_Q8_0_QK, TENSOR_Q8_0_BLOCK_SIZE><<<grid, block>>>(
-            (const float*)dA, (const uint8_t*)dB, (float*)dC, m, n, k, row_bytes);
-    }
-
-    bool ok = (cudaGetLastError() == cudaSuccess) &&
-              (cudaDeviceSynchronize() == cudaSuccess) &&
-              copy_to_host(out->data, dC, m * n * sizeof(float));
+    bool ok = (st == CUBLAS_STATUS_SUCCESS) && copy_to_host(out->data, dC, m * n * sizeof(float));
 
     cudaFree(dA);
     cudaFree(dC);
@@ -533,7 +785,6 @@ bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor
         }
         if (cudaMalloc(&dC, m * n * sizeof(float)) != cudaSuccess) {
             cudaFree(dA);
-            cudaFree(dB);
             return false;
         }
 
@@ -558,60 +809,31 @@ bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor
 
     if (!cuda_quant_kernels_enabled()) return false;
 
-    size_t row_bytes = 0;
-    size_t block_elems = 0;
-    size_t block_bytes = 0;
-
-    switch (B->type) {
-        case DataType::Q4_K:
-            row_bytes = tensor_q4_k_row_bytes(k);
-            block_elems = TENSOR_Q4_K_QK_K;
-            block_bytes = TENSOR_Q4_K_BLOCK_SIZE;
-            break;
-        case DataType::Q5_0:
-            row_bytes = tensor_q5_0_row_bytes(k);
-            block_elems = TENSOR_Q5_0_QK;
-            block_bytes = TENSOR_Q5_0_BLOCK_SIZE;
-            break;
-        case DataType::Q8_0:
-            row_bytes = tensor_q8_0_row_bytes(k);
-            block_elems = TENSOR_Q8_0_QK;
-            block_bytes = TENSOR_Q8_0_BLOCK_SIZE;
-            break;
-        default:
-            return false;
-    }
-
-    if (row_bytes == 0 || (k % block_elems) != 0) return false;
-    if (B->bytes < B->rows * row_bytes) return false;
+    if (B->type != DataType::Q4_K && B->type != DataType::Q5_0 && B->type != DataType::Q8_0) return false;
 
     void* dA = nullptr;
-    void* dB = nullptr;
+    float* dBf = nullptr;
     void* dC = nullptr;
     if (!alloc_copy_to_device(A->data, A->bytes, &dA)) return false;
-    if (!get_or_upload_persistent(B->data, B->bytes, &dB)) {
+    if (!get_or_build_persistent_dequant_f32(B, &dBf)) {
         cudaFree(dA);
         return false;
     }
     if (cudaMalloc(&dC, m * n * sizeof(float)) != cudaSuccess) {
         cudaFree(dA);
-        cudaFree(dB);
         return false;
     }
 
     dim3 block(16, 16);
     dim3 grid((unsigned int)((n + block.x - 1) / block.x), (unsigned int)((m + block.y - 1) / block.y));
 
-    if (B->type == DataType::Q4_K) {
-        matmul_rhs_quant_kernel<TENSOR_Q4_K_QK_K, TENSOR_Q4_K_BLOCK_SIZE><<<grid, block>>>(
-            (const float*)dA, (const uint8_t*)dB, (float*)dC, m, n, k, row_bytes);
-    } else if (B->type == DataType::Q5_0) {
-        matmul_rhs_quant_kernel<TENSOR_Q5_0_QK, TENSOR_Q5_0_BLOCK_SIZE><<<grid, block>>>(
-            (const float*)dA, (const uint8_t*)dB, (float*)dC, m, n, k, row_bytes);
-    } else {
-        matmul_rhs_quant_kernel<TENSOR_Q8_0_QK, TENSOR_Q8_0_BLOCK_SIZE><<<grid, block>>>(
-            (const float*)dA, (const uint8_t*)dB, (float*)dC, m, n, k, row_bytes);
-    }
+    matmul_rhs_transposed_kernel<<<grid, block>>>(
+        (const float*)dA,
+        (const float*)dBf,
+        (float*)dC,
+        m,
+        n,
+        k);
 
     bool ok = (cudaGetLastError() == cudaSuccess) &&
               (cudaDeviceSynchronize() == cudaSuccess) &&
