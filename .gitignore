@@ -1,5 +1,8 @@
 # Ignore build artifacts
+# top-level CMake build dir
 /build/
+# Ignore other generated build directories (e.g. build_vs_cuda_test/)
+build*/
 
 # Visual Studio
 .vs/
