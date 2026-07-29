@@ -347,6 +347,13 @@ bool backend_preload_tensor(const Tensor* t) {
     return false;
 }
 
+const char* backend_last_preload_error() {
+#if defined(MINXFMR_ENABLE_CUDA)
+    if (g_backend_kind == BackendKind::CUDA) return cuda_backend_last_error_msg();
+#endif
+    return "";
+}
+
 void backend_release_resources() {
 #if defined(MINXFMR_ENABLE_CUDA)
     cuda_backend_release_resources();

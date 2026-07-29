@@ -8,6 +8,7 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#include <string>
 
 namespace {
 
@@ -29,6 +30,7 @@ struct CudaState {
     std::unordered_map<const void*, CachedDeviceBuffer> persistent;
     std::unordered_map<const void*, CachedDequantBuffer> dequant_f32;
     std::mutex mu;
+    std::string last_error;
 };
 
 CudaState& state() {
@@ -378,8 +380,13 @@ bool get_or_upload_persistent(const void* src, size_t bytes, void** dst) {
     }
 
     void* d = nullptr;
-    if (cudaMalloc(&d, bytes) != cudaSuccess) return false;
+    if (cudaMalloc(&d, bytes) != cudaSuccess) {
+        // record a helpful error message for diagnostics
+        state().last_error = std::string("cudaMalloc failed allocating ") + std::to_string(bytes) + " bytes";
+        return false;
+    }
     if (cudaMemcpy(d, src, bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        state().last_error = std::string("cudaMemcpy (HostToDevice) failed for ") + std::to_string(bytes) + " bytes";
         cudaFree(d);
         return false;
     }
@@ -985,4 +992,11 @@ bool cuda_backend_vec_mul_rows_cols(const float* vec, const float* mat_rows, flo
     cudaFree(dMat);
     cudaFree(dOut);
     return ok;
+}
+
+const char* cuda_backend_last_error_msg() {
+    CudaState& s = state();
+    std::lock_guard<std::mutex> lock(s.mu);
+    if (s.last_error.empty()) return "";
+    return s.last_error.c_str();
 }

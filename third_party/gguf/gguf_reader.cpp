@@ -2,6 +2,26 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <fstream>
+#include <thread>
+#include <algorithm>
+
+// Determine thread count used for dequant work.
+static size_t gguf_choose_thread_count(size_t rows) {
+    unsigned int hw = std::thread::hardware_concurrency();
+    size_t hwc = hw > 0 ? (size_t)hw : 1;
+    const char* env = std::getenv("MINXFMR_NUM_THREADS");
+    size_t req = hwc;
+    if (env) {
+        try {
+            size_t v = std::stoul(env);
+            if (v > 0) req = std::min<size_t>(v, hwc);
+        } catch(...) { /* ignore parse errors */ }
+    }
+    if (req > rows) req = rows;
+    if (req == 0) req = 1;
+    return req;
+}
 
 static bool rd_u32(const std::vector<uint8_t>& d, size_t& p, uint32_t& out) {
     if (p + 4 > d.size()) return false;
@@ -37,6 +57,53 @@ static bool rd_str(const std::vector<uint8_t>& d, size_t& p, std::string& s) {
     if (!rd_u64(d, p, n)) return false;
     if (p + n > d.size()) return false;
     s.assign((const char*)d.data() + p, (size_t)n);
+    // Detect and decode UTF-16LE encoded strings (common in some GGUF metadata).
+    auto looks_like_utf16le = [](const std::string &str)->bool{
+        if (str.size() < 2) return false;
+        // BOM 0xFF 0xFE indicates UTF-16LE
+        if ((unsigned char)str[0] == 0xFF && (unsigned char)str[1] == 0xFE) return true;
+        // Heuristic: if many odd bytes are zero, likely UTF-16LE
+        size_t zeros = 0; size_t checks = 0;
+        for (size_t i = 1; i + 1 < str.size() && checks < 64; i += 2, ++checks) {
+            if ((unsigned char)str[i] == 0x00) ++zeros;
+        }
+        return (checks > 0 && zeros * 2 >= checks);
+    };
+
+    if (looks_like_utf16le(s)) {
+        std::string out;
+        size_t i = 0;
+        // skip BOM if present
+        if (s.size() >= 2 && (unsigned char)s[0] == 0xFF && (unsigned char)s[1] == 0xFE) i = 2;
+        while (i + 1 < s.size()) {
+            uint16_t cu = (uint8_t)s[i] | ((uint8_t)s[i+1] << 8);
+            i += 2;
+            // handle surrogate pairs
+            if (cu >= 0xD800 && cu <= 0xDBFF && i + 1 < s.size()) {
+                uint16_t cu2 = (uint8_t)s[i] | ((uint8_t)s[i+1] << 8);
+                i += 2;
+                uint32_t codepoint = 0x10000 + (((uint32_t)(cu - 0xD800) << 10) | (uint32_t)(cu2 - 0xDC00));
+                // encode to UTF-8
+                out.push_back((char)(0xF0 | ((codepoint >> 18) & 0x07)));
+                out.push_back((char)(0x80 | ((codepoint >> 12) & 0x3F)));
+                out.push_back((char)(0x80 | ((codepoint >> 6) & 0x3F)));
+                out.push_back((char)(0x80 | (codepoint & 0x3F)));
+            } else {
+                uint32_t codepoint = cu;
+                if (codepoint <= 0x7F) {
+                    out.push_back((char)codepoint);
+                } else if (codepoint <= 0x7FF) {
+                    out.push_back((char)(0xC0 | ((codepoint >> 6) & 0x1F)));
+                    out.push_back((char)(0x80 | (codepoint & 0x3F)));
+                } else {
+                    out.push_back((char)(0xE0 | ((codepoint >> 12) & 0x0F)));
+                    out.push_back((char)(0x80 | ((codepoint >> 6) & 0x3F)));
+                    out.push_back((char)(0x80 | (codepoint & 0x3F)));
+                }
+            }
+        }
+        s.swap(out);
+    }
     p += (size_t)n;
     return true;
 }
@@ -147,15 +214,15 @@ static float fp16_to_fp32(uint16_t h) {
 // and a basic Q4_K_M dequant path (adapted from open-source implementations).
 
 bool gguf_open(const char* path, GGUF_File& out) {
-    FILE* f = fopen(path, "rb");
-    if (!f) return false;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
-    long sz = ftell(f);
-    if (sz <= 0) { fclose(f); return false; }
-    rewind(f);
-    out.data.resize(sz);
-    if ((long)fread(out.data.data(), 1, sz, f) != sz) { fclose(f); return false; }
-    fclose(f);
+    // Use std::ifstream to support files larger than 2GB (portable 64-bit file sizes)
+    std::ifstream ifs(path, std::ios::binary | std::ios::ate);
+    if (!ifs) return false;
+    std::streamsize sz = ifs.tellg();
+    if (sz <= 0) return false;
+    ifs.seekg(0, std::ios::beg);
+    out.data.resize((size_t)sz);
+    if (!ifs.read((char*)out.data.data(), sz)) return false;
+    ifs.close();
     out.path = path;
     out.tensors.clear();
     out.vocab_tokens.clear();
@@ -235,15 +302,26 @@ bool gguf_open(const char* path, GGUF_File& out) {
             uint64_t n = 0;
             if (!rd_u32(out.data, p, elem_t)) return false;
             if (!rd_u64(out.data, p, n)) return false;
-            if (key == "tokenizer.ggml.tokens" && elem_t == 8) {
-                out.vocab_tokens.clear();
-                out.vocab_tokens.reserve((size_t)n);
-                for (uint64_t k = 0; k < n; ++k) {
-                    std::string tok;
-                    if (!rd_str(out.data, p, tok)) return false;
-                    out.vocab_tokens.push_back(tok);
+            // debug: print metadata key/type for diagnosis
+            std::fprintf(stderr, "[gguf] meta key='%s' type=%u elem_t=%u n=%llu\n", key.c_str(), t, elem_t, (unsigned long long)n);
+            // Accept common metadata key suffixes for greater compatibility with varied GGUF files.
+            if (key_matches_meta(key, "tokens") && elem_t == 8) {
+                // Read up to a configurable limit of tokens to avoid long stalls on huge vocabularies.
+                const char* env = std::getenv("MINXFMR_VOCAB_READ_LIMIT");
+                size_t max_read = 1000;
+                if (env) {
+                    try { max_read = std::stoul(env); } catch(...) { max_read = 1000; }
                 }
-            } else if (key == "tokenizer.ggml.scores" && (elem_t == 6 || elem_t == 12)) {
+                out.vocab_tokens.clear();
+                out.vocab_tokens.reserve((size_t)std::min<uint64_t>(n, max_read));
+                std::string tmp;
+                for (uint64_t k = 0; k < n; ++k) {
+                    if (!rd_str(out.data, p, tmp)) return false;
+                    if (k < max_read) out.vocab_tokens.push_back(tmp);
+                }
+                // expose reported vocab size
+                out.vocab_size = (uint64_t)n;
+            } else if (key_matches_meta(key, "scores") && (elem_t == 6 || elem_t == 12)) {
                 out.vocab_scores.clear();
                 out.vocab_scores.reserve((size_t)n);
                 for (uint64_t k = 0; k < n; ++k) {
@@ -261,7 +339,7 @@ bool gguf_open(const char* path, GGUF_File& out) {
                         out.vocab_scores.push_back((float)dv);
                     }
                 }
-            } else if (key == "tokenizer.ggml.token_type" && (elem_t == 0 || elem_t == 1 || elem_t == 2 || elem_t == 3 || elem_t == 4 || elem_t == 5 || elem_t == 10 || elem_t == 11)) {
+            } else if (key_matches_meta(key, "token_type") && (elem_t == 0 || elem_t == 1 || elem_t == 2 || elem_t == 3 || elem_t == 4 || elem_t == 5 || elem_t == 10 || elem_t == 11)) {
                 out.vocab_types.clear();
                 out.vocab_types.reserve((size_t)n);
                 for (uint64_t k = 0; k < n; ++k) {
@@ -666,48 +744,151 @@ bool gguf_dequant_q6_k(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*&
     const uint8_t* src = f.data.data() + info.offset;
     float* dst = (float*)out->data;
 
-    for (uint32_t r = 0; r < rows; ++r) {
-        float* row_dst = dst + (size_t)r * cols;
-        const uint8_t* row_src = src + (size_t)r * blocks_per_row * BLOCK_SIZE;
+    auto worker = [&](uint32_t r0, uint32_t r1){
+        for (uint32_t r = r0; r < r1; ++r) {
+            float* row_dst = dst + (size_t)r * cols;
+            const uint8_t* row_src = src + (size_t)r * blocks_per_row * BLOCK_SIZE;
 
-        for (size_t b = 0; b < blocks_per_row; ++b) {
-            const uint8_t* blk = row_src + b * BLOCK_SIZE;
+            for (size_t b = 0; b < blocks_per_row; ++b) {
+                const uint8_t* blk = row_src + b * BLOCK_SIZE;
 
-            const uint8_t* ql = blk;
-            const uint8_t* qh = blk + (QK_K / 2);
-            const int8_t* scales = (const int8_t*)(blk + (QK_K / 2) + (QK_K / 4));
-            const float d = rd_f16_at(blk + (QK_K / 2) + (QK_K / 4) + (QK_K / 16));
+                const uint8_t* ql = blk;
+                const uint8_t* qh = blk + (QK_K / 2);
+                const int8_t* scales = (const int8_t*)(blk + (QK_K / 2) + (QK_K / 4));
+                const float d = rd_f16_at(blk + (QK_K / 2) + (QK_K / 4) + (QK_K / 16));
 
-            float* block_dst = row_dst + b * QK_K;
+                float* block_dst = row_dst + b * QK_K;
 
-            const uint8_t* ql_it = ql;
-            const uint8_t* qh_it = qh;
-            const int8_t* sc_it = scales;
-            float* y = block_dst;
+                const uint8_t* ql_it = ql;
+                const uint8_t* qh_it = qh;
+                const int8_t* sc_it = scales;
+                float* y = block_dst;
 
-            for (int n = 0; n < (int)QK_K; n += 128) {
-                for (int l = 0; l < 32; ++l) {
-                    const int is = l / 16;
-                    const int8_t q1 = (int8_t)((ql_it[l + 0] & 0xF) | (((qh_it[l] >> 0) & 3) << 4)) - 32;
-                    const int8_t q2 = (int8_t)((ql_it[l + 32] & 0xF) | (((qh_it[l] >> 2) & 3) << 4)) - 32;
-                    const int8_t q3 = (int8_t)((ql_it[l + 0] >> 4) | (((qh_it[l] >> 4) & 3) << 4)) - 32;
-                    const int8_t q4 = (int8_t)((ql_it[l + 32] >> 4) | (((qh_it[l] >> 6) & 3) << 4)) - 32;
+                for (int n = 0; n < (int)QK_K; n += 128) {
+                    for (int l = 0; l < 32; ++l) {
+                        const int is = l / 16;
+                        const int8_t q1 = (int8_t)((ql_it[l + 0] & 0xF) | (((qh_it[l] >> 0) & 3) << 4)) - 32;
+                        const int8_t q2 = (int8_t)((ql_it[l + 32] & 0xF) | (((qh_it[l] >> 2) & 3) << 4)) - 32;
+                        const int8_t q3 = (int8_t)((ql_it[l + 0] >> 4) | (((qh_it[l] >> 4) & 3) << 4)) - 32;
+                        const int8_t q4 = (int8_t)((ql_it[l + 32] >> 4) | (((qh_it[l] >> 6) & 3) << 4)) - 32;
 
-                    y[l + 0] = d * sc_it[is + 0] * q1;
-                    y[l + 32] = d * sc_it[is + 2] * q2;
-                    y[l + 64] = d * sc_it[is + 4] * q3;
-                    y[l + 96] = d * sc_it[is + 6] * q4;
+                        y[l + 0] = d * sc_it[is + 0] * q1;
+                        y[l + 32] = d * sc_it[is + 2] * q2;
+                        y[l + 64] = d * sc_it[is + 4] * q3;
+                        y[l + 96] = d * sc_it[is + 6] * q4;
+                    }
+
+                    y += 128;
+                    ql_it += 64;
+                    qh_it += 32;
+                    sc_it += 8;
                 }
-
-                y += 128;
-                ql_it += 64;
-                qh_it += 32;
-                sc_it += 8;
             }
         }
+    };
+
+    unsigned int hw = std::thread::hardware_concurrency();
+    size_t nthreads = gguf_choose_thread_count(rows);
+    std::fprintf(stderr, "[gguf] dequant_q6_k rows=%u hw=%u threads=%zu\n", rows, hw, nthreads);
+    if (nthreads <= 1) {
+        worker(0, rows);
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(nthreads);
+        uint32_t base = rows / (uint32_t)nthreads;
+        uint32_t rem = rows % (uint32_t)nthreads;
+        uint32_t cur = 0;
+        for (size_t ti = 0; ti < nthreads; ++ti) {
+            uint32_t take = base + (ti < rem ? 1 : 0);
+            uint32_t start = cur;
+            uint32_t end = cur + take;
+            threads.emplace_back([worker, start, end]() { worker(start, end); });
+            cur = end;
+        }
+        for (auto& th : threads) th.join();
     }
 
     return true;
+}
+
+bool gguf_dequant_q1_0(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out) {
+    out = nullptr;
+    // GGUF q1_0 is not standardized across exporters; we implement safe heuristics:
+    // 1) If stored bytes == rows*cols -> one byte per element (0..255)
+    // 2) If stored bytes == rows*((cols+7)/8) -> packed bits (LSB first) -> 0/1
+    if (info.ggml_type != 41) return false;
+
+    const uint32_t rows = info.rows;
+    const uint32_t cols = info.cols;
+    const size_t need = (size_t)info.nbytes;
+    if (rows == 0 || cols == 0) return false;
+
+    const uint8_t* src = f.data.data() + info.offset;
+
+    // Case 1: one byte per element
+    if (need == (size_t)rows * (size_t)cols) {
+        out = tensor_create_f32(rows, cols);
+        if (!out) return false;
+        float* dst = (float*)out->data;
+        size_t nthreads = gguf_choose_thread_count(rows);
+        unsigned int hw = std::thread::hardware_concurrency();
+        std::fprintf(stderr, "[gguf] q1_0 onebyte rows=%u hw=%u threads=%zu\n", rows, hw, nthreads);
+        auto worker = [&](uint32_t r0, uint32_t r1){
+            for (uint32_t r = r0; r < r1; ++r) {
+                const uint8_t* row_src = src + (size_t)r * cols;
+                float* row_dst = dst + (size_t)r * cols;
+                for (uint32_t c = 0; c < cols; ++c) row_dst[c] = (float)row_src[c];
+            }
+        };
+        if (nthreads <= 1) worker(0, rows);
+        else {
+            std::vector<std::thread> threads; threads.reserve(nthreads);
+            uint32_t base = rows / (uint32_t)nthreads; uint32_t rem = rows % (uint32_t)nthreads; uint32_t cur = 0;
+            for (size_t ti = 0; ti < nthreads; ++ti) {
+                uint32_t take = base + (ti < rem ? 1 : 0);
+                uint32_t s = cur; uint32_t e = cur + take; cur = e;
+                threads.emplace_back([worker,s,e](){ worker(s,e); });
+            }
+            for (auto& th : threads) th.join();
+        }
+        return true;
+    }
+
+    // Case 2: packed bits per element
+    size_t bits_per_row_bytes = (cols + 7) / 8;
+    if (need == (size_t)rows * bits_per_row_bytes) {
+        out = tensor_create_f32(rows, cols);
+        if (!out) return false;
+        float* dst = (float*)out->data;
+        auto worker = [&](uint32_t r0, uint32_t r1){
+            for (uint32_t r = r0; r < r1; ++r) {
+                const uint8_t* row_src = src + (size_t)r * bits_per_row_bytes;
+                float* row_dst = dst + (size_t)r * cols;
+                for (uint32_t c = 0; c < cols; ++c) {
+                    size_t b = c / 8; int bit = c % 8;
+                    uint8_t v = (row_src[b] >> bit) & 1u;
+                    row_dst[c] = v ? 1.0f : 0.0f;
+                }
+            }
+        };
+        unsigned int hw = std::thread::hardware_concurrency();
+        size_t nthreads = gguf_choose_thread_count(rows);
+        std::fprintf(stderr, "[gguf] q1_0 bytes-per-element rows=%u hw=%u threads=%zu\n", rows, hw, nthreads);
+        if (nthreads <= 1) worker(0, rows);
+        else {
+            std::vector<std::thread> threads; threads.reserve(nthreads);
+            uint32_t base = rows / (uint32_t)nthreads; uint32_t rem = rows % (uint32_t)nthreads; uint32_t cur = 0;
+            for (size_t ti = 0; ti < nthreads; ++ti) {
+                uint32_t take = base + (ti < rem ? 1 : 0);
+                uint32_t s = cur; uint32_t e = cur + take; cur = e;
+                threads.emplace_back([worker,s,e](){ worker(s,e); });
+            }
+            for (auto& th : threads) th.join();
+        }
+        return true;
+    }
+
+    return false;
 }
 
 bool gguf_read_tensor(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out) {
@@ -719,6 +900,7 @@ bool gguf_read_tensor(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& 
     if (gguf_dequant_q8_0(f, info, out)) return true;
     if (gguf_dequant_q4_k_m(f, info, out)) return true;
     if (gguf_dequant_q6_k(f, info, out)) return true;
+    if (gguf_dequant_q1_0(f, info, out)) return true;
     // Unsupported type
     out = nullptr;
     return false;

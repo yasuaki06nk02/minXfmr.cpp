@@ -1,5 +1,6 @@
 #include "gguf_loader.h"
 #include "../../third_party/gguf/gguf_reader.h"
+#include "../backend/backend_runtime.h"
 #include <cstdio>
 #include <vector>
 #include <cstdint>
@@ -71,10 +72,36 @@ bool gguf_try_load_projections_for_layer(const char* path, int layer, Tensor*& o
             if (strcmp(tag, "Wv")==0) { gguf_last_name_Wv = info.name; gguf_last_rows_Wv = info.rows; gguf_last_cols_Wv = info.cols; }
             float minv,maxv; double mean; gguf_tensor_stats(t,minv,maxv,mean);
             fprintf(stderr, "[gguf] loaded %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n", tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+            // If CUDA backend is active, upload tensor to GPU persistent storage.
+            if (backend_using_cuda()) {
+                if (backend_preload_tensor(t)) {
+                    fprintf(stderr, "[gguf] uploaded %s to CUDA persistent storage\n", tag);
+                } else {
+                    const char* err = backend_last_preload_error();
+                    if (!err || !err[0]) err = "(no backend error message)";
+                    fprintf(stderr, "[gguf] failed to upload %s to CUDA; keeping host copy (tensor remains in CPU RAM)\n", tag);
+                    fprintf(stderr, "[gguf]   upload failure reason: %s\n", err);
+                }
+            }
             out = t;
             return;
         }
+        // Provide richer diagnostics when a tensor's type is unsupported.
         fprintf(stderr, "[gguf] found %s tensor '%s' but type '%s' is not yet supported\n", tag, info.name.c_str(), info.dtype.c_str());
+        fprintf(stderr, "[gguf]   info: offset=%llu nbytes=%llu rows=%u cols=%u ggml_type=%u\n",
+            (unsigned long long)info.offset, (unsigned long long)info.nbytes, info.rows, info.cols, info.ggml_type);
+        // Dump a short hex preview of the tensor's first bytes (if available) to aid debugging.
+        size_t preview = 32;
+        if (info.nbytes < preview) preview = (size_t)info.nbytes;
+        if (preview > 0 && info.offset + preview <= gf.data.size()) {
+            fprintf(stderr, "[gguf]   first %zu bytes:\n    ", preview);
+            for (size_t i = 0; i < preview; ++i) {
+                fprintf(stderr, "%02X", gf.data[info.offset + i]);
+                if ((i+1) % 16 == 0 && i+1 < preview) fprintf(stderr, "\n    ");
+                else if (i+1 < preview) fprintf(stderr, " ");
+            }
+            fprintf(stderr, "\n");
+        }
     };
 
     const auto q_names = make_candidates('q');

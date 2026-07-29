@@ -31,6 +31,10 @@ bool backend_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* o
 // Returns false when tensor is invalid or backend cannot preload it.
 bool backend_preload_tensor(const Tensor* t);
 
+// Returns a human-readable message describing the last preload/upload failure
+// from the backend (empty string when none). Useful for diagnostic logs.
+const char* backend_last_preload_error();
+
 // Release backend-side persistent resources (e.g., CUDA weight cache).
 void backend_release_resources();
 

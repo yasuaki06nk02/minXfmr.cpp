@@ -709,6 +709,9 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         size_t loaded_norm_layers = 0;
         size_t loaded_ffn_layers = 0;
         for (size_t l = 0; l < ctx->n_layer; ++l) {
+            // progress: report per-layer percentage so users see loading progress
+            int percent = (int)(((double)(l) / (double)ctx->n_layer) * 100.0);
+            fprintf(stderr, "[minxfmr] loading layers %zu/%zu (%d%%)\n", l, ctx->n_layer, percent);
             Tensor* lq = nullptr;
             Tensor* lk = nullptr;
             Tensor* lv = nullptr;
@@ -753,6 +756,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 loaded_ffn_layers++;
             }
         }
+        fprintf(stderr, "[minxfmr] model load complete (100%%)\n");
         if (loaded_attn_layers > 0) {
             fprintf(stderr, "[minxfmr] loaded per-layer projections: %zu/%zu layers\n", loaded_attn_layers, ctx->n_layer);
             for (size_t i = 0; i < ctx->Wq_layers.size(); ++i) {

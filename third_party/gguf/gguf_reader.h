@@ -68,6 +68,9 @@ bool gguf_dequant_q5_0(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*&
 bool gguf_dequant_q8_0(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out);
 bool gguf_dequant_q4_k_m(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out);
 bool gguf_dequant_q6_k(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out);
+// Best-effort loader for q1_0 tensors. Attempts to expand packed/byte-backed q1_0
+// into an F32 tensor using safe heuristics so models with q1_0 can be read.
+bool gguf_dequant_q1_0(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out);
 // Unified tensor loader: reads a tensor and returns a newly-allocated Tensor* in `out`.
 // Handles f32/f16 and supported quantized formats by delegating to dequant routines.
 bool gguf_read_tensor(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*& out);

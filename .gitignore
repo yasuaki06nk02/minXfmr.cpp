@@ -100,3 +100,5 @@ desktop.ini
 
 # Ignore result mask JSON logs generated during experiments
 result_mask*.json
+bonsai_gguf.ps1
+extract_head.txt
