@@ -60,6 +60,8 @@ pip-wheel-metadata/
 # Logs and search artifacts
 *.log
 *.err
+chat_*.txt
+*_verbose*.txt
 std*.txt
 run.log
 run.err

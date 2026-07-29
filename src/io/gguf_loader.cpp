@@ -72,10 +72,10 @@ bool gguf_try_load_projections_for_layer(const char* path, int layer, Tensor*& o
             if (strcmp(tag, "Wv")==0) { gguf_last_name_Wv = info.name; gguf_last_rows_Wv = info.rows; gguf_last_cols_Wv = info.cols; }
             float minv,maxv; double mean; gguf_tensor_stats(t,minv,maxv,mean);
             fprintf(stderr, "[gguf] loaded %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n", tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
-            // If CUDA backend is active, upload tensor to GPU persistent storage.
+            // If CUDA backend is active, warm backend-side CUDA caches for this tensor.
             if (backend_using_cuda()) {
                 if (backend_preload_tensor(t)) {
-                    fprintf(stderr, "[gguf] uploaded %s to CUDA persistent storage\n", tag);
+                    fprintf(stderr, "[gguf] preloaded %s for CUDA execution\n", tag);
                 } else {
                     const char* err = backend_last_preload_error();
                     if (!err || !err[0]) err = "(no backend error message)";

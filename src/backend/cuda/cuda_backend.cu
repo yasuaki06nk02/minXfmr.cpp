@@ -49,6 +49,17 @@ bool cuda_quant_kernels_enabled() {
     return mode == 1;
 }
 
+bool cuda_quant_parity_mode_enabled() {
+    static int mode = -1;
+    if (mode >= 0) return mode == 1;
+    const char* v = std::getenv("MINXFMR_CUDA_QUANT_PARITY");
+    mode = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
+    if (mode == 1) {
+        std::fprintf(stderr, "[cuda] quantized matmul parity mode enabled; dequantizing weights to F32 device cache for CPU parity\n");
+    }
+    return mode == 1;
+}
+
 bool ensure_ready() {
     CudaState& s = state();
     if (s.ready) return true;
@@ -273,86 +284,6 @@ __device__ __forceinline__ void dequant_q8_0_block_device(const uint8_t* blk, fl
     for (int i = 0; i < 32; ++i) dst32[i] = d * (float)qs[i];
 }
 
-__global__ void dequant_q4_k_matrix_kernel(const uint8_t* src, float* dst, size_t rows, size_t cols, size_t row_bytes) {
-    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t total = rows * cols;
-    if (idx >= total) return;
-
-    const size_t r = idx / cols;
-    const size_t c = idx % cols;
-
-    const size_t blk = c / TENSOR_Q4_K_QK_K;
-    const size_t within = c % TENSOR_Q4_K_QK_K;
-    const uint8_t* blk_ptr = src + r * row_bytes + blk * TENSOR_Q4_K_BLOCK_SIZE;
-
-    const float d = fp16_to_fp32_device(load_u16(blk_ptr + 0));
-    const float dmin = fp16_to_fp32_device(load_u16(blk_ptr + 2));
-    const uint8_t* scales = blk_ptr + 4;
-    const uint8_t* q = blk_ptr + 16;
-
-    const int seg = (int)(within / 64);
-    const int pos = (int)(within % 64);
-    const int is = seg * 2;
-    const uint8_t* qseg = q + seg * 32;
-
-    uint8_t sc = 0;
-    uint8_t m = 0;
-    if (pos < 32) {
-        get_scale_min_k4_device(is + 0, scales, sc, m);
-        dst[idx] = (d * (float)sc) * (float)(qseg[pos] & 0xFu) - (dmin * (float)m);
-    } else {
-        const int p = pos - 32;
-        get_scale_min_k4_device(is + 1, scales, sc, m);
-        dst[idx] = (d * (float)sc) * (float)(qseg[p] >> 4) - (dmin * (float)m);
-    }
-}
-
-__global__ void dequant_q5_0_matrix_kernel(const uint8_t* src, float* dst, size_t rows, size_t cols, size_t row_bytes) {
-    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t total = rows * cols;
-    if (idx >= total) return;
-
-    const size_t r = idx / cols;
-    const size_t c = idx % cols;
-
-    const size_t blk = c / TENSOR_Q5_0_QK;
-    const size_t within = c % TENSOR_Q5_0_QK;
-    const uint8_t* blk_ptr = src + r * row_bytes + blk * TENSOR_Q5_0_BLOCK_SIZE;
-
-    const float d = fp16_to_fp32_device(load_u16(blk_ptr + 0));
-    const uint8_t* qh = blk_ptr + 2;
-    const uint8_t* qs = blk_ptr + 6;
-
-    uint32_t hmask = 0;
-    hmask |= (uint32_t)qh[0];
-    hmask |= (uint32_t)qh[1] << 8;
-    hmask |= (uint32_t)qh[2] << 16;
-    hmask |= (uint32_t)qh[3] << 24;
-
-    const int wi = (int)within;
-    const int low = (wi < 16) ? (int)(qs[wi] & 0x0F) : (int)(qs[wi - 16] >> 4);
-    const int high = (int)((hmask >> wi) & 1u);
-    const int qv = (high << 4) | low;
-    dst[idx] = d * (float)(qv - 16);
-}
-
-__global__ void dequant_q8_0_matrix_kernel(const uint8_t* src, float* dst, size_t rows, size_t cols, size_t row_bytes) {
-    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
-    const size_t total = rows * cols;
-    if (idx >= total) return;
-
-    const size_t r = idx / cols;
-    const size_t c = idx % cols;
-
-    const size_t blk = c / TENSOR_Q8_0_QK;
-    const size_t within = c % TENSOR_Q8_0_QK;
-    const uint8_t* blk_ptr = src + r * row_bytes + blk * TENSOR_Q8_0_BLOCK_SIZE;
-
-    const float d = fp16_to_fp32_device(load_u16(blk_ptr + 0));
-    const int8_t* qs = (const int8_t*)(blk_ptr + 2);
-    dst[idx] = d * (float)qs[within];
-}
-
 bool alloc_copy_to_device(const void* src, size_t bytes, void** dst) {
     if (!src || !dst || bytes == 0) return false;
     if (cudaMalloc(dst, bytes) != cudaSuccess) return false;
@@ -399,6 +330,21 @@ bool get_or_upload_persistent(const void* src, size_t bytes, void** dst) {
 bool copy_to_host(void* dst, const void* src, size_t bytes) {
     return cudaMemcpy(dst, src, bytes, cudaMemcpyDeviceToHost) == cudaSuccess;
 }
+
+size_t quant_block_elems(DataType type) {
+    if (type == DataType::Q4_K) return TENSOR_Q4_K_QK_K;
+    if (type == DataType::Q5_0) return TENSOR_Q5_0_QK;
+    if (type == DataType::Q8_0) return TENSOR_Q8_0_QK;
+    return 0;
+}
+
+size_t quant_row_bytes(DataType type, size_t cols) {
+    if (type == DataType::Q4_K) return tensor_q4_k_row_bytes(cols);
+    if (type == DataType::Q5_0) return tensor_q5_0_row_bytes(cols);
+    if (type == DataType::Q8_0) return tensor_q8_0_row_bytes(cols);
+    return 0;
+}
+
 bool get_or_build_persistent_dequant_f32(const Tensor* t, float** dst) {
     if (!t || !dst || !t->data || t->bytes == 0) return false;
     if (!(t->type == DataType::Q4_K || t->type == DataType::Q5_0 || t->type == DataType::Q8_0)) return false;
@@ -672,6 +618,12 @@ void cuda_backend_release_resources() {
 bool cuda_backend_preload_tensor(const Tensor* t) {
     if (!ensure_ready()) return false;
     if (!t || !t->data || t->bytes == 0) return false;
+    if (t->type == DataType::Q4_K || t->type == DataType::Q5_0 || t->type == DataType::Q8_0) {
+        if (cuda_quant_parity_mode_enabled()) {
+            float* dF = nullptr;
+            return get_or_build_persistent_dequant_f32(t, &dF);
+        }
+    }
     void* d = nullptr;
     return get_or_upload_persistent(t->data, t->bytes, &d);
 }
@@ -731,11 +683,53 @@ bool cuda_backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
 
     if (B->type != DataType::Q4_K && B->type != DataType::Q5_0 && B->type != DataType::Q8_0) return false;
 
+    const size_t block_elems = quant_block_elems(B->type);
+    if (k == 0 || n == 0 || block_elems == 0 || (k % block_elems) != 0 || (n % block_elems) != 0) return false;
+
+    if (cuda_quant_parity_mode_enabled()) {
+        void* dA = nullptr;
+        float* dBf = nullptr;
+        void* dC = nullptr;
+        if (!alloc_copy_to_device(A->data, A->bytes, &dA)) return false;
+        if (!get_or_build_persistent_dequant_f32(B, &dBf)) {
+            cudaFree(dA);
+            return false;
+        }
+        if (cudaMalloc(&dC, m * n * sizeof(float)) != cudaSuccess) {
+            cudaFree(dA);
+            return false;
+        }
+
+        const float alpha = 1.0f;
+        const float beta = 0.0f;
+        cublasStatus_t st = cublasSgemm(
+            state().handle,
+            CUBLAS_OP_N,
+            CUBLAS_OP_N,
+            (int)n,
+            (int)m,
+            (int)k,
+            &alpha,
+            (const float*)dBf,
+            (int)n,
+            (const float*)dA,
+            (int)k,
+            &beta,
+            (float*)dC,
+            (int)n);
+
+        bool ok = (st == CUBLAS_STATUS_SUCCESS) && copy_to_host(out->data, dC, m * n * sizeof(float));
+
+        cudaFree(dA);
+        cudaFree(dC);
+        return ok;
+    }
+
     void* dA = nullptr;
-    float* dBf = nullptr;
+    uint8_t* dBq = nullptr;
     void* dC = nullptr;
     if (!alloc_copy_to_device(A->data, A->bytes, &dA)) return false;
-    if (!get_or_build_persistent_dequant_f32(B, &dBf)) {
+    if (!get_or_upload_persistent(B->data, B->bytes, (void**)&dBq)) {
         cudaFree(dA);
         return false;
     }
@@ -744,25 +738,46 @@ bool cuda_backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
         return false;
     }
 
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    cublasStatus_t st = cublasSgemm(
-        state().handle,
-        CUBLAS_OP_N,
-        CUBLAS_OP_N,
-        (int)n,
-        (int)m,
-        (int)k,
-        &alpha,
-        (const float*)dBf,
-        (int)n,
-        (const float*)dA,
-        (int)k,
-        &beta,
-        (float*)dC,
-        (int)n);
+    const dim3 block(16, 16);
+    const dim3 grid((unsigned int)((n + block.x - 1) / block.x), (unsigned int)((m + block.y - 1) / block.y));
+    const size_t row_bytes = quant_row_bytes(B->type, B->cols);
+    if (row_bytes == 0) {
+        cudaFree(dA);
+        cudaFree(dC);
+        return false;
+    }
+    if (B->type == DataType::Q4_K) {
+        matmul_quant_kernel<TENSOR_Q4_K_QK_K, TENSOR_Q4_K_BLOCK_SIZE><<<grid, block>>>(
+            (const float*)dA,
+            dBq,
+            (float*)dC,
+            m,
+            n,
+            k,
+            row_bytes);
+    } else if (B->type == DataType::Q5_0) {
+        matmul_quant_kernel<TENSOR_Q5_0_QK, TENSOR_Q5_0_BLOCK_SIZE><<<grid, block>>>(
+            (const float*)dA,
+            dBq,
+            (float*)dC,
+            m,
+            n,
+            k,
+            row_bytes);
+    } else {
+        matmul_quant_kernel<TENSOR_Q8_0_QK, TENSOR_Q8_0_BLOCK_SIZE><<<grid, block>>>(
+            (const float*)dA,
+            dBq,
+            (float*)dC,
+            m,
+            n,
+            k,
+            row_bytes);
+    }
 
-    bool ok = (st == CUBLAS_STATUS_SUCCESS) && copy_to_host(out->data, dC, m * n * sizeof(float));
+    bool ok = (cudaGetLastError() == cudaSuccess) &&
+              (cudaDeviceSynchronize() == cudaSuccess) &&
+              copy_to_host(out->data, dC, m * n * sizeof(float));
 
     cudaFree(dA);
     cudaFree(dC);
@@ -818,11 +833,48 @@ bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor
 
     if (B->type != DataType::Q4_K && B->type != DataType::Q5_0 && B->type != DataType::Q8_0) return false;
 
+    const size_t block_elems = quant_block_elems(B->type);
+    if (k == 0 || n == 0 || block_elems == 0 || (k % block_elems) != 0) return false;
+
+    if (cuda_quant_parity_mode_enabled()) {
+        void* dA = nullptr;
+        float* dBf = nullptr;
+        void* dC = nullptr;
+        if (!alloc_copy_to_device(A->data, A->bytes, &dA)) return false;
+        if (!get_or_build_persistent_dequant_f32(B, &dBf)) {
+            cudaFree(dA);
+            return false;
+        }
+        if (cudaMalloc(&dC, m * n * sizeof(float)) != cudaSuccess) {
+            cudaFree(dA);
+            return false;
+        }
+
+        dim3 block(16, 16);
+        dim3 grid((unsigned int)((n + block.x - 1) / block.x), (unsigned int)((m + block.y - 1) / block.y));
+
+        matmul_rhs_transposed_kernel<<<grid, block>>>(
+            (const float*)dA,
+            (const float*)dBf,
+            (float*)dC,
+            m,
+            n,
+            k);
+
+        bool ok = (cudaGetLastError() == cudaSuccess) &&
+                  (cudaDeviceSynchronize() == cudaSuccess) &&
+                  copy_to_host(out->data, dC, m * n * sizeof(float));
+
+        cudaFree(dA);
+        cudaFree(dC);
+        return ok;
+    }
+
     void* dA = nullptr;
-    float* dBf = nullptr;
+    uint8_t* dBq = nullptr;
     void* dC = nullptr;
     if (!alloc_copy_to_device(A->data, A->bytes, &dA)) return false;
-    if (!get_or_build_persistent_dequant_f32(B, &dBf)) {
+    if (!get_or_upload_persistent(B->data, B->bytes, (void**)&dBq)) {
         cudaFree(dA);
         return false;
     }
@@ -834,13 +886,40 @@ bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor
     dim3 block(16, 16);
     dim3 grid((unsigned int)((n + block.x - 1) / block.x), (unsigned int)((m + block.y - 1) / block.y));
 
-    matmul_rhs_transposed_kernel<<<grid, block>>>(
-        (const float*)dA,
-        (const float*)dBf,
-        (float*)dC,
-        m,
-        n,
-        k);
+    const size_t row_bytes = quant_row_bytes(B->type, B->cols);
+    if (row_bytes == 0) {
+        cudaFree(dA);
+        cudaFree(dC);
+        return false;
+    }
+    if (B->type == DataType::Q4_K) {
+        matmul_rhs_quant_kernel<TENSOR_Q4_K_QK_K, TENSOR_Q4_K_BLOCK_SIZE><<<grid, block>>>(
+            (const float*)dA,
+            dBq,
+            (float*)dC,
+            m,
+            n,
+            k,
+            row_bytes);
+    } else if (B->type == DataType::Q5_0) {
+        matmul_rhs_quant_kernel<TENSOR_Q5_0_QK, TENSOR_Q5_0_BLOCK_SIZE><<<grid, block>>>(
+            (const float*)dA,
+            dBq,
+            (float*)dC,
+            m,
+            n,
+            k,
+            row_bytes);
+    } else {
+        matmul_rhs_quant_kernel<TENSOR_Q8_0_QK, TENSOR_Q8_0_BLOCK_SIZE><<<grid, block>>>(
+            (const float*)dA,
+            dBq,
+            (float*)dC,
+            m,
+            n,
+            k,
+            row_bytes);
+    }
 
     bool ok = (cudaGetLastError() == cudaSuccess) &&
               (cudaDeviceSynchronize() == cudaSuccess) &&
