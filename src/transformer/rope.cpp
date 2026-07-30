@@ -1,5 +1,6 @@
 #include "rope.h"
 #include <cmath>
+#include <vector>
 
 void rope_apply(Tensor* tensor, size_t start_pos, size_t n_heads, size_t head_dim, float theta) {
     if (!tensor || tensor->type != DataType::F32) return;
@@ -12,13 +13,20 @@ void rope_apply(Tensor* tensor, size_t start_pos, size_t n_heads, size_t head_di
 
     for (size_t r = 0; r < seq; ++r) {
         const double pos = (double)(start_pos + r);
+        // ヘッドに依存しない部分を先に計算（本来のコスト）
+        std::vector<double> cos_tab(half), sin_tab(half);
+        
+        for (size_t i = 0; i < half; ++i) {
+            const double inv_freq = 1.0 / std::pow((double)theta, (2.0 * (double)i) / (double)head_dim);
+            const double ang = pos * inv_freq;
+            cos_tab[i] = std::cos(ang);
+            sin_tab[i] = std::sin(ang);
+        }
         for (size_t h = 0; h < n_heads; ++h) {
             const size_t base = h * head_dim;
             for (size_t i = 0; i < half; ++i) {
-                const double inv_freq = 1.0 / std::pow((double)theta, (2.0 * (double)i) / (double)head_dim);
-                const double ang = pos * inv_freq;
-                const double c = std::cos(ang);
-                const double s = std::sin(ang);
+                const double c = cos_tab[i];
+                const double s = sin_tab[i];
                 const size_t a = r * tensor->cols + base + (2 * i);
                 const size_t b = a + 1;
                 const double x0 = data[a];
