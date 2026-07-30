@@ -294,6 +294,10 @@ static bool env_enabled(const char* key) {
     return v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T';
 }
 
+static bool chat_debug_enabled() {
+    return env_enabled("MINXFMR_CHAT_DEBUG");
+}
+
 // Enable verbose per-token generation logs when MINXFMR_VERBOSE_GEN=1.
 static bool gen_verbose_enabled() {
     static int enabled = -1;
@@ -356,6 +360,7 @@ static bool quantized_square_needs_runtime_transpose(const Tensor* t, size_t in_
 static bool arch_uses_square_transpose(const std::string& arch_lc) {
     // Architectures whose exported square attention matrices are commonly laid out
     // in the opposite orientation for this runtime.
+    if (arch_lc.rfind("qwen", 0) == 0) return true;
     if (arch_lc == "llama") return true;
     if (arch_lc == "mistral") return true;
     if (arch_lc == "mixtral") return true;
@@ -372,6 +377,11 @@ static bool arch_uses_square_transpose(const std::string& arch_lc) {
     if (arch_lc == "phi2") return false;
     if (arch_lc == "phi3") return false;
     return false;
+}
+
+static bool arch_prefers_cuda_quant_parity(const std::string& arch_lc) {
+    // Qwen-family models are currently more sensitive to quantized CUDA path drift.
+    return arch_lc.rfind("qwen", 0) == 0;
 }
 
 static bool apply_norm_scale_local(Tensor* x, const Tensor* w) {
@@ -412,6 +422,7 @@ static bool apply_final_norm_inplace(Tensor* x, const Tensor* wnorm, float rmsno
     return ok;
 }
 static void log_vocab_specials(const std::vector<std::string>& vocab) {
+    if (!chat_debug_enabled()) return;
     size_t shown = 0;
     for (size_t i = 0; i < vocab.size() && shown < 40; ++i) {
         const std::string& tok = vocab[i];
@@ -678,8 +689,20 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                         "[minxfmr] auto orientation from gguf architecture='%s': square_transpose=%s\n",
                         arch.c_str(),
                         needs_square_transpose ? "on" : "off");
+
+                    if (backend_using_cuda() && !std::getenv("MINXFMR_CUDA_QUANT_PARITY")) {
+                        const bool prefer_parity = arch_prefers_cuda_quant_parity(arch_lc);
+                        backend_set_cuda_quant_parity_mode(prefer_parity ? 1 : 0);
+                        fprintf(stderr,
+                            "[minxfmr] auto cuda quant policy from architecture='%s': %s\n",
+                            arch.c_str(),
+                            prefer_parity ? "parity(dequant_f32)" : "quant-kernel");
+                    }
                 } else {
                     fprintf(stderr, "[minxfmr] auto orientation: architecture metadata missing, default square_transpose=off\n");
+                    if (backend_using_cuda() && !std::getenv("MINXFMR_CUDA_QUANT_PARITY")) {
+                        backend_set_cuda_quant_parity_mode(0);
+                    }
                 }
             }
         }
@@ -708,10 +731,14 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         size_t loaded_wo_layers = 0;
         size_t loaded_norm_layers = 0;
         size_t loaded_ffn_layers = 0;
+        int last_progress_bucket = -1;
         for (size_t l = 0; l < ctx->n_layer; ++l) {
-            // progress: report per-layer percentage so users see loading progress
             int percent = (int)(((double)(l) / (double)ctx->n_layer) * 100.0);
-            fprintf(stderr, "[minxfmr] loading layers %zu/%zu (%d%%)\n", l, ctx->n_layer, percent);
+            int bucket = percent / 10;
+            if (bucket != last_progress_bucket || l == 0 || l + 1 == ctx->n_layer) {
+                fprintf(stderr, "[minxfmr] loading layers %zu/%zu (%d%%)\n", l, ctx->n_layer, percent);
+                last_progress_bucket = bucket;
+            }
             Tensor* lq = nullptr;
             Tensor* lk = nullptr;
             Tensor* lv = nullptr;
@@ -768,6 +795,8 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 }
             }
         }
+        fprintf(stderr, "[minxfmr] projection load summary: attn=%zu bias=%zu wo=%zu norm=%zu ffn=%zu of %zu layers\n",
+            loaded_attn_layers, loaded_attn_bias_layers, loaded_wo_layers, loaded_norm_layers, loaded_ffn_layers, ctx->n_layer);
         if (loaded_attn_bias_layers > 0) {
             fprintf(stderr, "[minxfmr] loaded per-layer projection biases: %zu/%zu layers\n", loaded_attn_bias_layers, ctx->n_layer);
         }
@@ -825,16 +854,64 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         }
     }
 
-    // Derive missing dimensions from loaded tensors so later code can validate shapes.
-    if (ctx->Wq) {
-        if (ctx->model_dim == 0) {
-            ctx->model_dim = (ctx->Wq->rows == ctx->Wq->cols) ? ctx->Wq->rows : std::max(ctx->Wq->rows, ctx->Wq->cols);
+    auto first_nonnull = [](const std::vector<Tensor*>& v) -> const Tensor* {
+        for (const Tensor* t : v) if (t) return t;
+        return nullptr;
+    };
+
+    if (looks_gguf && ctx->n_layer > 1) {
+        size_t attn_ready = 0;
+        size_t wo_ready = 0;
+        size_t ffn_ready = 0;
+        for (size_t l = 0; l < ctx->n_layer; ++l) {
+            if (l < ctx->Wq_layers.size() && l < ctx->Wk_layers.size() && l < ctx->Wv_layers.size() &&
+                ctx->Wq_layers[l] && ctx->Wk_layers[l] && ctx->Wv_layers[l]) {
+                ++attn_ready;
+            }
+            if (l < ctx->Wo_layers.size() && ctx->Wo_layers[l]) ++wo_ready;
+            if (l < ctx->Wffn_gate_layers.size() && l < ctx->Wffn_up_layers.size() && l < ctx->Wffn_down_layers.size() &&
+                ctx->Wffn_gate_layers[l] && ctx->Wffn_up_layers[l] && ctx->Wffn_down_layers[l]) {
+                ++ffn_ready;
+            }
         }
-        size_t kv = infer_kv_dim_from_weight(ctx->Wk, ctx->model_dim);
-        size_t vv = infer_kv_dim_from_weight(ctx->Wv, ctx->model_dim);
-        if (kv == 0) kv = ctx->model_dim;
-        if (vv > 0) kv = std::min(kv, vv);
-        ctx->kv_dim = kv;
+
+        if (attn_ready == 0 || wo_ready == 0 || ffn_ready == 0) {
+            fprintf(stderr,
+                "[minxfmr] fatal: decoder tensors are missing (attn=%zu wo=%zu ffn=%zu of %zu layers).\n"
+                "[minxfmr] fatal: GGUF tensor resolution failed (naming mismatch, unsupported layout, or incomplete/truncated file); refusing to run to avoid gibberish output.\n",
+                attn_ready,
+                wo_ready,
+                ffn_ready,
+                ctx->n_layer);
+            minxfmr_close(ctx);
+            return nullptr;
+        }
+    }
+
+    // Derive missing dimensions from loaded tensors so later code can validate shapes.
+    const Tensor* wq_ref = ctx->Wq ? ctx->Wq : first_nonnull(ctx->Wq_layers);
+    const Tensor* wk_ref = ctx->Wk ? ctx->Wk : first_nonnull(ctx->Wk_layers);
+    const Tensor* wv_ref = ctx->Wv ? ctx->Wv : first_nonnull(ctx->Wv_layers);
+
+    if (ctx->n_head > 0 && ctx->n_head_kv > 0 && ctx->model_dim > 0 && (ctx->model_dim % ctx->n_head) == 0) {
+        const size_t head_dim = ctx->model_dim / ctx->n_head;
+        const size_t meta_kv_dim = head_dim * ctx->n_head_kv;
+        if (meta_kv_dim > 0) {
+            ctx->kv_dim = meta_kv_dim;
+        }
+    }
+
+    if (wq_ref) {
+        if (ctx->model_dim == 0) {
+            ctx->model_dim = (wq_ref->rows == wq_ref->cols) ? wq_ref->rows : std::max(wq_ref->rows, wq_ref->cols);
+        }
+        size_t kv = infer_kv_dim_from_weight(wk_ref, ctx->model_dim);
+        size_t vv = infer_kv_dim_from_weight(wv_ref, ctx->model_dim);
+        if (ctx->kv_dim == 0) {
+            if (kv == 0) kv = ctx->model_dim;
+            if (vv > 0) kv = std::min(kv, vv);
+            ctx->kv_dim = kv;
+        }
     }
     if (ctx->Wemb && ctx->model_dim == 0) {
         ctx->model_dim = (ctx->Wemb->rows >= ctx->Wemb->cols) ? ctx->Wemb->cols : ctx->Wemb->rows;
@@ -918,14 +995,27 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 }
             }
 
-            if (wfg && ffn_hidden > 0 && wfg->rows != ctx->model_dim && wfg->cols != ffn_hidden) ++bad_ffn;
-            if (wfu && ffn_hidden > 0 && wfu->rows != ctx->model_dim && wfu->cols != ffn_hidden) ++bad_ffn;
+            if (wfg && ffn_hidden > 0) {
+                const bool gate_ok =
+                    (wfg->rows == ctx->model_dim && wfg->cols == ffn_hidden) ||
+                    (wfg->rows == ffn_hidden && wfg->cols == ctx->model_dim);
+                if (!gate_ok) ++bad_ffn;
+            }
+            if (wfu && ffn_hidden > 0) {
+                const bool up_ok =
+                    (wfu->rows == ctx->model_dim && wfu->cols == ffn_hidden) ||
+                    (wfu->rows == ffn_hidden && wfu->cols == ctx->model_dim);
+                if (!up_ok) ++bad_ffn;
+            }
 
             if (wfd) {
                 if (ffn_hidden > 0) {
                     if (normalize_linear_inplace(wfd, ffn_hidden, desired_transpose_ffn_square, tr)) {
                         if (tr) ++n_ffn_down;
-                        if (wfd->rows != ffn_hidden && wfd->cols != ctx->model_dim) ++bad_ffn;
+                        const bool down_ok =
+                            (wfd->rows == ffn_hidden && wfd->cols == ctx->model_dim) ||
+                            (wfd->rows == ctx->model_dim && wfd->cols == ffn_hidden);
+                        if (!down_ok) ++bad_ffn;
                     } else {
                         ++bad_ffn;
                     }
@@ -1017,7 +1107,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     // 1) Tokenize prompt and prefill cache by running prompt tokens.
     std::vector<int> ids = tokenizer_encode(prompt);
     // debug: log prompt token ids and decoded prompt
-    if (!ids.empty()) {
+    if (!ids.empty() && chat_debug_enabled()) {
         fprintf(stderr, "[minxfmr] prompt token count=%zu\n", ids.size());
         fprintf(stderr, "[minxfmr] prompt ids:");
         for (size_t i=0;i<ids.size();++i) fprintf(stderr, " %d", ids[i]);
@@ -1047,7 +1137,14 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             tensor_free(out);
             continue;
         }
-        run_stack_forward(ctx, in, out);
+        if (!run_stack_forward(ctx, in, out)) {
+            fprintf(stderr, "[minxfmr] forward failed during prompt prefill (token id=%d)\n", id);
+            fflush(stderr);
+            tensor_free(in);
+            tensor_free(out);
+            if (last_out_prefill) tensor_free(last_out_prefill);
+            return -3;
+        }
         tensor_free(in);
         if (id == last) {
             last_out_prefill = tensor_clone_f32_local(out);
@@ -1131,7 +1228,16 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         } else {
             in = token_embedding_row(ctx, last);
             out = tensor_create_f32(1, dim);
-            if (in && out) run_stack_forward(ctx, in, out);
+            if (in && out) {
+                if (!run_stack_forward(ctx, in, out)) {
+                    fprintf(stderr, "[minxfmr] forward failed during generation step=%d last=%d\n", t, last);
+                    fflush(stderr);
+                    tensor_free(in);
+                    tensor_free(out);
+                    if (last_out_prefill) tensor_free(last_out_prefill);
+                    return -3;
+                }
+            }
         }
 
         if (!out) { fprintf(stderr, "[minxfmr] no output tensor at step=%d last=%d\n", t, last); fflush(stderr); gen_break_reason = "no_out"; break; }
@@ -1321,7 +1427,9 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                     raw_tok = alt_raw;
                     if (next >= 0 && (size_t)next < logits.size()) chosen_logit = logits[(size_t)next];
                     preview = alt_preview;
-                    fprintf(stderr, "[minxfmr] avoided empty first token, switched to id=%d raw='%s'\n", next, raw_tok.c_str());
+                    if (chat_debug_enabled()) {
+                        fprintf(stderr, "[minxfmr] avoided empty first token, switched to id=%d raw='%s'\n", next, raw_tok.c_str());
+                    }
                     break;
                 }
             }
@@ -1340,8 +1448,10 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             repeat_run = 1;
         }
         if (repeat_run >= 16) {
-            fprintf(stderr, "[minxfmr] stopping on repetition token='%s' run=%d\n", raw_tok.c_str(), repeat_run);
-            fflush(stderr);
+            if (chat_debug_enabled()) {
+                fprintf(stderr, "[minxfmr] stopping on repetition token='%s' run=%d\n", raw_tok.c_str(), repeat_run);
+                fflush(stderr);
+            }
             gen_break_reason = "repeat";
             if (in) tensor_free(in);
             if (out) tensor_free(out);
@@ -1350,8 +1460,10 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
 
         // If model emits an explicit EOS token, stop generation immediately.
         if (is_eos_token(raw_tok)) {
-            fprintf(stderr, "[minxfmr] stopping on EOS token id=%d raw='%s'\n", next, raw_tok.c_str());
-            fflush(stderr);
+            if (chat_debug_enabled()) {
+                fprintf(stderr, "[minxfmr] stopping on EOS token id=%d raw='%s'\n", next, raw_tok.c_str());
+                fflush(stderr);
+            }
             gen_break_reason = "eos";
             if (in) tensor_free(in);
             if (out) tensor_free(out);
@@ -1414,8 +1526,10 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
 
                 if (is_exact) {
                     // Suppress the complete marker sequence
-                    fprintf(stderr, "[minxfmr] suppressed role/template marker seq='%s'\n", concat.c_str());
-                    fflush(stderr);
+                    if (chat_debug_enabled()) {
+                        fprintf(stderr, "[minxfmr] suppressed role/template marker seq='%s'\n", concat.c_str());
+                        fflush(stderr);
+                    }
                     pending_token_buf.clear();
                 } else if (is_prefix) {
                     // Wait for more fragments before deciding; do nothing now.
@@ -1452,8 +1566,10 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             // If the token itself is already a complete role marker string,
             // just log and skip it. This path handles cases where tokenizer
             // returns the full marker in one token.
-            fprintf(stderr, "[minxfmr] suppressed role/template token id=%d raw='%s'\n", next, raw_tok.c_str());
-            fflush(stderr);
+            if (chat_debug_enabled()) {
+                fprintf(stderr, "[minxfmr] suppressed role/template token id=%d raw='%s'\n", next, raw_tok.c_str());
+                fflush(stderr);
+            }
         }
 
         if (!skip_role) recent_tokens.push_back(next);
@@ -1503,9 +1619,11 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     }
 
     if (gen_break_reason == "none") gen_break_reason = "max_steps";
-    fprintf(stderr, "[minxfmr] generation finished: emitted=%d last=%d reason=%s steps=%d max=%d\n",
-        gen_tokens_emitted, last, gen_break_reason.c_str(), t, max_steps);
-    fflush(stderr);
+    if (chat_debug_enabled()) {
+        fprintf(stderr, "[minxfmr] generation finished: emitted=%d last=%d reason=%s steps=%d max=%d\n",
+            gen_tokens_emitted, last, gen_break_reason.c_str(), t, max_steps);
+        fflush(stderr);
+    }
 
     // If emitting JSON, build object and write to stdout.
     if (emit_json) {

@@ -5,6 +5,7 @@
 #include <fstream>
 #include <thread>
 #include <algorithm>
+#include <cstdlib>
 
 // Determine thread count used for dequant work.
 static size_t gguf_choose_thread_count(size_t rows) {
@@ -21,6 +22,13 @@ static size_t gguf_choose_thread_count(size_t rows) {
     if (req > rows) req = rows;
     if (req == 0) req = 1;
     return req;
+}
+
+static bool gguf_verbose_meta() {
+    const char* env = std::getenv("MINXFMR_GGUF_VERBOSE");
+    if (!env || !env[0]) return false;
+    const char c = env[0];
+    return c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T';
 }
 
 static bool rd_u32(const std::vector<uint8_t>& d, size_t& p, uint32_t& out) {
@@ -226,6 +234,9 @@ bool gguf_open(const char* path, GGUF_File& out) {
     out.path = path;
     out.tensors.clear();
     out.vocab_tokens.clear();
+    out.tokenizer_model.clear();
+    out.tokenizer_pre.clear();
+    out.tokenizer_merges.clear();
     out.n_layer = 0;
     out.n_ctx = 0;
     out.n_embd = 0;
@@ -244,8 +255,15 @@ bool gguf_open(const char* path, GGUF_File& out) {
     uint64_t n_tensors = 0, n_kv = 0;
     if (!rd_u64(out.data, p, n_tensors)) return false;
     if (!rd_u64(out.data, p, n_kv)) return false;
+    if (gguf_verbose_meta()) {
+        std::fprintf(stderr, "[gguf] header version=%u tensors=%llu kv=%llu\n",
+            version,
+            (unsigned long long)n_tensors,
+            (unsigned long long)n_kv);
+    }
 
     uint32_t alignment = 32;
+    bool has_split_metadata = false;
     auto read_meta_u64 = [&](uint32_t t, size_t at, uint64_t& v)->bool {
         if (t == 4) { // u32
             if (at + 4 > out.data.size()) return false;
@@ -296,21 +314,41 @@ bool gguf_open(const char* path, GGUF_File& out) {
         if (!rd_u32(out.data, p, t)) return false;
         size_t before = p;
 
+        if (gguf_verbose_meta()) {
+            std::fprintf(stderr, "[gguf] meta key='%s' type=%u\n", key.c_str(), t);
+        }
+        if (key.rfind("split.", 0) == 0 || key.find(".split.") != std::string::npos) {
+            has_split_metadata = true;
+        }
+
         // Special-case tokenizer vocabulary array and related metadata.
         if (t == 9) {
             uint32_t elem_t = 0;
             uint64_t n = 0;
             if (!rd_u32(out.data, p, elem_t)) return false;
             if (!rd_u64(out.data, p, n)) return false;
-            // debug: print metadata key/type for diagnosis
-            std::fprintf(stderr, "[gguf] meta key='%s' type=%u elem_t=%u n=%llu\n", key.c_str(), t, elem_t, (unsigned long long)n);
+            if (gguf_verbose_meta()) {
+                std::fprintf(stderr, "[gguf] meta key='%s' type=%u elem_t=%u n=%llu\n", key.c_str(), t, elem_t, (unsigned long long)n);
+            }
             // Accept common metadata key suffixes for greater compatibility with varied GGUF files.
             if (key_matches_meta(key, "tokens") && elem_t == 8) {
-                // Read up to a configurable limit of tokens to avoid long stalls on huge vocabularies.
+                // By default read the full vocabulary. A read limit can be enabled explicitly
+                // for debugging very large models via MINXFMR_VOCAB_READ_LIMIT.
                 const char* env = std::getenv("MINXFMR_VOCAB_READ_LIMIT");
-                size_t max_read = 1000;
-                if (env) {
-                    try { max_read = std::stoul(env); } catch(...) { max_read = 1000; }
+                size_t max_read = (size_t)n;
+                if (env && env[0]) {
+                    try {
+                        size_t v = std::stoul(env);
+                        if (v > 0) max_read = std::min<size_t>(v, (size_t)n);
+                    } catch(...) {
+                        max_read = (size_t)n;
+                    }
+                }
+                if (max_read < (size_t)n) {
+                    std::fprintf(stderr,
+                        "[gguf] warning: tokenizer vocab read limited to %zu / %llu by MINXFMR_VOCAB_READ_LIMIT\n",
+                        max_read,
+                        (unsigned long long)n);
                 }
                 out.vocab_tokens.clear();
                 out.vocab_tokens.reserve((size_t)std::min<uint64_t>(n, max_read));
@@ -395,6 +433,14 @@ bool gguf_open(const char* path, GGUF_File& out) {
                     if (!rd_str(out.data, p, tok)) return false;
                     out.special_tokens.push_back(tok);
                 }
+            } else if ((key == "tokenizer.ggml.merges" || key == "tokenizer.merges" || key == "tokenizer.ggml.bpe_merges") && elem_t == 8) {
+                out.tokenizer_merges.clear();
+                out.tokenizer_merges.reserve((size_t)n);
+                for (uint64_t k = 0; k < n; ++k) {
+                    std::string m;
+                    if (!rd_str(out.data, p, m)) return false;
+                    out.tokenizer_merges.push_back(m);
+                }
             } else {
                 for (uint64_t k = 0; k < n; ++k) {
                     if (!skip_gguf_value(out.data, p, elem_t)) return false;
@@ -470,6 +516,20 @@ bool gguf_open(const char* path, GGUF_File& out) {
                 out.architecture = tmp;
             }
         }
+        if ((key == "tokenizer.ggml.model" || key == "tokenizer.model") && t == 8) {
+            size_t tmp_p = before;
+            std::string tmp;
+            if (rd_str(out.data, tmp_p, tmp)) {
+                out.tokenizer_model = tmp;
+            }
+        }
+        if ((key == "tokenizer.ggml.pre" || key == "tokenizer.ggml.pre_tokenizer" || key == "tokenizer.pre") && t == 8) {
+            size_t tmp_p = before;
+            std::string tmp;
+            if (rd_str(out.data, tmp_p, tmp)) {
+                out.tokenizer_pre = tmp;
+            }
+        }
     }
 
     struct TmpT {
@@ -482,6 +542,8 @@ bool gguf_open(const char* path, GGUF_File& out) {
     };
     std::vector<TmpT> tmp;
     tmp.reserve((size_t)n_tensors);
+
+    const size_t tensor_info_start = p;
 
     for (uint64_t i = 0; i < n_tensors; ++i) {
         TmpT t;
@@ -510,6 +572,8 @@ bool gguf_open(const char* path, GGUF_File& out) {
         tmp.push_back(t);
     }
 
+    const size_t tensor_info_end = p;
+
     size_t tensor_data = p;
     if (alignment > 1) {
         size_t rem = tensor_data % alignment;
@@ -517,6 +581,20 @@ bool gguf_open(const char* path, GGUF_File& out) {
     }
     if (tensor_data > out.data.size()) return false;
 
+    if (gguf_verbose_meta()) {
+        std::fprintf(stderr,
+            "[gguf] tensor table bytes start=%zu end=%zu span=%zu aligned_data_start=%zu file_size=%zu align=%u\n",
+            tensor_info_start,
+            tensor_info_end,
+            tensor_info_end >= tensor_info_start ? (tensor_info_end - tensor_info_start) : 0,
+            tensor_data,
+            out.data.size(),
+            alignment);
+    }
+
+    size_t skipped_out_of_range = 0;
+    std::string first_oob_name;
+    size_t first_oob_offset = 0;
     for (const auto& t : tmp) {
         GGUF_TensorInfo ti;
         ti.name = t.name;
@@ -526,7 +604,54 @@ bool gguf_open(const char* path, GGUF_File& out) {
         ti.rows = (uint32_t)((t.n_dims >= 2) ? t.ne[1] : 1);
         ti.offset = tensor_data + (size_t)t.rel_off;
         ti.nbytes = t.nbytes;
-        if (ti.offset < out.data.size()) out.tensors.push_back(ti);
+        if (ti.offset < out.data.size()) {
+            out.tensors.push_back(ti);
+        } else {
+            ++skipped_out_of_range;
+            if (first_oob_name.empty()) {
+                first_oob_name = ti.name;
+                first_oob_offset = ti.offset;
+            }
+        }
+    }
+
+    if (gguf_verbose_meta() && !tmp.empty()) {
+        const size_t preview = std::min<size_t>(tmp.size(), 5);
+        for (size_t i = 0; i < preview; ++i) {
+            const auto& t = tmp[i];
+            const size_t abs_off = tensor_data + (size_t)t.rel_off;
+            std::fprintf(stderr,
+                "[gguf] tensor[%zu] name='%s' dims=%u ne0=%llu ne1=%llu type=%u rel_off=%llu abs_off=%zu in_file=%s\n",
+                i,
+                t.name.c_str(),
+                t.n_dims,
+                (unsigned long long)t.ne[0],
+                (unsigned long long)t.ne[1],
+                t.type,
+                (unsigned long long)t.rel_off,
+                abs_off,
+                (abs_off < out.data.size()) ? "yes" : "no");
+        }
+    }
+    if (gguf_verbose_meta()) {
+        std::fprintf(stderr, "[gguf] parsed tensor directory entries=%zu\n", out.tensors.size());
+    }
+
+    if (skipped_out_of_range > 0) {
+        std::fprintf(stderr,
+            "[gguf] error: %zu tensor entries point past EOF (first='%s' abs_off=%zu file_size=%zu)\n",
+            skipped_out_of_range,
+            first_oob_name.c_str(),
+            first_oob_offset,
+            out.data.size());
+        if (has_split_metadata) {
+            std::fprintf(stderr,
+                "[gguf] hint: this appears to be a split GGUF model, but split GGUF loading is not implemented yet\n");
+        } else {
+            std::fprintf(stderr,
+                "[gguf] hint: the GGUF file may be incomplete or truncated; verify the model download and file size\n");
+        }
+        return false;
     }
 
     // if vocab array was present, prefer its length as vocab_size
@@ -548,6 +673,9 @@ void gguf_close(GGUF_File& f) {
     f.vocab_tokens.clear();
     f.vocab_scores.clear();
     f.vocab_types.clear();
+    f.tokenizer_model.clear();
+    f.tokenizer_pre.clear();
+    f.tokenizer_merges.clear();
     f.chat_template.clear();
     f.special_tokens.clear();
 }
@@ -789,7 +917,9 @@ bool gguf_dequant_q6_k(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*&
 
     unsigned int hw = std::thread::hardware_concurrency();
     size_t nthreads = gguf_choose_thread_count(rows);
-    std::fprintf(stderr, "[gguf] dequant_q6_k rows=%u hw=%u threads=%zu\n", rows, hw, nthreads);
+    if (gguf_verbose_meta()) {
+        std::fprintf(stderr, "[gguf] dequant_q6_k rows=%u hw=%u threads=%zu\n", rows, hw, nthreads);
+    }
     if (nthreads <= 1) {
         worker(0, rows);
     } else {
@@ -824,68 +954,80 @@ bool gguf_dequant_q1_0(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*&
     if (rows == 0 || cols == 0) return false;
 
     const uint8_t* src = f.data.data() + info.offset;
-
-    // Case 1: one byte per element
-    if (need == (size_t)rows * (size_t)cols) {
-        out = tensor_create_f32(rows, cols);
-        if (!out) return false;
-        float* dst = (float*)out->data;
-        size_t nthreads = gguf_choose_thread_count(rows);
-        unsigned int hw = std::thread::hardware_concurrency();
-        std::fprintf(stderr, "[gguf] q1_0 onebyte rows=%u hw=%u threads=%zu\n", rows, hw, nthreads);
-        auto worker = [&](uint32_t r0, uint32_t r1){
-            for (uint32_t r = r0; r < r1; ++r) {
-                const uint8_t* row_src = src + (size_t)r * cols;
-                float* row_dst = dst + (size_t)r * cols;
-                for (uint32_t c = 0; c < cols; ++c) row_dst[c] = (float)row_src[c];
+    // Case 1: one byte per element (or per-row padded)
+    if (need >= (size_t)rows * (size_t)cols) {
+        // check per-row stride (may include padding)
+        if (rows > 0 && need % rows == 0) {
+            size_t bytes_per_row = need / rows;
+            if (bytes_per_row >= cols && bytes_per_row <= cols + 256) {
+                out = tensor_create_f32(rows, cols);
+                if (!out) return false;
+                float* dst = (float*)out->data;
+                size_t nthreads = gguf_choose_thread_count(rows);
+                unsigned int hw = std::thread::hardware_concurrency();
+                if (gguf_verbose_meta()) {
+                    std::fprintf(stderr, "[gguf] q1_0 onebyte rows=%u hw=%u threads=%zu stride=%zu\n", rows, hw, nthreads, bytes_per_row);
+                }
+                auto worker = [&](uint32_t r0, uint32_t r1){
+                    for (uint32_t r = r0; r < r1; ++r) {
+                        const uint8_t* row_src = src + (size_t)r * bytes_per_row;
+                        float* row_dst = dst + (size_t)r * cols;
+                        for (uint32_t c = 0; c < cols; ++c) row_dst[c] = (float)row_src[c];
+                    }
+                };
+                if (nthreads <= 1) worker(0, rows);
+                else {
+                    std::vector<std::thread> threads; threads.reserve(nthreads);
+                    uint32_t base = rows / (uint32_t)nthreads; uint32_t rem = rows % (uint32_t)nthreads; uint32_t cur = 0;
+                    for (size_t ti = 0; ti < nthreads; ++ti) {
+                        uint32_t take = base + (ti < rem ? 1 : 0);
+                        uint32_t s = cur; uint32_t e = cur + take; cur = e;
+                        threads.emplace_back([worker,s,e](){ worker(s,e); });
+                    }
+                    for (auto& th : threads) th.join();
+                }
+                return true;
             }
-        };
-        if (nthreads <= 1) worker(0, rows);
-        else {
-            std::vector<std::thread> threads; threads.reserve(nthreads);
-            uint32_t base = rows / (uint32_t)nthreads; uint32_t rem = rows % (uint32_t)nthreads; uint32_t cur = 0;
-            for (size_t ti = 0; ti < nthreads; ++ti) {
-                uint32_t take = base + (ti < rem ? 1 : 0);
-                uint32_t s = cur; uint32_t e = cur + take; cur = e;
-                threads.emplace_back([worker,s,e](){ worker(s,e); });
-            }
-            for (auto& th : threads) th.join();
         }
-        return true;
     }
 
-    // Case 2: packed bits per element
+    // Case 2: packed bits per element (LSB-first) with possible per-row padding
     size_t bits_per_row_bytes = (cols + 7) / 8;
-    if (need == (size_t)rows * bits_per_row_bytes) {
-        out = tensor_create_f32(rows, cols);
-        if (!out) return false;
-        float* dst = (float*)out->data;
-        auto worker = [&](uint32_t r0, uint32_t r1){
-            for (uint32_t r = r0; r < r1; ++r) {
-                const uint8_t* row_src = src + (size_t)r * bits_per_row_bytes;
-                float* row_dst = dst + (size_t)r * cols;
-                for (uint32_t c = 0; c < cols; ++c) {
-                    size_t b = c / 8; int bit = c % 8;
-                    uint8_t v = (row_src[b] >> bit) & 1u;
-                    row_dst[c] = v ? 1.0f : 0.0f;
+    if (need >= (size_t)rows * bits_per_row_bytes) {
+        size_t bytes_per_row = (rows > 0 && need % rows == 0) ? (need / rows) : bits_per_row_bytes;
+        if (bytes_per_row >= bits_per_row_bytes && bytes_per_row <= bits_per_row_bytes + 256) {
+            out = tensor_create_f32(rows, cols);
+            if (!out) return false;
+            float* dst = (float*)out->data;
+            auto worker = [&](uint32_t r0, uint32_t r1){
+                for (uint32_t r = r0; r < r1; ++r) {
+                    const uint8_t* row_src = src + (size_t)r * bytes_per_row;
+                    float* row_dst = dst + (size_t)r * cols;
+                    for (uint32_t c = 0; c < cols; ++c) {
+                        size_t b = c / 8; int bit = c % 8;
+                        uint8_t v = (row_src[b] >> bit) & 1u;
+                        row_dst[c] = v ? 1.0f : 0.0f;
+                    }
                 }
+            };
+            unsigned int hw = std::thread::hardware_concurrency();
+            size_t nthreads = gguf_choose_thread_count(rows);
+            if (gguf_verbose_meta()) {
+                std::fprintf(stderr, "[gguf] q1_0 bytes-per-element rows=%u hw=%u threads=%zu stride=%zu\n", rows, hw, nthreads, bytes_per_row);
             }
-        };
-        unsigned int hw = std::thread::hardware_concurrency();
-        size_t nthreads = gguf_choose_thread_count(rows);
-        std::fprintf(stderr, "[gguf] q1_0 bytes-per-element rows=%u hw=%u threads=%zu\n", rows, hw, nthreads);
-        if (nthreads <= 1) worker(0, rows);
-        else {
-            std::vector<std::thread> threads; threads.reserve(nthreads);
-            uint32_t base = rows / (uint32_t)nthreads; uint32_t rem = rows % (uint32_t)nthreads; uint32_t cur = 0;
-            for (size_t ti = 0; ti < nthreads; ++ti) {
-                uint32_t take = base + (ti < rem ? 1 : 0);
-                uint32_t s = cur; uint32_t e = cur + take; cur = e;
-                threads.emplace_back([worker,s,e](){ worker(s,e); });
+            if (nthreads <= 1) worker(0, rows);
+            else {
+                std::vector<std::thread> threads; threads.reserve(nthreads);
+                uint32_t base = rows / (uint32_t)nthreads; uint32_t rem = rows % (uint32_t)nthreads; uint32_t cur = 0;
+                for (size_t ti = 0; ti < nthreads; ++ti) {
+                    uint32_t take = base + (ti < rem ? 1 : 0);
+                    uint32_t s = cur; uint32_t e = cur + take; cur = e;
+                    threads.emplace_back([worker,s,e](){ worker(s,e); });
+                }
+                for (auto& th : threads) th.join();
             }
-            for (auto& th : threads) th.join();
+            return true;
         }
-        return true;
     }
 
     return false;

@@ -57,7 +57,7 @@ static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out,
     const size_t d_in = in->cols;
 
     // Some checkpoints store square matrices in the opposite orientation.
-    if (transpose_square && W->rows == d_in && W->cols == d_in) {
+    if (transpose_square && W->rows == d_in && W->cols == d_in && W->type != DataType::F32) {
         out = tensor_create_f32_noinit(in->rows, d_in);
         if (!out || !backend_matmul_rhs_transposed(in, W, out)) {
             tensor_free(out);
@@ -215,10 +215,17 @@ bool transformer_forward_single_layer(
     if (v_ok && Vraw && Bv_in) add_bias_inplace(Vraw, Bv_in);
 
     if (!q_ok || !k_ok || !v_ok) {
-        tensor_free(Qraw); tensor_free(Kraw); tensor_free(Vraw);
-        Qraw = tensor_clone_f32(norm);
-        Kraw = tensor_clone_f32(norm);
-        Vraw = tensor_clone_f32(norm);
+        fprintf(stderr,
+            "[transformer] missing projection weights at layer=%zu (q_ok=%d k_ok=%d v_ok=%d)\n",
+            layer,
+            q_ok ? 1 : 0,
+            k_ok ? 1 : 0,
+            v_ok ? 1 : 0);
+        tensor_free(Qraw);
+        tensor_free(Kraw);
+        tensor_free(Vraw);
+        tensor_free(norm);
+        return false;
     }
     if (!Qraw || !Kraw || !Vraw) {
         tensor_free(Qraw); tensor_free(Kraw); tensor_free(Vraw);

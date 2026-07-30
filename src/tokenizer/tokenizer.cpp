@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
+#include <limits>
 #ifdef _WIN32
 #include <windows.h>
 #if defined(__has_include)
@@ -24,6 +25,17 @@ static std::vector<float> g_vocab_scores;
 static std::vector<int>   g_vocab_types;
 static std::unordered_map<uint8_t, std::string> g_byte_encoder;
 static std::unordered_map<std::string, uint8_t> g_byte_decoder;
+static std::string g_tokenizer_model;
+static std::string g_tokenizer_pre;
+static std::vector<std::string> g_tokenizer_merges;
+static bool g_use_bpe = false;
+enum class BpePretokenizerMode {
+    Generic,
+    Qwen2,
+    Qwen35,
+};
+static BpePretokenizerMode g_bpe_pretokenizer = BpePretokenizerMode::Generic;
+static std::unordered_map<std::string, int> g_bpe_ranks;
 static size_t g_max_token_len = 0;
 static const std::string kSpmMarker("\xE2\x96\x81");
 static const std::string kGptSpaceMarker("\xC3\x84\xC2\xA0");
@@ -161,6 +173,320 @@ static void detect_tokenizer_markers_from_vocab() {
     }
 }
 
+static std::string bpe_pair_key(const std::string& a, const std::string& b) {
+    std::string k;
+    k.reserve(a.size() + b.size() + 1);
+    k += a;
+    k.push_back('\x1f');
+    k += b;
+    return k;
+}
+
+static std::vector<std::string> split_byte_level_symbols(const std::string& encoded) {
+    std::vector<std::string> syms;
+    syms.reserve(encoded.size());
+    for (size_t i = 0; i < encoded.size();) {
+        bool matched = false;
+        for (int len = 3; len >= 1; --len) {
+            if (i + (size_t)len > encoded.size()) continue;
+            std::string sub = encoded.substr(i, (size_t)len);
+            if (g_byte_decoder.find(sub) == g_byte_decoder.end()) continue;
+            syms.push_back(sub);
+            i += (size_t)len;
+            matched = true;
+            break;
+        }
+        if (!matched) {
+            syms.push_back(encoded.substr(i, 1));
+            ++i;
+        }
+    }
+    return syms;
+}
+
+static std::vector<std::string> apply_bpe_merges(std::vector<std::string> syms) {
+    if (!g_use_bpe || g_bpe_ranks.empty()) return syms;
+    if (syms.size() < 2) return syms;
+
+    while (syms.size() >= 2) {
+        int best_rank = (std::numeric_limits<int>::max)();
+        size_t best_i = syms.size();
+
+        for (size_t i = 0; i + 1 < syms.size(); ++i) {
+            auto it = g_bpe_ranks.find(bpe_pair_key(syms[i], syms[i + 1]));
+            if (it == g_bpe_ranks.end()) continue;
+            if (it->second < best_rank) {
+                best_rank = it->second;
+                best_i = i;
+            }
+        }
+
+        if (best_i == syms.size()) break;
+
+        std::vector<std::string> next;
+        next.reserve(syms.size());
+        size_t i = 0;
+        while (i < syms.size()) {
+            if (i + 1 < syms.size()) {
+                auto it = g_bpe_ranks.find(bpe_pair_key(syms[i], syms[i + 1]));
+                if (it != g_bpe_ranks.end() && it->second == best_rank) {
+                    next.push_back(syms[i] + syms[i + 1]);
+                    i += 2;
+                    continue;
+                }
+            }
+            next.push_back(syms[i]);
+            ++i;
+        }
+        syms.swap(next);
+    }
+
+    return syms;
+}
+
+static bool utf8_decode_one(const std::string& s, size_t pos, uint32_t& cp, size_t& len) {
+    if (pos >= s.size()) return false;
+    unsigned char c0 = (unsigned char)s[pos];
+    if (c0 < 0x80) {
+        cp = c0;
+        len = 1;
+        return true;
+    }
+    if ((c0 >> 5) == 0x6 && pos + 1 < s.size()) {
+        cp = ((uint32_t)(c0 & 0x1F) << 6) | ((uint32_t)s[pos + 1] & 0x3F);
+        len = 2;
+        return true;
+    }
+    if ((c0 >> 4) == 0xE && pos + 2 < s.size()) {
+        cp = ((uint32_t)(c0 & 0x0F) << 12) |
+             (((uint32_t)s[pos + 1] & 0x3F) << 6) |
+             ((uint32_t)s[pos + 2] & 0x3F);
+        len = 3;
+        return true;
+    }
+    if ((c0 >> 3) == 0x1E && pos + 3 < s.size()) {
+        cp = ((uint32_t)(c0 & 0x07) << 18) |
+             (((uint32_t)s[pos + 1] & 0x3F) << 12) |
+             (((uint32_t)s[pos + 2] & 0x3F) << 6) |
+             ((uint32_t)s[pos + 3] & 0x3F);
+        len = 4;
+        return true;
+    }
+    cp = c0;
+    len = 1;
+    return true;
+}
+
+static bool is_unicode_newline(uint32_t cp) {
+    return cp == '\n';
+}
+
+static bool is_unicode_space(uint32_t cp) {
+    return cp == ' ' || cp == '\t' || cp == '\v' || cp == '\f' || cp == 0x00A0 || cp == 0x3000;
+}
+
+static bool is_unicode_letter(uint32_t cp);
+
+static bool is_unicode_digit(uint32_t cp) {
+    if (cp >= '0' && cp <= '9') return true;
+    if (cp >= 0xFF10 && cp <= 0xFF19) return true;
+    return false;
+}
+
+static bool is_unicode_mark(uint32_t cp) {
+    return (cp >= 0x0300 && cp <= 0x036F) ||
+           (cp >= 0x1AB0 && cp <= 0x1AFF) ||
+           (cp >= 0x1DC0 && cp <= 0x1DFF) ||
+           (cp >= 0x20D0 && cp <= 0x20FF) ||
+           (cp >= 0xFE20 && cp <= 0xFE2F);
+}
+
+static bool is_qwen_word_char(uint32_t cp, BpePretokenizerMode mode) {
+    if (is_unicode_letter(cp) || is_unicode_digit(cp)) {
+        return true;
+    }
+    if (mode == BpePretokenizerMode::Qwen35 && is_unicode_mark(cp)) {
+        return true;
+    }
+    return false;
+}
+
+static bool is_unicode_letter(uint32_t cp) {
+    if ((cp >= 'a' && cp <= 'z') || (cp >= 'A' && cp <= 'Z')) return true;
+    if ((cp >= 0x00C0 && cp <= 0x02AF) || (cp >= 0x0370 && cp <= 0x052F)) return true;
+    if ((cp >= 0x0590 && cp <= 0x08FF) || (cp >= 0x0900 && cp <= 0x0E7F)) return true;
+    if ((cp >= 0x3040 && cp <= 0x30FF) || (cp >= 0x31F0 && cp <= 0x31FF)) return true;
+    if ((cp >= 0x3400 && cp <= 0x4DBF) || (cp >= 0x4E00 && cp <= 0x9FFF)) return true;
+    if ((cp >= 0xAC00 && cp <= 0xD7AF) || (cp >= 0x1100 && cp <= 0x11FF)) return true;
+    if ((cp >= 0xF900 && cp <= 0xFAFF) || (cp >= 0x20000 && cp <= 0x2FA1F)) return true;
+    return false;
+}
+
+static bool match_ascii_contraction(const std::string& s, size_t pos, size_t& matched_len) {
+    matched_len = 0;
+    if (pos >= s.size() || s[pos] != '\'') return false;
+    auto ieq = [](char a, char b) {
+        return std::tolower((unsigned char)a) == std::tolower((unsigned char)b);
+    };
+    if (pos + 2 <= s.size()) {
+        char c1 = s[pos + 1];
+        if (ieq(c1, 's') || ieq(c1, 't') || ieq(c1, 'm') || ieq(c1, 'd')) {
+            matched_len = 2;
+            return true;
+        }
+    }
+    if (pos + 3 <= s.size()) {
+        char c1 = s[pos + 1];
+        char c2 = s[pos + 2];
+        if ((ieq(c1, 'r') && ieq(c2, 'e')) ||
+            (ieq(c1, 'v') && ieq(c2, 'e')) ||
+            (ieq(c1, 'l') && ieq(c2, 'l'))) {
+            matched_len = 3;
+            return true;
+        }
+    }
+    return false;
+}
+
+static std::vector<std::string> pretokenize_bpe_text(const std::string& text, BpePretokenizerMode mode) {
+    std::vector<std::string> parts;
+    for (size_t i = 0; i < text.size();) {
+        size_t contraction_len = 0;
+        if (match_ascii_contraction(text, i, contraction_len)) {
+            parts.push_back(text.substr(i, contraction_len));
+            i += contraction_len;
+            continue;
+        }
+
+        uint32_t cp = 0;
+        size_t len = 0;
+        if (!utf8_decode_one(text, i, cp, len)) break;
+
+        if (cp == ' ' && i + len < text.size()) {
+            uint32_t next_cp = 0;
+            size_t next_len = 0;
+            if (utf8_decode_one(text, i + len, next_cp, next_len) && !is_unicode_space(next_cp) && !is_unicode_newline(next_cp) && !is_qwen_word_char(next_cp, mode)) {
+                size_t j = i + len + next_len;
+                while (j < text.size()) {
+                    uint32_t cur_cp = 0;
+                    size_t cur_len = 0;
+                    if (!utf8_decode_one(text, j, cur_cp, cur_len)) break;
+                    if (is_unicode_space(cur_cp) || is_qwen_word_char(cur_cp, mode)) break;
+                    if (is_unicode_newline(cur_cp)) break;
+                    j += cur_len;
+                }
+                while (j < text.size()) {
+                    uint32_t cur_cp = 0;
+                    size_t cur_len = 0;
+                    if (!utf8_decode_one(text, j, cur_cp, cur_len) || !is_unicode_newline(cur_cp)) break;
+                    j += cur_len;
+                }
+                parts.push_back(text.substr(i, j - i));
+                i = j;
+                continue;
+            }
+        }
+
+        if (!is_unicode_newline(cp) && !is_qwen_word_char(cp, mode) && i + len < text.size()) {
+            uint32_t next_cp = 0;
+            size_t next_len = 0;
+            if (utf8_decode_one(text, i + len, next_cp, next_len) && is_qwen_word_char(next_cp, mode)) {
+                size_t j = i + len + next_len;
+                while (j < text.size()) {
+                    uint32_t cur_cp = 0;
+                    size_t cur_len = 0;
+                    if (!utf8_decode_one(text, j, cur_cp, cur_len) || !is_qwen_word_char(cur_cp, mode)) break;
+                    j += cur_len;
+                }
+                parts.push_back(text.substr(i, j - i));
+                i = j;
+                continue;
+            }
+        }
+
+        if (is_qwen_word_char(cp, mode)) {
+            size_t j = i + len;
+            while (j < text.size()) {
+                uint32_t cur_cp = 0;
+                size_t cur_len = 0;
+                if (!utf8_decode_one(text, j, cur_cp, cur_len) || !is_qwen_word_char(cur_cp, mode)) break;
+                j += cur_len;
+            }
+            parts.push_back(text.substr(i, j - i));
+            i = j;
+            continue;
+        }
+
+        if (is_unicode_digit(cp)) {
+            parts.push_back(text.substr(i, len));
+            i += len;
+            continue;
+        }
+
+        if (is_unicode_space(cp) || is_unicode_newline(cp)) {
+            size_t j = i + len;
+            if (is_unicode_space(cp)) {
+                while (j < text.size()) {
+                    uint32_t cur_cp = 0;
+                    size_t cur_len = 0;
+                    if (!utf8_decode_one(text, j, cur_cp, cur_len) || !is_unicode_space(cur_cp)) break;
+                    j += cur_len;
+                }
+                size_t k = j;
+                while (k < text.size()) {
+                    uint32_t cur_cp = 0;
+                    size_t cur_len = 0;
+                    if (!utf8_decode_one(text, k, cur_cp, cur_len) || !is_unicode_newline(cur_cp)) break;
+                    k += cur_len;
+                }
+                if (k > j) {
+                    parts.push_back(text.substr(i, k - i));
+                    i = k;
+                    continue;
+                }
+            } else {
+                while (j < text.size()) {
+                    uint32_t cur_cp = 0;
+                    size_t cur_len = 0;
+                    if (!utf8_decode_one(text, j, cur_cp, cur_len) || !is_unicode_newline(cur_cp)) break;
+                    j += cur_len;
+                }
+            }
+            parts.push_back(text.substr(i, j - i));
+            i = j;
+            continue;
+        }
+
+        size_t j = i + len;
+        while (j < text.size()) {
+            uint32_t cur_cp = 0;
+            size_t cur_len = 0;
+            if (!utf8_decode_one(text, j, cur_cp, cur_len)) break;
+            if (is_unicode_space(cur_cp) || is_unicode_newline(cur_cp) || is_unicode_letter(cur_cp) || is_unicode_digit(cur_cp)) break;
+            j += cur_len;
+        }
+        while (j < text.size()) {
+            uint32_t cur_cp = 0;
+            size_t cur_len = 0;
+            if (!utf8_decode_one(text, j, cur_cp, cur_len) || !is_unicode_newline(cur_cp)) break;
+            j += cur_len;
+        }
+        parts.push_back(text.substr(i, j - i));
+        i = j;
+    }
+    return parts;
+}
+
+static bool is_special_like_token_text(const std::string& tok) {
+    if (tok.empty()) return false;
+    if (tok == "<unk>" || tok == "</s>" || tok == "<s>" || tok == "<pad>") return true;
+    if (tok == "[INST]" || tok == "[/INST]" || tok == "[SYS]" || tok == "[/SYS]") return true;
+    if (tok.rfind("<|", 0) == 0 && tok.size() >= 4 && tok.back() == '>') return true;
+    if (tok.front() == '<' && tok.back() == '>' && (tok.find('|') != std::string::npos || tok.find("assistant") != std::string::npos || tok.find("user") != std::string::npos || tok.find("tool") != std::string::npos)) return true;
+    if (tok.front() == '[' && tok.back() == ']' && (tok.find("INST") != std::string::npos || tok.find("SYS") != std::string::npos || tok.find("ASSISTANT") != std::string::npos || tok.find("USER") != std::string::npos)) return true;
+    return false;
+}
+
 static std::string normalize_text_for_tokenizer(const std::string& s_in) {
 #if defined(_WIN32) && defined(MINXFMR_HAS_NORMALIZ)
     // Use Windows Normaliz API to normalize to NFKC where available
@@ -176,44 +502,27 @@ static std::string normalize_text_for_tokenizer(const std::string& s_in) {
             if (outlen > 0) {
                 std::string out(outlen, 0);
                 WideCharToMultiByte(CP_UTF8, 0, nbuf.c_str(), nlen, &out[0], outlen, NULL, NULL);
-                // replace common non-breaking/fullwidth spaces left as bytes
+                // Keep normalization conservative for multilingual text:
+                // preserve spacing and punctuation exactly except for CRLF/NBSP normalization.
                 size_t pos = 0;
                 while ((pos = out.find("\xC2\xA0", pos)) != std::string::npos) out.replace(pos, 2, " ");
                 pos = 0;
                 while ((pos = out.find("\xE3\x80\x80", pos)) != std::string::npos) out.replace(pos, 3, " ");
-                // compress whitespace, but preserve newlines because chat templates rely on them.
-                std::string comp;
-                comp.reserve(out.size());
-                bool last_space = false;
+                std::string norm;
+                norm.reserve(out.size());
                 for (unsigned char c : out) {
-                    if (c == '\r') {
-                        continue;
-                    }
-                    if (c == '\n') {
-                        comp.push_back('\n');
-                        last_space = false;
-                        continue;
-                    }
-                    if (c == ' ' || c == '\t' || c == '\v' || c == '\f') {
-                        if (!last_space) comp.push_back(' ');
-                        last_space = true;
-                    } else {
-                        comp.push_back((char)c);
-                        last_space = false;
-                    }
+                    if (c == '\r') continue;
+                    norm.push_back((char)c);
                 }
-                while (!comp.empty() && comp.front() == ' ') comp.erase(comp.begin());
-                while (!comp.empty() && comp.back() == ' ') comp.pop_back();
-                return comp;
+                return norm;
             }
         }
     }
 #endif
-    // Cross-platform fallback: keep behavior conservative and predictable.
+    // Cross-platform fallback with minimal transformation.
     std::string s = s_in;
     std::string out;
     out.reserve(s.size());
-    bool last_was_space = false;
     for (size_t i = 0; i < s.size(); ++i) {
         unsigned char ch = (unsigned char)s[i];
         if (i == 0 && s.size() >= 3 && (unsigned char)s[0] == 0xEF && (unsigned char)s[1] == 0xBB && (unsigned char)s[2] == 0xBF) {
@@ -232,24 +541,26 @@ static std::string normalize_text_for_tokenizer(const std::string& s_in) {
         }
         if (ch == '\n') {
             out.push_back('\n');
-            last_was_space = false;
             continue;
         }
-        if (ch == '\t' || ch == '\v' || ch == '\f') {
-            ch = ' ';
-        }
-        if (ch == ' ') {
-            if (last_was_space) continue;
-            last_was_space = true;
-            out.push_back(' ');
-            continue;
-        }
-        last_was_space = false;
         out.push_back((char)ch);
     }
-    while (!out.empty() && out.front() == ' ') out.erase(out.begin());
-    while (!out.empty() && out.back() == ' ') out.pop_back();
     return out;
+}
+
+static BpePretokenizerMode detect_bpe_pretokenizer_mode() {
+    std::string pre = g_tokenizer_pre;
+    for (char& c : pre) {
+        c = (char)std::tolower((unsigned char)c);
+    }
+
+    if (pre == "qwen35" || pre == "qwen3") {
+        return BpePretokenizerMode::Qwen35;
+    }
+    if (pre == "qwen2" || pre == "deepseek-r1-qwen" || pre == "kormo" || pre == "f2llmv2" || pre == "megrez") {
+        return BpePretokenizerMode::Qwen2;
+    }
+    return BpePretokenizerMode::Generic;
 }
 
 bool tokenizer_load_from_list(const std::vector<std::string>& vocab) {
@@ -261,6 +572,12 @@ bool tokenizer_load_from_list(const std::vector<std::string>& vocab) {
         g_vid[g_vocab[i]] = (int)i;
         if (g_vocab[i].size() > g_max_token_len) g_max_token_len = g_vocab[i].size();
     }
+    g_tokenizer_model.clear();
+    g_tokenizer_pre.clear();
+    g_tokenizer_merges.clear();
+    g_bpe_ranks.clear();
+    g_use_bpe = false;
+    g_bpe_pretokenizer = BpePretokenizerMode::Generic;
     detect_tokenizer_markers_from_vocab();
     trie_build_from_vocab();
     return true;
@@ -274,6 +591,32 @@ bool tokenizer_load_from_gguf(const GGUF_File& gf) {
     for (size_t i = 0; i < g_vocab.size(); ++i) {
         g_vid[g_vocab[i]] = (int)i;
         if (g_vocab[i].size() > g_max_token_len) g_max_token_len = g_vocab[i].size();
+    }
+    g_tokenizer_model = gf.tokenizer_model;
+    g_tokenizer_pre = gf.tokenizer_pre;
+    g_tokenizer_merges = gf.tokenizer_merges;
+    g_bpe_pretokenizer = detect_bpe_pretokenizer_mode();
+
+    g_bpe_ranks.clear();
+    for (size_t i = 0; i < g_tokenizer_merges.size(); ++i) {
+        const std::string& m = g_tokenizer_merges[i];
+        size_t sp = m.find(' ');
+        if (sp == std::string::npos || sp == 0 || sp + 1 >= m.size()) continue;
+        std::string a = m.substr(0, sp);
+        std::string b = m.substr(sp + 1);
+        if (a.empty() || b.empty()) continue;
+        g_bpe_ranks[bpe_pair_key(a, b)] = (int)i;
+    }
+    std::string model_lc = g_tokenizer_model;
+    for (char& c : model_lc) c = (char)std::tolower((unsigned char)c);
+    g_use_bpe = (!g_bpe_ranks.empty()) && (model_lc.find("bpe") != std::string::npos || model_lc.find("gpt2") != std::string::npos);
+
+    if (!g_tokenizer_model.empty()) {
+        std::fprintf(stderr, "[tokenizer] model=%s pre=%s merges=%zu mode=%s\n",
+            g_tokenizer_model.c_str(),
+            g_tokenizer_pre.empty() ? "" : g_tokenizer_pre.c_str(),
+            g_tokenizer_merges.size(),
+            g_use_bpe ? "bpe" : "greedy");
     }
     detect_tokenizer_markers_from_vocab();
     trie_build_from_vocab();
@@ -327,7 +670,103 @@ std::string tokenizer_id_to_token(int id) {
 std::vector<int> tokenizer_encode(const std::string& text) {
     std::vector<int> out;
     if (text.empty()) return out;
-    const std::string norm_text = byte_level_encode(normalize_text_for_tokenizer(text));
+    const std::string norm_src = normalize_text_for_tokenizer(text);
+
+    if (g_use_bpe) {
+        auto push_unknown_or_byte = [&](const std::string& sym) {
+            auto it_dec = g_byte_decoder.find(sym);
+            if (it_dec != g_byte_decoder.end()) {
+                char byte_tok[7];
+                std::snprintf(byte_tok, sizeof(byte_tok), "<0x%02X>", (unsigned int)it_dec->second);
+                int id = tokenizer_token_to_id(byte_tok);
+                if (id >= 0) {
+                    out.push_back(id);
+                    return;
+                }
+            }
+            int unk = -1;
+            auto it_unk = g_vid.find("<unk>");
+            if (it_unk != g_vid.end()) unk = it_unk->second;
+            if (unk < 0 && !g_vocab.empty()) unk = 0;
+            out.push_back(unk);
+        };
+
+        size_t pos = 0;
+        while (pos < norm_src.size()) {
+            size_t best_len = 0;
+            int best_id = -1;
+            if (!g_trie.empty()) {
+                int node = 0;
+                size_t i = pos;
+                while (i < norm_src.size()) {
+                    unsigned char uc = (unsigned char)norm_src[i];
+                    auto it = g_trie[node].children.find(uc);
+                    if (it == g_trie[node].children.end()) break;
+                    node = it->second;
+                    ++i;
+                    if (g_trie[node].token_id >= 0) {
+                        int candidate = g_trie[node].token_id;
+                        if ((size_t)candidate < g_vocab.size() && is_special_like_token_text(g_vocab[(size_t)candidate])) {
+                            best_id = candidate;
+                            best_len = i - pos;
+                        }
+                    }
+                }
+            }
+
+            if (best_id >= 0 && best_len > 0) {
+                out.push_back(best_id);
+                pos += best_len;
+                continue;
+            }
+
+            size_t next_special = pos + 1;
+            while (next_special < norm_src.size()) {
+                size_t probe_len = 0;
+                int probe_id = -1;
+                if (!g_trie.empty()) {
+                    int node = 0;
+                    size_t i = next_special;
+                    while (i < norm_src.size()) {
+                        unsigned char uc = (unsigned char)norm_src[i];
+                        auto it = g_trie[node].children.find(uc);
+                        if (it == g_trie[node].children.end()) break;
+                        node = it->second;
+                        ++i;
+                        if (g_trie[node].token_id >= 0) {
+                            int candidate = g_trie[node].token_id;
+                            if ((size_t)candidate < g_vocab.size() && is_special_like_token_text(g_vocab[(size_t)candidate])) {
+                                probe_id = candidate;
+                                probe_len = i - next_special;
+                            }
+                        }
+                    }
+                }
+                if (probe_id >= 0 && probe_len > 0) break;
+                ++next_special;
+            }
+
+            std::string raw_chunk = norm_src.substr(pos, next_special - pos);
+            std::vector<std::string> parts = pretokenize_bpe_text(raw_chunk, g_bpe_pretokenizer);
+            for (const std::string& part_raw : parts) {
+                const std::string part = byte_level_encode(part_raw);
+                std::vector<std::string> syms = split_byte_level_symbols(part);
+                syms = apply_bpe_merges(std::move(syms));
+                for (const std::string& tok : syms) {
+                    int id = tokenizer_token_to_id(tok);
+                    if (id >= 0) {
+                        out.push_back(id);
+                    } else {
+                        push_unknown_or_byte(tok);
+                    }
+                }
+            }
+            pos = next_special;
+        }
+        return out;
+    }
+
+    const std::string norm_text = byte_level_encode(norm_src);
 
     auto match_exact_prefix = [&](const std::string& src, size_t pos, size_t& matched_len) -> int {
         matched_len = 0;

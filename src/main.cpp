@@ -19,6 +19,40 @@
 #include <windows.h>
 #endif
 
+static bool read_chat_line_utf8(std::string& out) {
+    out.clear();
+#ifdef _WIN32
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (hIn != INVALID_HANDLE_VALUE && GetConsoleMode(hIn, &mode)) {
+        wchar_t wbuf[1024];
+        DWORD nread = 0;
+        if (!ReadConsoleW(hIn, wbuf, (DWORD)(sizeof(wbuf) / sizeof(wbuf[0]) - 1), &nread, nullptr)) {
+            return false;
+        }
+        if (nread == 0) return false;
+        std::wstring ws(wbuf, wbuf + nread);
+        while (!ws.empty() && (ws.back() == L'\r' || ws.back() == L'\n')) ws.pop_back();
+        int bytes = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), nullptr, 0, nullptr, nullptr);
+        if (bytes <= 0) {
+            out.clear();
+            return true;
+        }
+        out.resize((size_t)bytes);
+        WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), (int)ws.size(), &out[0], bytes, nullptr, nullptr);
+        return true;
+    }
+#endif
+    char line[1024];
+    if (!fgets(line, sizeof(line), stdin)) return false;
+    size_t len = strlen(line);
+    while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) {
+        line[--len] = '\0';
+    }
+    out.assign(line, len);
+    return true;
+}
+
 // model token output should go to stdout only (clean for chat). Logs go to stderr.
 static void write_stdout_bytes(const char* token) {
     if (!token) return;
@@ -42,6 +76,48 @@ static void gen_collect_callback(const char* token) {
 static void gen_collect_only_callback(const char* token) {
     if (!token) return;
     gen_outbuf_global.append(token);
+}
+
+static bool chat_debug_enabled() {
+    const char* v = std::getenv("MINXFMR_CHAT_DEBUG");
+    if (!v || !v[0]) return false;
+    const char c = v[0];
+    return c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T';
+}
+
+static bool contains_cjk(const std::string& s) {
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) {
+            ++i;
+            continue;
+        }
+        if ((c & 0xE0) == 0xC0) {
+            i += 2;
+            continue;
+        }
+        if ((c & 0xF0) == 0xE0 && i + 2 < s.size()) {
+            unsigned char c1 = (unsigned char)s[i + 1];
+            unsigned char c2 = (unsigned char)s[i + 2];
+            if ((c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80) {
+                unsigned int cp = ((unsigned int)(c & 0x0F) << 12) |
+                                  ((unsigned int)(c1 & 0x3F) << 6) |
+                                  (unsigned int)(c2 & 0x3F);
+                if ((cp >= 0x3040 && cp <= 0x30FF) ||  // Hiragana/Katakana
+                    (cp >= 0x3400 && cp <= 0x9FFF)) {  // CJK Unified Ideographs
+                    return true;
+                }
+            }
+            i += 3;
+            continue;
+        }
+        if ((c & 0xF8) == 0xF0) {
+            i += 4;
+            continue;
+        }
+        ++i;
+    }
+    return false;
 }
 
 static std::string utf8_truncate_for_history(const std::string& text, size_t max_bytes) {
@@ -82,6 +158,8 @@ int main(int argc, char** argv) {
     bool transpose_user_override = false;
     bool try_all_templates = false;
     bool emit_vocab = false;
+    bool temp_set_by_user = false;
+    bool topk_set_by_user = false;
     if (argc > 1) model = argv[1];
     if (argc > 2) prompt = argv[2];
         bool run_once = false;
@@ -105,12 +183,14 @@ int main(int argc, char** argv) {
             }
             if (strcmp(argv[i], "--temp")==0 && i+1<argc) {
                 temperature = (float)strtod(argv[i+1], nullptr);
+                temp_set_by_user = true;
             }
             if (strcmp(argv[i], "--top_p")==0 && i+1<argc) {
                 top_p = (float)strtod(argv[i+1], nullptr);
             }
             if (strcmp(argv[i], "--top_k")==0 && i+1<argc) {
                 top_k = (int)strtol(argv[i+1], nullptr, 10);
+                topk_set_by_user = true;
             }
             if (strcmp(argv[i], "--max-gen-tokens")==0 && i+1<argc) {
                 max_gen_tokens = (int)strtol(argv[i+1], nullptr, 10);
@@ -160,6 +240,13 @@ int main(int argc, char** argv) {
             }
         }
 
+    if (chat_mode) {
+        // Chat defaults should remain stable but not fully deterministic;
+        // pure greedy often gets trapped into short/repetitive fragments.
+        if (!temp_set_by_user) temperature = 0.7f;
+        if (!topk_set_by_user) top_k = 40;
+    }
+
     if (log_file) {
         FILE* lf = freopen(log_file, "w", stderr);
         if (!lf) {
@@ -173,6 +260,11 @@ int main(int argc, char** argv) {
     if (transpose_user_override) {
         transformer_set_transpose_square_weights_for_all(transpose_wq, transpose_wk, transpose_wv, transpose_wo);
     }
+
+    const bool env_transpose_override = []() {
+        const char* v = std::getenv("MINXFMR_TRANSPOSE_USER_OVERRIDE");
+        return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
+    }();
     if (max_gen_tokens < 1) max_gen_tokens = 1;
     if (max_gen_tokens > 256) max_gen_tokens = 256;
 #ifdef _WIN32
@@ -180,11 +272,13 @@ int main(int argc, char** argv) {
         char buf[16];
         snprintf(buf, sizeof(buf), "%d", max_gen_tokens);
         _putenv_s("MINXFMR_MAX_GEN_TOKENS", buf);
-        _putenv_s("MINXFMR_TRANSPOSE_USER_OVERRIDE", transpose_user_override ? "1" : "");
-        _putenv_s("MINXFMR_TRANSPOSE_WQ", transpose_user_override ? (transpose_wq ? "1" : "0") : "");
-        _putenv_s("MINXFMR_TRANSPOSE_WK", transpose_user_override ? (transpose_wk ? "1" : "0") : "");
-        _putenv_s("MINXFMR_TRANSPOSE_WV", transpose_user_override ? (transpose_wv ? "1" : "0") : "");
-        _putenv_s("MINXFMR_TRANSPOSE_WO", transpose_user_override ? (transpose_wo ? "1" : "0") : "");
+        if (transpose_user_override) {
+            _putenv_s("MINXFMR_TRANSPOSE_USER_OVERRIDE", "1");
+            _putenv_s("MINXFMR_TRANSPOSE_WQ", transpose_wq ? "1" : "0");
+            _putenv_s("MINXFMR_TRANSPOSE_WK", transpose_wk ? "1" : "0");
+            _putenv_s("MINXFMR_TRANSPOSE_WV", transpose_wv ? "1" : "0");
+            _putenv_s("MINXFMR_TRANSPOSE_WO", transpose_wo ? "1" : "0");
+        }
     }
 #else
     {
@@ -197,12 +291,6 @@ int main(int argc, char** argv) {
             setenv("MINXFMR_TRANSPOSE_WK", transpose_wk ? "1" : "0", 1);
             setenv("MINXFMR_TRANSPOSE_WV", transpose_wv ? "1" : "0", 1);
             setenv("MINXFMR_TRANSPOSE_WO", transpose_wo ? "1" : "0", 1);
-        } else {
-            unsetenv("MINXFMR_TRANSPOSE_USER_OVERRIDE");
-            unsetenv("MINXFMR_TRANSPOSE_WQ");
-            unsetenv("MINXFMR_TRANSPOSE_WK");
-            unsetenv("MINXFMR_TRANSPOSE_WV");
-            unsetenv("MINXFMR_TRANSPOSE_WO");
         }
     }
 #endif
@@ -212,6 +300,8 @@ int main(int argc, char** argv) {
             transpose_wk ? "on" : "off",
             transpose_wv ? "on" : "off",
             transpose_wo ? "on" : "off");
+    } else if (env_transpose_override) {
+        fprintf(stderr, "[main] square-weight transpose mode (user env): using MINXFMR_TRANSPOSE_* overrides\n");
     } else {
         fprintf(stderr, "[main] square-weight transpose mode: auto (by model architecture)\n");
     }
@@ -249,6 +339,27 @@ int main(int argc, char** argv) {
                 }
             }
             tensor_free(A); tensor_free(B); tensor_free(C);
+        }
+
+        // Phase2b: rhs-transposed matmul test (used by square-weight projection paths)
+        Tensor* AT = tensor_create_f32(2,3);
+        Tensor* BT = tensor_create_f32(2,3);
+        Tensor* CT = tensor_create_f32(2,2);
+        if (AT && BT && CT) {
+            tensor_set_f32(AT,0,0,1.0f); tensor_set_f32(AT,0,1,2.0f); tensor_set_f32(AT,0,2,3.0f);
+            tensor_set_f32(AT,1,0,4.0f); tensor_set_f32(AT,1,1,5.0f); tensor_set_f32(AT,1,2,6.0f);
+            tensor_set_f32(BT,0,0,7.0f); tensor_set_f32(BT,0,1,8.0f); tensor_set_f32(BT,0,2,9.0f);
+            tensor_set_f32(BT,1,0,10.0f); tensor_set_f32(BT,1,1,11.0f); tensor_set_f32(BT,1,2,12.0f);
+            if (backend_matmul_rhs_transposed(AT, BT, CT)) {
+                printf("rhs_transposed result:\n");
+                for (size_t i = 0; i < 2; ++i) {
+                    for (size_t j = 0; j < 2; ++j) {
+                        printf(" %f", tensor_get_f32(CT, i, j));
+                    }
+                    printf("\n");
+                }
+            }
+            tensor_free(AT); tensor_free(BT); tensor_free(CT);
         }
 
         // Phase3: Transformer component smoke test
@@ -411,19 +522,23 @@ int main(int argc, char** argv) {
         size_t non_space = 0;
         size_t alpha_num = 0;
         size_t symbol_like = 0;
+        bool has_non_ascii = false;
         size_t i = 0;
         for (unsigned char c : text) {
             if (c == '\n') ++line_count;
             if (c != ' ' && c != '\t' && c != '\r' && c != '\n') ++non_space;
             if (std::isalnum((int)c)) ++alpha_num;
             if (c == '|' || c == '<' || c == '>' || c == '[' || c == ']') ++symbol_like;
+            if (c >= 0x80) has_non_ascii = true;
         }
         if (non_space == 0) return false;
         if (line_count > 16) return false;
         while (i < text.size() && std::isspace((unsigned char)text[i])) ++i;
         if (i < text.size() && (text[i] == '|' || text[i] == '<')) return false;
         if (non_space <= 2) return false;
-        if (alpha_num == 0 && non_space > 8) return false;
+        // Accept non-Latin replies (e.g. Japanese) even when std::isalnum
+        // cannot classify UTF-8 bytes as alnum in the current locale.
+        if (alpha_num == 0 && non_space > 8 && !has_non_ascii) return false;
         if (symbol_like * 2 >= non_space) return false;
         return true;
     };
@@ -448,6 +563,31 @@ int main(int argc, char** argv) {
         char c = text[i];
         return c == '|' || c == '<' || c == '>' || c == '[' || c == ']' ||
                c == ':' || c == ';' || c == ',' || c == '.' || c == '\'' || c == '"';
+    };
+
+    auto to_lower_ascii = [](const std::string& s) {
+        std::string out = s;
+        for (char& ch : out) {
+            unsigned char c = (unsigned char)ch;
+            if (c >= 'A' && c <= 'Z') ch = (char)(c - 'A' + 'a');
+        }
+        return out;
+    };
+
+    auto is_low_information_reply = [&](const std::string& text) {
+        if (text.empty()) return true;
+        std::string t = text;
+        while (!t.empty() && std::isspace((unsigned char)t.back())) t.pop_back();
+        std::string low = to_lower_ascii(t);
+
+        if (low.rfind("i'm sorry", 0) == 0) return true;
+        if (low.rfind("i am sorry", 0) == 0) return true;
+        if (low.find("i can't understand") != std::string::npos) return true;
+        if (low.find("i am an ai language") != std::string::npos) return true;
+
+        // A short question-like echo is usually not a useful answer.
+        if (!t.empty() && t.back() == '?' && t.size() < 64) return true;
+        return false;
     };
 
     auto looks_like_qwen_jinja_template = [](const char* tpl) {
@@ -544,33 +684,41 @@ int main(int argc, char** argv) {
         } else if (chat_mode) {
             printf("Entering chat mode. Type 'reset' to clear history, 'exit' to quit.\n");
             std::vector<std::string> history; // alternating user/assistant entries
-            char line[1024];
             while (true) {
                 printf("you> ");
                 fflush(stdout);
-                if (!fgets(line, sizeof(line), stdin)) break;
-                size_t L = strlen(line); if (L>0 && line[L-1]=='\n') line[L-1]='\0';
-                if (strcmp(line, "exit") == 0) break;
-                if (strcmp(line, "reset") == 0) { history.clear(); minxfmr_reset(ctx); printf("history reset\n"); continue; }
-                if (strlen(line) == 0) continue;
+                std::string line;
+                if (!read_chat_line_utf8(line)) break;
+                if (line == "exit") break;
+                if (line == "reset") { history.clear(); minxfmr_reset(ctx); printf("history reset\n"); continue; }
+                if (line.empty()) continue;
                 if ((history.size() % 2) != 0) {
-                    fprintf(stderr, "[main] dropping stray history entry to preserve user/assistant pairing\n");
+                    if (chat_debug_enabled()) {
+                        fprintf(stderr, "[main] dropping stray history entry to preserve user/assistant pairing\n");
+                    }
                     history.pop_back();
                 }
                 bool used_auto_qwen = false;
-                std::string assembled = render_template_auto(history, model_chat_template, system_prompt, line, &used_auto_qwen);
-                if (used_auto_qwen) {
+                std::string user_line = line;
+                bool user_wants_cjk = contains_cjk(user_line);
+                if (user_wants_cjk) {
+                    // Encourage same-language response for CJK prompts.
+                    user_line += "\nPlease answer in Japanese.";
+                }
+                std::string assembled = render_template_auto(history, model_chat_template, system_prompt, user_line.c_str(), &used_auto_qwen);
+                if (used_auto_qwen && chat_debug_enabled()) {
                     fprintf(stderr, "[main] auto-detected qwen-style chat template\n");
                 }
-                // debug: log assembled prompt tokens
-                std::vector<int> dbg_ids = tokenizer_encode(assembled);
-                fprintf(stderr, "[main] assembled prompt token count=%zu\n", dbg_ids.size());
-                if (!dbg_ids.empty()) {
-                    fprintf(stderr, "[main] token ids:");
-                    for (size_t ii=0; ii<dbg_ids.size(); ++ii) fprintf(stderr, " %d", dbg_ids[ii]);
-                    fprintf(stderr, "\n");
-                    std::string dbg_dec = tokenizer_decode(dbg_ids);
-                    fprintf(stderr, "[main] decoded assembled prompt: %s\n", dbg_dec.c_str());
+                if (chat_debug_enabled()) {
+                    std::vector<int> dbg_ids = tokenizer_encode(assembled);
+                    fprintf(stderr, "[main] assembled prompt token count=%zu\n", dbg_ids.size());
+                    if (!dbg_ids.empty()) {
+                        fprintf(stderr, "[main] token ids:");
+                        for (size_t ii=0; ii<dbg_ids.size(); ++ii) fprintf(stderr, " %d", dbg_ids[ii]);
+                        fprintf(stderr, "\n");
+                        std::string dbg_dec = tokenizer_decode(dbg_ids);
+                        fprintf(stderr, "[main] decoded assembled prompt: %s\n", dbg_dec.c_str());
+                    }
                 }
                 // If model doesn't provide a template, default to single deterministic template.
                 // Optional debug mode can still run all candidate templates.
@@ -625,16 +773,52 @@ int main(int argc, char** argv) {
                 minxfmr_reset(ctx);
                 minxfmr_generate(ctx, assembled.c_str(), gen_collect_only_callback, temperature, top_k);
                 std::string first_try = sanitize_assistant_text(gen_outbuf_global);
-                bool retry_needed = first_try.empty() || starts_with_bad_chat_char(first_try) || !should_store_assistant_text(first_try) || looks_corrupted_reply(first_try) || is_suspicious_assistant_text(first_try);
+                bool reply_has_cjk = contains_cjk(first_try);
+                bool language_mismatch = user_wants_cjk && !reply_has_cjk;
+                auto is_bad_reply = [&](const std::string& s, bool wants_cjk) {
+                    if (s.empty()) return true;
+                    if (starts_with_bad_chat_char(s)) return true;
+                    if (!should_store_assistant_text(s)) return true;
+                    if (looks_corrupted_reply(s)) return true;
+                    if (is_suspicious_assistant_text(s)) return true;
+                    if (is_low_information_reply(s)) return true;
+                    if (wants_cjk && !contains_cjk(s)) return true;
+                    return false;
+                };
+
+                bool retry_needed = is_bad_reply(first_try, user_wants_cjk);
+                if (language_mismatch) retry_needed = true;
                 if (retry_needed) {
-                    fprintf(stderr, "[main] retrying turn with greedy fallback due to low-quality sampled reply\n");
+                    if (chat_debug_enabled()) {
+                        fprintf(stderr, "[main] retrying turn with greedy fallback due to low-quality sampled reply\n");
+                    }
                     gen_outbuf_global.clear();
                     minxfmr_reset(ctx);
-                    minxfmr_generate(ctx, assembled.c_str(), gen_collect_only_callback, 0.0f, 1);
+                    // Retry with tighter sampling, but avoid strict greedy collapse.
+                    minxfmr_generate(ctx, assembled.c_str(), gen_collect_only_callback, 0.2f, 20);
+
+                    std::string retry_try = sanitize_assistant_text(gen_outbuf_global);
+                    bool retry_still_bad = is_bad_reply(retry_try, user_wants_cjk);
+
+                    // Final rescue: run stateless prompt (no history) to prevent bad
+                    // assistant turns from poisoning subsequent generations.
+                    if (retry_still_bad) {
+                        bool dummy_used_auto_qwen = false;
+                        std::vector<std::string> empty_history;
+                        std::string rescue_user = line;
+                        if (user_wants_cjk) rescue_user += "\nPlease answer in Japanese.";
+                        std::string rescue = render_template_auto(empty_history, model_chat_template, system_prompt, rescue_user.c_str(), &dummy_used_auto_qwen);
+                        gen_outbuf_global.clear();
+                        minxfmr_reset(ctx);
+                        minxfmr_generate(ctx, rescue.c_str(), gen_collect_only_callback, 0.2f, 20);
+                    }
                 }
 
                 std::string printable = sanitize_assistant_text(gen_outbuf_global);
                 if (printable.empty()) printable = gen_outbuf_global;
+                if (user_wants_cjk && !contains_cjk(printable) && looks_corrupted_reply(printable)) {
+                    printable = clean_fallback;
+                }
                 if (printable.empty() || starts_with_bad_chat_char(printable) || looks_corrupted_reply(printable) || is_suspicious_assistant_text(printable)) {
                     printable = "Sorry, I could not generate a clean response. Please try again.";
                 }
@@ -647,16 +831,24 @@ int main(int argc, char** argv) {
                 if (allow_store && sanitized == clean_fallback) {
                     allow_store = false;
                 }
+                if (allow_store && is_low_information_reply(sanitized)) {
+                    allow_store = false;
+                }
                 if (allow_store && looks_corrupted_reply(sanitized)) {
                     allow_store = false;
-                    fprintf(stderr, "[main] skipping history store due to corrupted reply pattern\n");
+                    if (chat_debug_enabled()) {
+                        fprintf(stderr, "[main] skipping history store due to corrupted reply pattern\n");
+                    }
                 }
+                if (allow_store && user_wants_cjk && !contains_cjk(sanitized)) allow_store = false;
                 if (allow_store) {
                     sanitized = utf8_truncate_for_history(sanitized, 320);
                     history.push_back(line);
                     history.push_back(sanitized);
                 } else {
-                    fprintf(stderr, "[main] skipping history store due to suspicious/empty assistant text\n");
+                    if (chat_debug_enabled()) {
+                        fprintf(stderr, "[main] skipping history store due to suspicious/empty assistant text\n");
+                    }
                 }
                 
             }

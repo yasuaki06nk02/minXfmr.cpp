@@ -205,8 +205,32 @@ bool backend_using_cuda() {
     return backend_get_kind() == BackendKind::CUDA;
 }
 
+void backend_set_cuda_quant_parity_mode(int mode) {
+#if defined(MINXFMR_ENABLE_CUDA)
+    cuda_backend_set_quant_parity_mode(mode);
+#else
+    (void)mode;
+#endif
+}
+
+int backend_get_cuda_quant_parity_mode() {
+#if defined(MINXFMR_ENABLE_CUDA)
+    return cuda_backend_get_quant_parity_mode();
+#else
+    return -1;
+#endif
+}
+
 bool backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
     backend_initialize_from_env();
+    // Autoregressive decoding mostly issues tiny GEMMs (m=1). For these,
+    // host/device launch + copy overhead dominates and can also introduce
+    // backend drift against the CPU reference path. Prefer CPU directly.
+    if (A && B && out &&
+        A->type == DataType::F32 && B->type == DataType::F32 && out->type == DataType::F32 &&
+        A->rows <= 2) {
+        return cpu_matmul(A, B, out);
+    }
 #if defined(MINXFMR_ENABLE_CUDA)
     // Prefer CUDA when selected and available; fallback is always CPU.
     if (g_backend_kind == BackendKind::CUDA && cuda_backend_matmul(A, B, out)) return true;
@@ -216,8 +240,12 @@ bool backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
 
 bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out) {
     backend_initialize_from_env();
+    const bool prefer_cpu_tiny_f32 =
+        (A && B && out &&
+         A->type == DataType::F32 && B->type == DataType::F32 && out->type == DataType::F32 &&
+         A->rows <= 2);
 #if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA && cuda_backend_matmul_rhs_transposed(A, B, out)) return true;
+    if (!prefer_cpu_tiny_f32 && g_backend_kind == BackendKind::CUDA && cuda_backend_matmul_rhs_transposed(A, B, out)) return true;
 #endif
 
     if (!A || !B || !out) return false;
@@ -362,33 +390,25 @@ void backend_release_resources() {
 
 bool backend_matvec_strided(const float* vec, const float* mat, float* out, size_t K, size_t N, size_t mat_row_stride) {
     backend_initialize_from_env();
-#if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA && cuda_backend_matvec_strided(vec, mat, out, K, N, mat_row_stride)) return true;
-#endif
+    // Keep strided helper ops on CPU for correctness and latency stability.
+    // These call sites commonly pass submatrix pointers (row offsets), and
+    // CUDA upload paths can over-copy when treating them as full contiguous
+    // matrices, which harms quality on chat workloads.
     return cpu_matvec_strided(vec, mat, out, K, N, mat_row_stride);
 }
 
 bool backend_vec_dot_rows(const float* vec, const float* mat_rows, float* out, size_t K, size_t Nrows, size_t row_stride) {
     backend_initialize_from_env();
-#if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA && cuda_backend_vec_dot_rows(vec, mat_rows, out, K, Nrows, row_stride)) return true;
-#endif
     return cpu_vec_dot_rows(vec, mat_rows, out, K, Nrows, row_stride);
 }
 
 bool backend_vec_dot_rows_ring(const float* vec, const float* ring, size_t head, size_t seq_max, size_t len, size_t K, size_t row_stride, float* out) {
     backend_initialize_from_env();
-#if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA && cuda_backend_vec_dot_rows_ring(vec, ring, head, seq_max, len, K, row_stride, out)) return true;
-#endif
     return cpu_vec_dot_rows_ring(vec, ring, head, seq_max, len, K, row_stride, out);
 }
 
 bool backend_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* out, size_t Nrows, size_t Ncols, size_t row_stride) {
     backend_initialize_from_env();
-#if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA && cuda_backend_vec_mul_rows_cols(vec, mat_rows, out, Nrows, Ncols, row_stride)) return true;
-#endif
     return cpu_vec_mul_rows_cols(vec, mat_rows, out, Nrows, Ncols, row_stride);
 }
 

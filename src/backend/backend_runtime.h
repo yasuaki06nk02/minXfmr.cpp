@@ -20,6 +20,13 @@ BackendKind backend_get_kind();
 const char* backend_get_name();
 bool backend_using_cuda();
 
+// CUDA quant parity mode control:
+//  -1: follow environment variable MINXFMR_CUDA_QUANT_PARITY
+//   0: force quantized CUDA kernels path
+//   1: force dequant-F32 parity path
+void backend_set_cuda_quant_parity_mode(int mode);
+int backend_get_cuda_quant_parity_mode();
+
 bool backend_matmul(const Tensor* A, const Tensor* B, Tensor* out);
 bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out);
 bool backend_matvec_strided(const float* vec, const float* mat, float* out, size_t K, size_t N, size_t mat_row_stride);

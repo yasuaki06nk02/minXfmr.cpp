@@ -36,6 +36,9 @@ struct GGUF_File {
     std::vector<std::string> vocab_tokens;
     std::vector<float> vocab_scores;
     std::vector<int> vocab_types;
+    std::string tokenizer_model;
+    std::string tokenizer_pre;
+    std::vector<std::string> tokenizer_merges;
     // Optional metadata supplied by model authors
     std::string chat_template;
     std::vector<std::string> special_tokens;

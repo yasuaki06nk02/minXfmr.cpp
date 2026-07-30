@@ -8,6 +8,49 @@
 #include <limits>
 #include <string>
 
+static bool gguf_verbose_enabled() {
+    const char* v = std::getenv("MINXFMR_GGUF_VERBOSE");
+    return v && v[0] == '1';
+}
+
+static void gguf_log_tensor_name_hints(const GGUF_File& gf, int layer) {
+    if (!gguf_verbose_enabled()) return;
+    fprintf(stderr, "[gguf] tensor-name hints for layer=%d:\n", layer);
+    if (layer < 0) {
+        size_t printed = 0;
+        for (const auto& t : gf.tensors) {
+            fprintf(stderr, "[gguf]   %s\n", t.name.c_str());
+            if (++printed >= 40) break;
+        }
+        return;
+    }
+    size_t printed = 0;
+    for (const auto& t : gf.tensors) {
+        const bool hint = t.name.find("attn") != std::string::npos ||
+            t.name.find("attention") != std::string::npos ||
+            t.name.find("proj") != std::string::npos ||
+            t.name.find("norm") != std::string::npos ||
+            t.name.find("embed") != std::string::npos ||
+            t.name.find("head") != std::string::npos ||
+            t.name.find("mlp") != std::string::npos ||
+            t.name.find("feed_forward") != std::string::npos ||
+            t.name.find("wq") != std::string::npos ||
+            t.name.find("wk") != std::string::npos ||
+            t.name.find("wv") != std::string::npos ||
+            t.name.find("wo") != std::string::npos;
+        if (!hint) continue;
+        if (layer >= 0) {
+            char prefix[32];
+            std::snprintf(prefix, sizeof(prefix), "layers.%d.", layer);
+            if (t.name.find(prefix) == std::string::npos && t.name.find("blk.") == std::string::npos && t.name.find("model.layers.") == std::string::npos) {
+                continue;
+            }
+        }
+        fprintf(stderr, "[gguf]   %s\n", t.name.c_str());
+        if (++printed >= 40) break;
+    }
+}
+
 // This file resolves architecture-dependent GGUF tensor names into a common runtime form.
 
 // backing storage for accessors
@@ -26,6 +69,9 @@ bool gguf_try_load_projections_for_layer(const char* path, int layer, Tensor*& o
     outWq = outWk = outWv = nullptr;
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
+    if (layer == 0) {
+        gguf_log_tensor_name_hints(gf, layer);
+    }
     (void)0;
 
     auto make_candidates = [&](char proj) {
@@ -33,19 +79,24 @@ bool gguf_try_load_projections_for_layer(const char* path, int layer, Tensor*& o
         // We try a prioritized list and load the first match.
         std::vector<std::string> names;
         if (layer >= 0) {
-            char b0[64], b1[96], b2[80];
+            char b0[64], b1[96], b2[80], b3[96], b4[96], b5[96], b6[96], b7[96];
             const char* suf = (proj == 'q') ? "q" : ((proj == 'k') ? "k" : "v");
             std::snprintf(b0, sizeof(b0), "blk.%d.attn_%c.weight", layer, proj);
             std::snprintf(b1, sizeof(b1), "model.layers.%d.attention.w%c.weight", layer, proj);
             std::snprintf(b2, sizeof(b2), "layers.%d.attention.w%c.weight", layer, proj);
-            char b3[96], b4[96];
             std::snprintf(b3, sizeof(b3), "model.blocks.%d.attention.w%c.weight", layer, proj);
             std::snprintf(b4, sizeof(b4), "layers.%d.attn.w%c.weight", layer, proj);
+            std::snprintf(b5, sizeof(b5), "model.layers.%d.self_attn.%c_proj.weight", layer, proj);
+            std::snprintf(b6, sizeof(b6), "model.layers.%d.self_attn.w%c.weight", layer, proj);
+            std::snprintf(b7, sizeof(b7), "model.layers.%d.attn.%c_proj.weight", layer, proj);
             names.emplace_back(b0);
             names.emplace_back(b1);
             names.emplace_back(b2);
             names.emplace_back(b3);
             names.emplace_back(b4);
+            names.emplace_back(b5);
+            names.emplace_back(b6);
+            names.emplace_back(b7);
             names.emplace_back(std::string(suf) + "_proj.weight");
             names.emplace_back(std::string("attn_") + suf + ".weight");
             names.emplace_back(std::string("w") + suf + ".weight");
@@ -71,16 +122,22 @@ bool gguf_try_load_projections_for_layer(const char* path, int layer, Tensor*& o
             if (strcmp(tag, "Wk")==0) { gguf_last_name_Wk = info.name; gguf_last_rows_Wk = info.rows; gguf_last_cols_Wk = info.cols; }
             if (strcmp(tag, "Wv")==0) { gguf_last_name_Wv = info.name; gguf_last_rows_Wv = info.rows; gguf_last_cols_Wv = info.cols; }
             float minv,maxv; double mean; gguf_tensor_stats(t,minv,maxv,mean);
-            fprintf(stderr, "[gguf] loaded %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n", tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+            if (gguf_verbose_enabled()) {
+                fprintf(stderr, "[gguf] loaded %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n", tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+            }
             // If CUDA backend is active, warm backend-side CUDA caches for this tensor.
             if (backend_using_cuda()) {
                 if (backend_preload_tensor(t)) {
-                    fprintf(stderr, "[gguf] preloaded %s for CUDA execution\n", tag);
+                    if (gguf_verbose_enabled()) {
+                        fprintf(stderr, "[gguf] preloaded %s for CUDA execution\n", tag);
+                    }
                 } else {
                     const char* err = backend_last_preload_error();
                     if (!err || !err[0]) err = "(no backend error message)";
-                    fprintf(stderr, "[gguf] failed to upload %s to CUDA; keeping host copy (tensor remains in CPU RAM)\n", tag);
-                    fprintf(stderr, "[gguf]   upload failure reason: %s\n", err);
+                    if (gguf_verbose_enabled()) {
+                        fprintf(stderr, "[gguf] failed to upload %s to CUDA; keeping host copy (tensor remains in CPU RAM)\n", tag);
+                        fprintf(stderr, "[gguf]   upload failure reason: %s\n", err);
+                    }
                 }
             }
             out = t;
@@ -140,6 +197,9 @@ bool gguf_try_load_projection_biases_for_layer(const char* path, int layer, Tens
     outBq = outBk = outBv = nullptr;
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
+    if (layer == 0) {
+        gguf_log_tensor_name_hints(gf, layer);
+    }
 
     auto make_candidates = [&](char proj) {
         // Bias tensors follow similar naming drift across model families.
@@ -173,8 +233,10 @@ bool gguf_try_load_projection_biases_for_layer(const char* path, int layer, Tens
             float minv, maxv;
             double mean;
             gguf_tensor_stats(t, minv, maxv, mean);
-            fprintf(stderr, "[gguf] loaded %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
-                tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+            if (gguf_verbose_enabled()) {
+                fprintf(stderr, "[gguf] loaded %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
+                    tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+            }
             out = t;
         }
     };
@@ -191,6 +253,9 @@ bool gguf_try_load_attn_out_for_layer(const char* path, int layer, Tensor*& outW
     outWo = nullptr;
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
+    if (layer == 0) {
+        gguf_log_tensor_name_hints(gf, layer);
+    }
 
     std::vector<std::string> names;
     char b0[96], b1[96], b2[96], b3[96];
@@ -222,8 +287,10 @@ bool gguf_try_load_attn_out_for_layer(const char* path, int layer, Tensor*& outW
         float minv, maxv;
         double mean;
         gguf_tensor_stats(t, minv, maxv,mean);
-        fprintf(stderr, "[gguf] loaded Wo from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
-            info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+        if (gguf_verbose_enabled()) {
+            fprintf(stderr, "[gguf] loaded Wo from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
+                info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+        }
         outWo = t;
     }
     gguf_close(gf);
@@ -235,6 +302,9 @@ bool gguf_try_load_norms_for_layer(const char* path, int layer, Tensor*& outAttn
     outFfnNorm = nullptr;
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
+    if (layer == 0) {
+        gguf_log_tensor_name_hints(gf, layer);
+    }
 
     auto load_one = [&](const std::vector<std::string>& names, const char* tag, Tensor*& out) {
         std::vector<const char*> cands;
@@ -248,8 +318,10 @@ bool gguf_try_load_norms_for_layer(const char* path, int layer, Tensor*& outAttn
             float minv, maxv;
             double mean;
             gguf_tensor_stats(t, minv, maxv, mean);
-            fprintf(stderr, "[gguf] loaded %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
-                tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+            if (gguf_verbose_enabled()) {
+                fprintf(stderr, "[gguf] loaded %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
+                    tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+            }
             out = t;
         }
     };
@@ -282,6 +354,9 @@ bool gguf_try_load_ffn_for_layer(const char* path, int layer, Tensor*& outWgate,
     outWgate = outWup = outWdown = nullptr;
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
+    if (layer == 0) {
+        gguf_log_tensor_name_hints(gf, layer);
+    }
 
     auto load_one = [&](const std::vector<std::string>& names, const char* tag, Tensor*& out) {
         std::vector<const char*> cands;
@@ -295,8 +370,10 @@ bool gguf_try_load_ffn_for_layer(const char* path, int layer, Tensor*& outWgate,
             float minv, maxv;
             double mean;
             gguf_tensor_stats(t, minv, maxv, mean);
-            fprintf(stderr, "[gguf] loaded %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
-                tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+            if (gguf_verbose_enabled()) {
+                fprintf(stderr, "[gguf] loaded %s from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
+                    tag, info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+            }
             out = t;
         }
     };
@@ -368,6 +445,9 @@ bool gguf_try_load_token_embedding(const char* path, Tensor*& outWemb) {
     outWemb = nullptr;
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
+    if (gguf_verbose_enabled()) {
+        gguf_log_tensor_name_hints(gf, -1);
+    }
 
     const char* candidates[] = {
         "tok_embeddings.weight",
@@ -388,8 +468,10 @@ bool gguf_try_load_token_embedding(const char* path, Tensor*& outWemb) {
         float minv, maxv;
         double mean;
         gguf_tensor_stats(t, minv, maxv, mean);
-        fprintf(stderr, "[gguf] loaded token embedding from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
-            info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+        if (gguf_verbose_enabled()) {
+            fprintf(stderr, "[gguf] loaded token embedding from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
+                info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+        }
         outWemb = t;
     }
     gguf_close(gf);
@@ -422,6 +504,9 @@ bool gguf_try_load_final_norm(const char* path, Tensor*& outWnorm) {
     outWnorm = nullptr;
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
+    if (gguf_verbose_enabled()) {
+        gguf_log_tensor_name_hints(gf, -1);
+    }
 
     const char* candidates[] = {
         "output_norm.weight",
@@ -442,8 +527,10 @@ bool gguf_try_load_final_norm(const char* path, Tensor*& outWnorm) {
         float minv, maxv;
         double mean;
         gguf_tensor_stats(t, minv, maxv, mean);
-        fprintf(stderr, "[gguf] loaded final norm from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
-            info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+        if (gguf_verbose_enabled()) {
+            fprintf(stderr, "[gguf] loaded final norm from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
+                info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+        }
         outWnorm = t;
     }
     gguf_close(gf);
@@ -454,6 +541,9 @@ bool gguf_try_load_lm_head(const char* path, Tensor*& outWout) {
     outWout = nullptr;
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
+    if (gguf_verbose_enabled()) {
+        gguf_log_tensor_name_hints(gf, -1);
+    }
 
     const char* candidates[] = {
         "output.weight",
@@ -473,8 +563,10 @@ bool gguf_try_load_lm_head(const char* path, Tensor*& outWout) {
         float minv, maxv;
         double mean;
         gguf_tensor_stats(t, minv, maxv, mean);
-        fprintf(stderr, "[gguf] loaded lm_head from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
-            info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+        if (gguf_verbose_enabled()) {
+            fprintf(stderr, "[gguf] loaded lm_head from '%s' rows=%u cols=%u type=%s min=%f max=%f mean=%f\n",
+                info.name.c_str(), info.rows, info.cols, info.dtype.c_str(), minv, maxv, mean);
+        }
         outWout = t;
     }
     gguf_close(gf);

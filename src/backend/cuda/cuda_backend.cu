@@ -6,6 +6,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <mutex>
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 #include <string>
@@ -38,6 +39,11 @@ CudaState& state() {
     return s;
 }
 
+std::atomic<int>& quant_parity_mode_override() {
+    static std::atomic<int> mode{-1};
+    return mode;
+}
+
 bool cuda_quant_kernels_enabled() {
     static int mode = -1;
     if (mode >= 0) return mode == 1;
@@ -50,14 +56,18 @@ bool cuda_quant_kernels_enabled() {
 }
 
 bool cuda_quant_parity_mode_enabled() {
-    static int mode = -1;
-    if (mode >= 0) return mode == 1;
+    const int override_mode = quant_parity_mode_override().load(std::memory_order_relaxed);
+    if (override_mode >= 0) return override_mode == 1;
+
+    static int env_mode = -1;
+    if (env_mode >= 0) return env_mode == 1;
+
     const char* v = std::getenv("MINXFMR_CUDA_QUANT_PARITY");
-    mode = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
-    if (mode == 1) {
+    env_mode = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
+    if (env_mode == 1) {
         std::fprintf(stderr, "[cuda] quantized matmul parity mode enabled; dequantizing weights to F32 device cache for CPU parity\n");
     }
-    return mode == 1;
+    return env_mode == 1;
 }
 
 bool ensure_ready() {
@@ -597,6 +607,15 @@ __global__ void vec_mul_rows_cols_kernel(
 }
 
 } // namespace
+
+void cuda_backend_set_quant_parity_mode(int mode) {
+    if (mode < -1 || mode > 1) return;
+    quant_parity_mode_override().store(mode, std::memory_order_relaxed);
+}
+
+int cuda_backend_get_quant_parity_mode() {
+    return quant_parity_mode_override().load(std::memory_order_relaxed);
+}
 
 bool cuda_backend_is_available() {
     return ensure_ready();

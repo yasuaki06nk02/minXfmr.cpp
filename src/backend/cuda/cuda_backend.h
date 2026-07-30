@@ -6,6 +6,13 @@ bool cuda_backend_is_available();
 void cuda_backend_release_resources();
 bool cuda_backend_preload_tensor(const Tensor* t);
 
+// CUDA quant parity mode control:
+//  -1: follow environment variable MINXFMR_CUDA_QUANT_PARITY
+//   0: force quantized CUDA kernels path
+//   1: force dequant-F32 parity path
+void cuda_backend_set_quant_parity_mode(int mode);
+int cuda_backend_get_quant_parity_mode();
+
 // When the last CUDA operation failed in a way that prevented preload/upload,
 // this returns a human-readable message (owned by the backend). Empty when
 // no message is available.
