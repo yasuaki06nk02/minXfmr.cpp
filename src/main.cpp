@@ -73,51 +73,11 @@ static void gen_collect_callback(const char* token) {
     write_stdout_bytes(token);
 }
 
-static void gen_collect_only_callback(const char* token) {
-    if (!token) return;
-    gen_outbuf_global.append(token);
-}
-
 static bool chat_debug_enabled() {
     const char* v = std::getenv("MINXFMR_CHAT_DEBUG");
     if (!v || !v[0]) return false;
     const char c = v[0];
     return c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T';
-}
-
-static bool contains_cjk(const std::string& s) {
-    for (size_t i = 0; i < s.size();) {
-        unsigned char c = (unsigned char)s[i];
-        if (c < 0x80) {
-            ++i;
-            continue;
-        }
-        if ((c & 0xE0) == 0xC0) {
-            i += 2;
-            continue;
-        }
-        if ((c & 0xF0) == 0xE0 && i + 2 < s.size()) {
-            unsigned char c1 = (unsigned char)s[i + 1];
-            unsigned char c2 = (unsigned char)s[i + 2];
-            if ((c1 & 0xC0) == 0x80 && (c2 & 0xC0) == 0x80) {
-                unsigned int cp = ((unsigned int)(c & 0x0F) << 12) |
-                                  ((unsigned int)(c1 & 0x3F) << 6) |
-                                  (unsigned int)(c2 & 0x3F);
-                if ((cp >= 0x3040 && cp <= 0x30FF) ||  // Hiragana/Katakana
-                    (cp >= 0x3400 && cp <= 0x9FFF)) {  // CJK Unified Ideographs
-                    return true;
-                }
-            }
-            i += 3;
-            continue;
-        }
-        if ((c & 0xF8) == 0xF0) {
-            i += 4;
-            continue;
-        }
-        ++i;
-    }
-    return false;
 }
 
 static std::string utf8_truncate_for_history(const std::string& text, size_t max_bytes) {
@@ -145,7 +105,6 @@ int main(int argc, char** argv) {
     float top_p = 1.0f;
     int top_k = 8;
     int max_gen_tokens = 128;
-    const std::string clean_fallback = "Sorry, I could not generate a clean response. Please try again.";
     const char* stop_token = nullptr;
     const char* log_file = nullptr;
     bool run_selftest = false;
@@ -156,7 +115,6 @@ int main(int argc, char** argv) {
     bool transpose_wv = false;
     bool transpose_wo = false;
     bool transpose_user_override = false;
-    bool try_all_templates = false;
     bool emit_vocab = false;
     bool temp_set_by_user = false;
     bool topk_set_by_user = false;
@@ -231,9 +189,6 @@ int main(int argc, char** argv) {
                 transpose_square = false;
                 transpose_wq = transpose_wk = transpose_wv = transpose_wo = false;
                 transpose_user_override = true;
-            }
-            if (strcmp(argv[i], "--try-all-templates")==0) {
-                try_all_templates = true;
             }
             if (strcmp(argv[i], "--emit-vocab")==0) {
                 emit_vocab = true;
@@ -497,99 +452,6 @@ int main(int argc, char** argv) {
         return out;
     };
 
-    auto is_suspicious_assistant_text = [](const std::string& text) {
-        static const std::vector<std::string> markers = {
-            "<s>", "</s>", "[INST]", "[/INST]", "<|assistant|>", "<|user|>",
-            "<assistant>", "<user>", "[/ASSISTANT]", "[/USER]", "<<SYS>>", "<</SYS>>",
-            "speaker", "SYSTEMMODULE", "INST", "USER", "ASSISTANT", "SYS",
-            "<tool_call>", "</tool_call>", "<tool_response>", "</tool_response>"
-        };
-        for (const std::string& marker : markers) {
-            if (text.find(marker) != std::string::npos) return true;
-        }
-        return false;
-    };
-
-    auto should_store_assistant_text = [](const std::string& text) {
-        if (text.empty()) return false;
-        if (text.find("```") != std::string::npos) return false;
-        if (text.find("Explanation:") != std::string::npos) return false;
-        if (text.find("String.") != std::string::npos) return false;
-        if (text.find("|>") != std::string::npos) return false;
-        if (text.find("[|") != std::string::npos) return false;
-
-        size_t line_count = 1;
-        size_t non_space = 0;
-        size_t alpha_num = 0;
-        size_t symbol_like = 0;
-        bool has_non_ascii = false;
-        size_t i = 0;
-        for (unsigned char c : text) {
-            if (c == '\n') ++line_count;
-            if (c != ' ' && c != '\t' && c != '\r' && c != '\n') ++non_space;
-            if (std::isalnum((int)c)) ++alpha_num;
-            if (c == '|' || c == '<' || c == '>' || c == '[' || c == ']') ++symbol_like;
-            if (c >= 0x80) has_non_ascii = true;
-        }
-        if (non_space == 0) return false;
-        if (line_count > 16) return false;
-        while (i < text.size() && std::isspace((unsigned char)text[i])) ++i;
-        if (i < text.size() && (text[i] == '|' || text[i] == '<')) return false;
-        if (non_space <= 2) return false;
-        // Accept non-Latin replies (e.g. Japanese) even when std::isalnum
-        // cannot classify UTF-8 bytes as alnum in the current locale.
-        if (alpha_num == 0 && non_space > 8 && !has_non_ascii) return false;
-        if (symbol_like * 2 >= non_space) return false;
-        return true;
-    };
-
-    auto looks_corrupted_reply = [](const std::string& text) {
-        if (text.empty()) return true;
-        if (text.find("<|") != std::string::npos) return true;
-        if (text.find("|<") != std::string::npos) return true;
-        if (text.find(":i:") != std::string::npos) return true;
-        size_t pipe_count = 0;
-        for (unsigned char c : text) {
-            if (c == '|') ++pipe_count;
-        }
-        if (pipe_count >= 2) return true;
-        return false;
-    };
-
-    auto starts_with_bad_chat_char = [](const std::string& text) {
-        size_t i = 0;
-        while (i < text.size() && std::isspace((unsigned char)text[i])) ++i;
-        if (i >= text.size()) return true;
-        char c = text[i];
-        return c == '|' || c == '<' || c == '>' || c == '[' || c == ']' ||
-               c == ':' || c == ';' || c == ',' || c == '.' || c == '\'' || c == '"';
-    };
-
-    auto to_lower_ascii = [](const std::string& s) {
-        std::string out = s;
-        for (char& ch : out) {
-            unsigned char c = (unsigned char)ch;
-            if (c >= 'A' && c <= 'Z') ch = (char)(c - 'A' + 'a');
-        }
-        return out;
-    };
-
-    auto is_low_information_reply = [&](const std::string& text) {
-        if (text.empty()) return true;
-        std::string t = text;
-        while (!t.empty() && std::isspace((unsigned char)t.back())) t.pop_back();
-        std::string low = to_lower_ascii(t);
-
-        if (low.rfind("i'm sorry", 0) == 0) return true;
-        if (low.rfind("i am sorry", 0) == 0) return true;
-        if (low.find("i can't understand") != std::string::npos) return true;
-        if (low.find("i am an ai language") != std::string::npos) return true;
-
-        // A short question-like echo is usually not a useful answer.
-        if (!t.empty() && t.back() == '?' && t.size() < 64) return true;
-        return false;
-    };
-
     auto looks_like_qwen_jinja_template = [](const char* tpl) {
         if (!tpl || tpl[0] == '\0') return false;
         return std::strstr(tpl, "<|im_start|>") != nullptr &&
@@ -699,13 +561,7 @@ int main(int argc, char** argv) {
                     history.pop_back();
                 }
                 bool used_auto_qwen = false;
-                std::string user_line = line;
-                bool user_wants_cjk = contains_cjk(user_line);
-                if (user_wants_cjk) {
-                    // Encourage same-language response for CJK prompts.
-                    user_line += "\nPlease answer in Japanese.";
-                }
-                std::string assembled = render_template_auto(history, model_chat_template, system_prompt, user_line.c_str(), &used_auto_qwen);
+                std::string assembled = render_template_auto(history, model_chat_template, system_prompt, line.c_str(), &used_auto_qwen);
                 if (used_auto_qwen && chat_debug_enabled()) {
                     fprintf(stderr, "[main] auto-detected qwen-style chat template\n");
                 }
@@ -720,151 +576,36 @@ int main(int argc, char** argv) {
                         fprintf(stderr, "[main] decoded assembled prompt: %s\n", dbg_dec.c_str());
                     }
                 }
-                // If model doesn't provide a template, default to single deterministic template.
-                // Optional debug mode can still run all candidate templates.
-                if (!(model_chat_template && model_chat_template[0] != '\0') && try_all_templates) {
-                    std::vector<std::string> candidates = {
-                        "<s>[INST] <<SYS>>\n{{SYSTEM}}\n<</SYS>>\n\n{{HISTORY}}{{USER}} [/INST]",
-                        "[INST]{{SYSTEM}}\n{{HISTORY}}{{USER}}[/INST]",
-                        "<s>{{SYSTEM}}\n{{HISTORY}}User: {{USER}}\nAssistant:\n",
-                        "<s>[INST] {{USER}} [/INST]",
-                    };
-                    for (size_t ci=0; ci<candidates.size(); ++ci) {
-                        std::string tpl = candidates[ci];
-                        auto replace_all_local = [&](const std::string& key, const std::string& val) {
-                            size_t pos = 0; while ((pos = tpl.find(key, pos)) != std::string::npos) { tpl.replace(pos, key.size(), val); pos += val.size(); }
-                        };
-                        size_t begin = history.size() > (size_t)max_history ? history.size() - (size_t)max_history : 0;
-                        std::string history_blob;
-                        for (size_t i = begin; i + 1 < history.size(); i += 2) { history_blob += history[i]; history_blob += "\n"; history_blob += history[i+1]; history_blob += "\n"; }
-                        replace_all_local("{{SYSTEM}}", system_prompt ? system_prompt : "");
-                        replace_all_local("{{HISTORY}}", history_blob);
-                        replace_all_local("{{USER}}", line);
-                        fprintf(stderr, "[main] trying template %zu => '%s'\n", ci, tpl.c_str());
-                        // log tokens
-                        std::vector<int> dbg_ids = tokenizer_encode(tpl);
-                        fprintf(stderr, "[main] tpl %zu token count=%zu\n", ci, dbg_ids.size());
-                        fprintf(stderr, "[main] tpl %zu ids:", ci);
-                        for (size_t ii=0; ii<dbg_ids.size(); ++ii) fprintf(stderr, " %d", dbg_ids[ii]);
-                        fprintf(stderr, "\n");
-                        // run generation for this template
-                        gen_outbuf_global.clear();
-                        printf("assistant(template %zu)> ", ci);
-                        minxfmr_reset(ctx);
-                        minxfmr_generate(ctx, tpl.c_str(), gen_collect_callback, temperature, top_k);
-                        printf("\n");
-                        fprintf(stderr, "[main] tpl %zu output: %s\n", ci, gen_outbuf_global.c_str());
-                    }
-                    // push only the raw line into history as before
-                    std::string sanitized = sanitize_assistant_text(gen_outbuf_global);
-                    bool allow_store = !sanitized.empty() && !is_suspicious_assistant_text(sanitized) && should_store_assistant_text(sanitized);
-                    if (allow_store) {
-                        sanitized = utf8_truncate_for_history(sanitized, 320);
-                        history.push_back(line);
-                        history.push_back(sanitized);
-                    } else {
-                        fprintf(stderr, "[main] skipping history store for template reply due to suspicious/empty assistant text\n");
-                    }
-                    continue;
-                }
                 gen_outbuf_global.clear();
                 printf("assistant> ");
                 if (debug_attn_once) attention_set_debug_once(true);
                 minxfmr_reset(ctx);
-                minxfmr_generate(ctx, assembled.c_str(), gen_collect_only_callback, temperature, top_k);
-                std::string first_try = sanitize_assistant_text(gen_outbuf_global);
-                bool reply_has_cjk = contains_cjk(first_try);
-                bool language_mismatch = user_wants_cjk && !reply_has_cjk;
-                auto is_bad_reply = [&](const std::string& s, bool wants_cjk) {
-                    if (s.empty()) return true;
-                    if (starts_with_bad_chat_char(s)) return true;
-                    if (!should_store_assistant_text(s)) return true;
-                    if (looks_corrupted_reply(s)) return true;
-                    if (is_suspicious_assistant_text(s)) return true;
-                    if (is_low_information_reply(s)) return true;
-                    if (wants_cjk && !contains_cjk(s)) return true;
-                    return false;
-                };
-
-                bool retry_needed = is_bad_reply(first_try, user_wants_cjk);
-                if (language_mismatch) retry_needed = true;
-                if (retry_needed) {
-                    if (chat_debug_enabled()) {
-                        fprintf(stderr, "[main] retrying turn with greedy fallback due to low-quality sampled reply\n");
-                    }
-                    gen_outbuf_global.clear();
-                    minxfmr_reset(ctx);
-                    // Retry with tighter sampling, but avoid strict greedy collapse.
-                    minxfmr_generate(ctx, assembled.c_str(), gen_collect_only_callback, 0.2f, 20);
-
-                    std::string retry_try = sanitize_assistant_text(gen_outbuf_global);
-                    bool retry_still_bad = is_bad_reply(retry_try, user_wants_cjk);
-
-                    // Final rescue: run stateless prompt (no history) to prevent bad
-                    // assistant turns from poisoning subsequent generations.
-                    if (retry_still_bad) {
-                        bool dummy_used_auto_qwen = false;
-                        std::vector<std::string> empty_history;
-                        std::string rescue_user = line;
-                        if (user_wants_cjk) rescue_user += "\nPlease answer in Japanese.";
-                        std::string rescue = render_template_auto(empty_history, model_chat_template, system_prompt, rescue_user.c_str(), &dummy_used_auto_qwen);
-                        gen_outbuf_global.clear();
-                        minxfmr_reset(ctx);
-                        minxfmr_generate(ctx, rescue.c_str(), gen_collect_only_callback, 0.2f, 20);
-                    }
-                }
-
-                std::string printable = sanitize_assistant_text(gen_outbuf_global);
-                if (printable.empty()) printable = gen_outbuf_global;
-                if (user_wants_cjk && !contains_cjk(printable) && looks_corrupted_reply(printable)) {
-                    printable = clean_fallback;
-                }
-                if (printable.empty() || starts_with_bad_chat_char(printable) || looks_corrupted_reply(printable) || is_suspicious_assistant_text(printable)) {
-                    printable = "Sorry, I could not generate a clean response. Please try again.";
-                }
-                gen_outbuf_global = printable;
-                if (!gen_outbuf_global.empty()) write_stdout_bytes(gen_outbuf_global.c_str());
+                minxfmr_generate(ctx, assembled.c_str(), gen_collect_callback, temperature, top_k);
                 printf("\n");
 
                 std::string sanitized = sanitize_assistant_text(gen_outbuf_global);
-                bool allow_store = !sanitized.empty() && !is_suspicious_assistant_text(sanitized) && should_store_assistant_text(sanitized);
-                if (allow_store && sanitized == clean_fallback) {
-                    allow_store = false;
-                }
-                if (allow_store && is_low_information_reply(sanitized)) {
-                    allow_store = false;
-                }
-                if (allow_store && looks_corrupted_reply(sanitized)) {
-                    allow_store = false;
-                    if (chat_debug_enabled()) {
-                        fprintf(stderr, "[main] skipping history store due to corrupted reply pattern\n");
-                    }
-                }
-                if (allow_store && user_wants_cjk && !contains_cjk(sanitized)) allow_store = false;
-                if (allow_store) {
+                if (!sanitized.empty()) {
                     sanitized = utf8_truncate_for_history(sanitized, 320);
                     history.push_back(line);
                     history.push_back(sanitized);
                 } else {
                     if (chat_debug_enabled()) {
-                        fprintf(stderr, "[main] skipping history store due to suspicious/empty assistant text\n");
+                        fprintf(stderr, "[main] skipping history store due to empty assistant text\n");
                     }
                 }
                 
             }
         } else {
             printf("Entering interactive mode. Type 'reset' to clear cache, 'exit' to quit.\n");
-            char line[256];
+            std::string line;
             while (true) {
                 printf("prompt> ");
                 fflush(stdout);
-                if (!fgets(line, sizeof(line), stdin)) break;
-                // trim newline
-                size_t L = strlen(line); if (L>0 && line[L-1]=='\n') line[L-1]='\0';
-                if (strcmp(line, "exit") == 0) break;
-                if (strcmp(line, "reset") == 0) { minxfmr_reset(ctx); printf("context reset\n"); continue; }
-                if (strlen(line) == 0) continue;
-                minxfmr_generate(ctx, line, print_callback, 1.0, 3);
+                if (!read_chat_line_utf8(line)) break;
+                if (line == "exit") break;
+                if (line == "reset") { minxfmr_reset(ctx); printf("context reset\n"); continue; }
+                if (line.empty()) continue;
+                minxfmr_generate(ctx, line.c_str(), print_callback, temperature, top_k);
                 printf("\n");
             }
         }

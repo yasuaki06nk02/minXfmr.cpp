@@ -380,8 +380,10 @@ static bool arch_uses_square_transpose(const std::string& arch_lc) {
 }
 
 static bool arch_prefers_cuda_quant_parity(const std::string& arch_lc) {
-    // Qwen-family models are currently more sensitive to quantized CUDA path drift.
-    return arch_lc.rfind("qwen", 0) == 0;
+    (void)arch_lc;
+    // Keep parity off by default to match llama.cpp-style CUDA behavior.
+    // Users can still opt in via MINXFMR_CUDA_QUANT_PARITY=1.
+    return false;
 }
 
 static bool apply_norm_scale_local(Tensor* x, const Tensor* w) {

@@ -48,9 +48,14 @@ bool cuda_quant_kernels_enabled() {
     static int mode = -1;
     if (mode >= 0) return mode == 1;
     const char* v = std::getenv("MINXFMR_CUDA_QUANT");
-    mode = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
+    if (!v) {
+        // llama.cpp-like default: keep quantized matmul on GPU unless explicitly disabled.
+        mode = 1;
+    } else {
+        mode = (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T') ? 1 : 0;
+    }
     if (mode == 0) {
-        std::fprintf(stderr, "[cuda] quantized matmul kernels disabled by default; falling back to CPU for quantized weights (set MINXFMR_CUDA_QUANT=1 to enable experimental CUDA quant kernels)\n");
+        std::fprintf(stderr, "[cuda] quantized matmul kernels disabled by MINXFMR_CUDA_QUANT; falling back to CPU for quantized weights\n");
     }
     return mode == 1;
 }
@@ -65,7 +70,7 @@ bool cuda_quant_parity_mode_enabled() {
     const char* v = std::getenv("MINXFMR_CUDA_QUANT_PARITY");
     env_mode = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
     if (env_mode == 1) {
-        std::fprintf(stderr, "[cuda] quantized matmul parity mode enabled; dequantizing weights to F32 device cache for CPU parity\n");
+        std::fprintf(stderr, "[cuda] quantized matmul parity mode enabled; host-side dequantizing weights to F32 device cache for numerical parity\n");
     }
     return env_mode == 1;
 }
@@ -985,8 +990,6 @@ bool cuda_backend_vec_dot_rows(const float* vec, const float* mat_rows, float* o
     if (!ensure_ready()) return false;
     if (!vec || !mat_rows || !out || K == 0 || Nrows == 0) return false;
 
-    if (K * Nrows < 16384) return false;
-
     float* dVec = nullptr;
     float* dMat = nullptr;
     float* dOut = nullptr;
@@ -1026,8 +1029,6 @@ bool cuda_backend_vec_dot_rows_ring(const float* vec, const float* ring, size_t 
     if (!ensure_ready()) return false;
     if (!vec || !ring || !out || K == 0 || len == 0 || seq_max == 0) return false;
 
-    if (K * len < 16384) return false;
-
     float* dVec = nullptr;
     float* dRing = nullptr;
     float* dOut = nullptr;
@@ -1060,8 +1061,6 @@ bool cuda_backend_vec_dot_rows_ring(const float* vec, const float* ring, size_t 
 bool cuda_backend_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* out, size_t Nrows, size_t Ncols, size_t row_stride) {
     if (!ensure_ready()) return false;
     if (!vec || !mat_rows || !out || Nrows == 0 || Ncols == 0) return false;
-
-    if (Nrows * Ncols < 16384) return false;
 
     float* dVec = nullptr;
     float* dMat = nullptr;
