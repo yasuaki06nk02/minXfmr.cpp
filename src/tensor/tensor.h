@@ -77,3 +77,15 @@ void tensor_set_f32(Tensor* t, size_t r, size_t c, float v);
 
 // return a new tensor which is the transpose of `in`. Caller owns the result.
 Tensor* tensor_transpose_f32(const Tensor* in);
+
+// --- Quantization helpers (shared by embedding lookup & matmul) ---
+float tensor_fp16_to_fp32(uint16_t h);
+
+// Dequantize one packed block into dst (caller provides buffer of correct size).
+void tensor_dequant_q4_k_block(const uint8_t* blk, float* dst256);  // 256 floats
+void tensor_dequant_q5_0_block(const uint8_t* blk, float* dst32);   // 32 floats
+void tensor_dequant_q8_0_block(const uint8_t* blk, float* dst32);   // 32 floats
+
+// Dequantize a single row of a quantized weight/embedding tensor into an F32 buffer.
+// dst must have room for `t->cols` floats. Returns false on type/shape mismatch.
+bool tensor_dequant_row(const Tensor* t, size_t row, float* dst);

@@ -81,107 +81,6 @@ static Tensor* tensor_clone_f32_local(const Tensor* in) {
     return out;
 }
 
-static float fp16_to_fp32_local_embed(uint16_t h) {
-    uint32_t s = (h >> 15) & 1;
-    uint32_t e = (h >> 10) & 0x1f;
-    uint32_t f = h & 0x3ff;
-    uint32_t out;
-    if (e == 0) {
-        if (f == 0) {
-            out = s << 31;
-        } else {
-            e = 1;
-            while ((f & 0x400) == 0) { f <<= 1; --e; }
-            f &= 0x3ff;
-            out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
-        }
-    } else if (e == 31) {
-        out = (s << 31) | 0x7f800000 | (f << 13);
-    } else {
-        out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
-    }
-    float v;
-    std::memcpy(&v, &out, sizeof(v));
-    return v;
-}
-
-static inline void get_scale_min_k4_embed(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
-    if (j < 4) {
-        d = q[j] & 63;
-        m = q[j + 4] & 63;
-    } else {
-        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
-    }
-}
-
-static void dequant_q4_k_block_embed(const uint8_t* blk, float* dst256) {
-    uint16_t hd = 0;
-    uint16_t hm = 0;
-    std::memcpy(&hd, blk + 0, sizeof(hd));
-    std::memcpy(&hm, blk + 2, sizeof(hm));
-    const float d = fp16_to_fp32_local_embed(hd);
-    const float dmin = fp16_to_fp32_local_embed(hm);
-
-    const uint8_t* scales = blk + 4;
-    const uint8_t* q = blk + 16;
-
-    int is = 0;
-    for (int j = 0; j < (int)TENSOR_Q4_K_QK_K; j += 64) {
-        uint8_t sc = 0;
-        uint8_t m = 0;
-
-        get_scale_min_k4_embed(is + 0, scales, sc, m);
-        const float d1 = d * sc;
-        const float m1 = dmin * m;
-
-        get_scale_min_k4_embed(is + 1, scales, sc, m);
-        const float d2 = d * sc;
-        const float m2 = dmin * m;
-
-        for (int l = 0; l < 32; ++l) dst256[j + l] = d1 * (q[l] & 0xF) - m1;
-        for (int l = 0; l < 32; ++l) dst256[j + 32 + l] = d2 * (q[l] >> 4) - m2;
-
-        q += 32;
-        is += 2;
-    }
-}
-
-static void dequant_q5_0_block_embed(const uint8_t* blk, float* dst32) {
-    uint16_t hd = 0;
-    std::memcpy(&hd, blk, sizeof(hd));
-    const float d = fp16_to_fp32_local_embed(hd);
-
-    const uint8_t* qh = blk + 2;
-    const uint8_t* qs = blk + 6;
-
-    uint32_t hmask = 0;
-    hmask |= (uint32_t)qh[0];
-    hmask |= (uint32_t)qh[1] << 8;
-    hmask |= (uint32_t)qh[2] << 16;
-    hmask |= (uint32_t)qh[3] << 24;
-
-    for (int i = 0; i < 16; ++i) {
-        const uint8_t ql = qs[i];
-        const int low0 = (int)(ql & 0x0F);
-        const int low1 = (int)(ql >> 4);
-        const int high0 = (int)((hmask >> i) & 1u);
-        const int high1 = (int)((hmask >> (i + 16)) & 1u);
-        const int q0 = (high0 << 4) | low0;
-        const int q1 = (high1 << 4) | low1;
-        dst32[i] = d * (float)(q0 - 16);
-        dst32[i + 16] = d * (float)(q1 - 16);
-    }
-}
-
-static void dequant_q8_0_block_embed(const uint8_t* blk, float* dst32) {
-    uint16_t hd = 0;
-    std::memcpy(&hd, blk, sizeof(hd));
-    const float d = fp16_to_fp32_local_embed(hd);
-    const int8_t* qs = (const int8_t*)(blk + 2);
-    for (int i = 0; i < 32; ++i) dst32[i] = d * (float)qs[i];
-}
-
 static bool is_supported_quantized_type(DataType t) {
     return t == DataType::Q4_K || t == DataType::Q5_0 || t == DataType::Q8_0;
 }
@@ -200,91 +99,35 @@ static bool ensure_f32_tensor_shape(Tensor*& t, size_t rows, size_t cols) {
 static Tensor* token_embedding_row(const minxfmr_context* ctx, int token_id) {
     if (!ctx || !ctx->Wemb || token_id < 0) return nullptr;
     const Tensor* emb = ctx->Wemb;
-    const size_t dim = ctx->model_dim > 0 ? ctx->model_dim : ((emb->rows > emb->cols) ? emb->cols : emb->rows);
 
-    if (emb->type == DataType::Q4_K) {
-        // Common GGUF layout is [vocab x dim] in packed Q4_K blocks.
-        if (emb->rows < emb->cols) {
-            return nullptr;
-        }
-
-        if ((size_t)token_id >= emb->rows) token_id = (int)((size_t)token_id % emb->rows);
-        const size_t row_bytes = tensor_q4_k_row_bytes(emb->cols);
-        if (row_bytes == 0 || emb->bytes < emb->rows * row_bytes) return nullptr;
-
-        Tensor* row = tensor_create_f32_noinit(1, emb->cols);
-        if (!row) return nullptr;
-
-        const uint8_t* src = (const uint8_t*)emb->data + (size_t)token_id * row_bytes;
-        float* dst = (float*)row->data;
-        const size_t blocks_per_row = emb->cols / TENSOR_Q4_K_QK_K;
-        for (size_t blk = 0; blk < blocks_per_row; ++blk) {
-            dequant_q4_k_block_embed(src + blk * TENSOR_Q4_K_BLOCK_SIZE, dst + blk * TENSOR_Q4_K_QK_K);
-        }
-        return row;
-    }
-
-    if (emb->type == DataType::Q5_0) {
-        if (emb->rows < emb->cols) {
-            return nullptr;
-        }
-
-        if ((size_t)token_id >= emb->rows) token_id = (int)((size_t)token_id % emb->rows);
-        const size_t row_bytes = tensor_q5_0_row_bytes(emb->cols);
-        if (row_bytes == 0 || emb->bytes < emb->rows * row_bytes) return nullptr;
-
-        Tensor* row = tensor_create_f32_noinit(1, emb->cols);
-        if (!row) return nullptr;
-
-        const uint8_t* src = (const uint8_t*)emb->data + (size_t)token_id * row_bytes;
-        float* dst = (float*)row->data;
-        const size_t blocks_per_row = emb->cols / TENSOR_Q5_0_QK;
-        for (size_t blk = 0; blk < blocks_per_row; ++blk) {
-            dequant_q5_0_block_embed(src + blk * TENSOR_Q5_0_BLOCK_SIZE, dst + blk * TENSOR_Q5_0_QK);
-        }
-        return row;
-    }
-
-    if (emb->type == DataType::Q8_0) {
-        if (emb->rows < emb->cols) {
-            return nullptr;
-        }
-
-        if ((size_t)token_id >= emb->rows) token_id = (int)((size_t)token_id % emb->rows);
-        const size_t row_bytes = tensor_q8_0_row_bytes(emb->cols);
-        if (row_bytes == 0 || emb->bytes < emb->rows * row_bytes) return nullptr;
-
-        Tensor* row = tensor_create_f32_noinit(1, emb->cols);
-        if (!row) return nullptr;
-
-        const uint8_t* src = (const uint8_t*)emb->data + (size_t)token_id * row_bytes;
-        float* dst = (float*)row->data;
-        const size_t blocks_per_row = emb->cols / TENSOR_Q8_0_QK;
-        for (size_t blk = 0; blk < blocks_per_row; ++blk) {
-            dequant_q8_0_block_embed(src + blk * TENSOR_Q8_0_BLOCK_SIZE, dst + blk * TENSOR_Q8_0_QK);
-        }
-        return row;
-    }
-
-    if (emb->type != DataType::F32) return nullptr;
-
-    // If embeddings are stored as rows (rows >= cols) we can return a lightweight
-    // view into the backing storage instead of copying the row.
-    if (emb->rows >= emb->cols) {
-        if ((size_t)token_id >= emb->rows) token_id = (int)((size_t)token_id % emb->rows);
+    // F32 row-major: zero-copy view
+    if (emb->type == DataType::F32 && emb->rows >= emb->cols) {
+        if ((size_t)token_id >= emb->rows) return nullptr;  // ラップはやめて明示エラー
         float* ptr = (float*)emb->data + (size_t)token_id * emb->cols;
-        Tensor* view = tensor_create_f32_view(1, emb->cols, ptr);
-        return view;
+        return tensor_create_f32_view(1, emb->cols, ptr);
     }
 
-    // Otherwise the token vectors are laid out in columns; fall back to copying.
-    if ((size_t)token_id >= emb->cols) token_id = (int)((size_t)token_id % emb->cols);
-    Tensor* row = tensor_create_f32(1, emb->rows);
+    // Quantized or column-major F32: dequant/copy into owned row
+    const size_t cols = (emb->rows >= emb->cols) ? emb->cols : emb->rows;
+    if ((size_t)token_id >= emb->rows && emb->rows >= emb->cols) return nullptr;
+    if ((size_t)token_id >= emb->cols && emb->cols > emb->rows) return nullptr;
+
+    Tensor* row = tensor_create_f32_noinit(1, cols);
     if (!row) return nullptr;
-    float* dst = (float*)row->data;
-    const float* src = (const float*)emb->data;
-    for (size_t r = 0; r < emb->rows; ++r) dst[r] = src[r * emb->cols + (size_t)token_id];
-    (void)dim;
+
+    if (emb->type == DataType::F32) {
+        // column-major layout
+        const float* src = (const float*)emb->data;
+        float* dst = (float*)row->data;
+        for (size_t r = 0; r < emb->rows; ++r)
+            dst[r] = src[r * emb->cols + (size_t)token_id];
+        return row;
+    }
+
+    if (!tensor_dequant_row(emb, (size_t)token_id, (float*)row->data)) {
+        tensor_free(row);
+        return nullptr;
+    }
     return row;
 }
 
