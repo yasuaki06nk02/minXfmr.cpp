@@ -44,6 +44,8 @@ pip-wheel-metadata/
 .python-version
 
 # Models and large binaries
+models/
+.cache/
 *.gguf
 *.safetensors
 *.pt

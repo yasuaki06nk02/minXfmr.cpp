@@ -18,6 +18,10 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#ifdef _WIN32
+#include <io.h>
+#include <fcntl.h>
+#endif
 
 static bool read_chat_line_utf8(std::string& out) {
     out.clear();
@@ -56,8 +60,29 @@ static bool read_chat_line_utf8(std::string& out) {
 // model token output should go to stdout only (clean for chat). Logs go to stderr.
 static void write_stdout_bytes(const char* token) {
     if (!token) return;
+#ifdef _WIN32
+    // If stdout is attached to a Windows console, write wide chars so
+    // UTF-8 is displayed correctly. Otherwise fall back to fwrite.
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    DWORD mode = 0;
+    if (hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &mode)) {
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, token, -1, NULL, 0);
+        if (wlen > 0) {
+            std::wstring wbuf;
+            wbuf.resize((size_t)wlen - 1);
+            MultiByteToWideChar(CP_UTF8, 0, token, -1, &wbuf[0], wlen);
+            DWORD written = 0;
+            WriteConsoleW(hOut, wbuf.c_str(), (DWORD)wbuf.size(), &written, NULL);
+            return;
+        }
+    }
+    // Fallback to byte-wise write (works for pipes/redirection).
     std::fwrite(token, 1, std::strlen(token), stdout);
     std::fflush(stdout);
+#else
+    std::fwrite(token, 1, std::strlen(token), stdout);
+    std::fflush(stdout);
+#endif
 }
 
 static void print_callback(const char* token) {
@@ -93,8 +118,8 @@ int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     SetConsoleCP(CP_UTF8);
 #endif
-    const char* model = "dummy.gguf";
-    const char* prompt = "Hello world";
+    std::string model = "dummy.gguf";
+    std::string prompt = "Hello world";
     bool test_weights = false;
     bool debug_attn_once = false;
     int projection_layer = 0;
@@ -118,82 +143,63 @@ int main(int argc, char** argv) {
     bool emit_vocab = false;
     bool temp_set_by_user = false;
     bool topk_set_by_user = false;
-    if (argc > 1) model = argv[1];
-    if (argc > 2) prompt = argv[2];
-        bool run_once = false;
-        for (int i=1;i<argc;i++) {
-            if (strcmp(argv[i], "--test-weights")==0) test_weights = true;
-            if (strcmp(argv[i], "--prompt")==0 && i+1<argc) { prompt = argv[i+1]; run_once = true; }
-            if (strcmp(argv[i], "--layer")==0 && i+1<argc) {
-                projection_layer = (int)strtol(argv[i+1], nullptr, 10);
+    bool run_once = false;
+    bool show_help = false;
+        int argi = 1;
+        while (argi < argc) {
+            const char* a = argv[argi];
+            if (strcmp(a, "--test-weights") == 0) { test_weights = true; argi++; continue; }
+            if (strcmp(a, "--prompt") == 0 && argi+1 < argc) { prompt = argv[argi+1]; run_once = true; argi += 2; continue; }
+            if (strcmp(a, "--model") == 0 && argi+1 < argc) { model = argv[argi+1]; argi += 2; continue; }
+            if (strcmp(a, "--help") == 0 || strcmp(a, "-h") == 0) { show_help = true; argi++; continue; }
+            // positional args: model and prompt
+            if (a[0] != '-') {
+                if (model == "dummy.gguf") { model = a; argi++; continue; }
+                if (prompt == "Hello world") { prompt = a; argi++; continue; }
             }
-            if (strcmp(argv[i], "--debug-attn")==0) {
-                debug_attn_once = true;
-            }
-            if (strcmp(argv[i], "--chat")==0) {
-                chat_mode = true;
-            }
-            if (strcmp(argv[i], "--system")==0 && i+1<argc) {
-                system_prompt = argv[i+1];
-            }
-            if (strcmp(argv[i], "--max-history")==0 && i+1<argc) {
-                max_history = (int)strtol(argv[i+1], nullptr, 10);
-            }
-            if (strcmp(argv[i], "--temp")==0 && i+1<argc) {
-                temperature = (float)strtod(argv[i+1], nullptr);
-                temp_set_by_user = true;
-            }
-            if (strcmp(argv[i], "--top_p")==0 && i+1<argc) {
-                top_p = (float)strtod(argv[i+1], nullptr);
-            }
-            if (strcmp(argv[i], "--top_k")==0 && i+1<argc) {
-                top_k = (int)strtol(argv[i+1], nullptr, 10);
-                topk_set_by_user = true;
-            }
-            if (strcmp(argv[i], "--max-gen-tokens")==0 && i+1<argc) {
-                max_gen_tokens = (int)strtol(argv[i+1], nullptr, 10);
-            }
-            if (strcmp(argv[i], "--stop")==0 && i+1<argc) {
-                stop_token = argv[i+1];
-            }
-            if (strcmp(argv[i], "--log-file")==0 && i+1<argc) {
-                log_file = argv[i+1];
-            }
-            if (strcmp(argv[i], "--selftest")==0) {
-                run_selftest = true;
-            }
-            if (strcmp(argv[i], "--transpose-square")==0) {
-                transpose_square = true;
-                transpose_wq = transpose_wk = transpose_wv = transpose_wo = true;
-                transpose_user_override = true;
-            }
-            if (strcmp(argv[i], "--no-transpose-square")==0) {
-                transpose_square = false;
-                transpose_wq = transpose_wk = transpose_wv = transpose_wo = false;
-                transpose_user_override = true;
-            }
-            if (strcmp(argv[i], "--transpose-wq")==0) { transpose_wq = true; transpose_user_override = true; }
-            if (strcmp(argv[i], "--no-transpose-wq")==0) { transpose_wq = false; transpose_user_override = true; }
-            if (strcmp(argv[i], "--transpose-wk")==0) { transpose_wk = true; transpose_user_override = true; }
-            if (strcmp(argv[i], "--no-transpose-wk")==0) { transpose_wk = false; transpose_user_override = true; }
-            if (strcmp(argv[i], "--transpose-wv")==0) { transpose_wv = true; transpose_user_override = true; }
-            if (strcmp(argv[i], "--no-transpose-wv")==0) { transpose_wv = false; transpose_user_override = true; }
-            if (strcmp(argv[i], "--transpose-wo")==0) { transpose_wo = true; transpose_user_override = true; }
-            if (strcmp(argv[i], "--no-transpose-wo")==0) { transpose_wo = false; transpose_user_override = true; }
-            if (strcmp(argv[i], "--transpose-all")==0) {
-                transpose_square = true;
-                transpose_wq = transpose_wk = transpose_wv = transpose_wo = true;
-                transpose_user_override = true;
-            }
-            if (strcmp(argv[i], "--no-transpose-all")==0) {
-                transpose_square = false;
-                transpose_wq = transpose_wk = transpose_wv = transpose_wo = false;
-                transpose_user_override = true;
-            }
-            if (strcmp(argv[i], "--emit-vocab")==0) {
-                emit_vocab = true;
-            }
+            if (strcmp(a, "--layer") == 0 && argi+1 < argc) { projection_layer = (int)strtol(argv[argi+1], nullptr, 10); argi += 2; continue; }
+            if (strcmp(a, "--debug-attn") == 0) { debug_attn_once = true; argi++; continue; }
+            if (strcmp(a, "--chat") == 0) { chat_mode = true; argi++; continue; }
+            if (strcmp(a, "--system") == 0 && argi+1 < argc) { system_prompt = argv[argi+1]; argi += 2; continue; }
+            if (strcmp(a, "--max-history") == 0 && argi+1 < argc) { max_history = (int)strtol(argv[argi+1], nullptr, 10); argi += 2; continue; }
+            if (strcmp(a, "--temp") == 0 && argi+1 < argc) { temperature = (float)strtod(argv[argi+1], nullptr); temp_set_by_user = true; argi += 2; continue; }
+            if (strcmp(a, "--top_p") == 0 && argi+1 < argc) { top_p = (float)strtod(argv[argi+1], nullptr); argi += 2; continue; }
+            if (strcmp(a, "--top_k") == 0 && argi+1 < argc) { top_k = (int)strtol(argv[argi+1], nullptr, 10); topk_set_by_user = true; argi += 2; continue; }
+            if (strcmp(a, "--max-gen-tokens") == 0 && argi+1 < argc) { max_gen_tokens = (int)strtol(argv[argi+1], nullptr, 10); argi += 2; continue; }
+            if (strcmp(a, "--stop") == 0 && argi+1 < argc) { stop_token = argv[argi+1]; argi += 2; continue; }
+            if (strcmp(a, "--log-file") == 0 && argi+1 < argc) { log_file = argv[argi+1]; argi += 2; continue; }
+            if (strcmp(a, "--selftest") == 0) { run_selftest = true; argi++; continue; }
+            if (strcmp(a, "--transpose-square") == 0) { transpose_square = true; transpose_wq = transpose_wk = transpose_wv = transpose_wo = true; transpose_user_override = true; argi++; continue; }
+            if (strcmp(a, "--no-transpose-square") == 0) { transpose_square = false; transpose_wq = transpose_wk = transpose_wv = transpose_wo = false; transpose_user_override = true; argi++; continue; }
+            if (strcmp(a, "--transpose-wq") == 0) { transpose_wq = true; transpose_user_override = true; argi++; continue; }
+            if (strcmp(a, "--no-transpose-wq") == 0) { transpose_wq = false; transpose_user_override = true; argi++; continue; }
+            if (strcmp(a, "--transpose-wk") == 0) { transpose_wk = true; transpose_user_override = true; argi++; continue; }
+            if (strcmp(a, "--no-transpose-wk") == 0) { transpose_wk = false; transpose_user_override = true; argi++; continue; }
+            if (strcmp(a, "--transpose-wv") == 0) { transpose_wv = true; transpose_user_override = true; argi++; continue; }
+            if (strcmp(a, "--no-transpose-wv") == 0) { transpose_wv = false; transpose_user_override = true; argi++; continue; }
+            if (strcmp(a, "--transpose-wo") == 0) { transpose_wo = true; transpose_user_override = true; argi++; continue; }
+            if (strcmp(a, "--no-transpose-wo") == 0) { transpose_wo = false; transpose_user_override = true; argi++; continue; }
+            if (strcmp(a, "--transpose-all") == 0) { transpose_square = true; transpose_wq = transpose_wk = transpose_wv = transpose_wo = true; transpose_user_override = true; argi++; continue; }
+            if (strcmp(a, "--no-transpose-all") == 0) { transpose_square = false; transpose_wq = transpose_wk = transpose_wv = transpose_wo = false; transpose_user_override = true; argi++; continue; }
+            if (strcmp(a, "--emit-vocab") == 0) { emit_vocab = true; argi++; continue; }
+            // Unknown or unsupported option: skip it
+            argi++;
         }
+
+    if (show_help) {
+        printf("minxfmr_cli - simple CLI for minXfmr\n");
+        printf("Usage: minxfmr_cli [MODEL] [PROMPT] [OPTIONS]\n");
+        printf("\nOptions:\n");
+        printf("  --model <path>        Specify path to model (.gguf). Overrides positional MODEL.\n");
+        printf("  --prompt <text>       Run single prompt and exit (non-interactive).\n");
+        printf("  --chat                Enter chat mode (interactive).\n");
+        printf("  --temp <n>            Sampling temperature (default 0.7 in chat).\n");
+        printf("  --top_k <n>           Top-k sampling parameter.\n");
+        printf("  --max-gen-tokens <n>  Maximum tokens to generate (1-256).\n");
+        printf("  --help, -h            Show this help message.\n");
+        printf("\nYou can also set environment variables such as MINXFMR_BACKEND, MINXFMR_GGUF_VERBOSE.\n");
+        return 0;
+    }
 
     if (chat_mode) {
         // Chat defaults should remain stable but not fully deterministic;
@@ -381,7 +387,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    minxfmr_context* ctx = minxfmr_open_with_layer(model, projection_layer);
+    minxfmr_context* ctx = minxfmr_open_with_layer(model.c_str(), projection_layer);
     if (!ctx) return 1;
 
     // retrieve optional chat template and special tokens from model
@@ -541,7 +547,7 @@ int main(int argc, char** argv) {
 
             if (run_once && !chat_mode) {
                 if (debug_attn_once) attention_set_debug_once(true);
-                minxfmr_generate(ctx, prompt, print_callback, temperature, top_k);
+                minxfmr_generate(ctx, prompt.c_str(), print_callback, temperature, top_k);
                 printf("\n");
         } else if (chat_mode) {
             printf("Entering chat mode. Type 'reset' to clear history, 'exit' to quit.\n");

@@ -1127,6 +1127,9 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     std::vector<std::string> gen_token_strs;
     // Buffer for consecutive byte-fallback tokens like <0xE3><0x81>...
     std::vector<unsigned char> pending_bytes;
+    // Track the ids and raw token strings corresponding to pending_bytes
+    std::vector<int> pending_bytes_ids;
+    std::vector<std::string> pending_bytes_raws;
     // Buffer for recently-seen token fragments that may form a role/template
     // marker split across several token ids (e.g. '[', 'INST', ']'). Each
     // entry holds the token id and its raw token string.
@@ -1347,34 +1350,16 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             }
             return false;
         };
+        // Note: do not apply language-specific leading-piece heuristics here.
+        // The user requested not to bias toward English-like tokens; keep
+        // only a simple visibility check for first-token handling.
 
-        auto is_bad_leading_piece = [](const std::string& s) {
-            if (s.empty()) return true;
-            size_t i = 0;
-            while (i < s.size()) {
-                unsigned char c = (unsigned char)s[i];
-                if (c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f') {
-                    ++i;
-                    continue;
-                }
-                if (c == '|' || c == '<' || c == '>' || c == '[' || c == ']' || c == '{' || c == '}') return true;
-                if (c == '.' || c == ',' || c == ';' || c == ':' || c == '!' || c == '?' || c == '\'' || c == '"') return true;
-                if (c == ':' && i + 1 < s.size()) {
-                    unsigned char n = (unsigned char)s[i + 1];
-                    if ((n >= 'A' && n <= 'Z') || (n >= 'a' && n <= 'z')) return true;
-                }
-                if (c == 'Q' && i + 1 < s.size() && s[i + 1] == ':') return true;
-                return false;
-            }
-            return true;
-        };
-
-        if (gen_tokens_emitted == 0 && (!is_visible_piece(preview) || is_bad_leading_piece(preview) || is_eos_token(raw_tok) || is_role_token(raw_tok))) {
+        if (gen_tokens_emitted == 0 && (!is_visible_piece(preview) || is_eos_token(raw_tok) || is_role_token(raw_tok))) {
             for (int i = 1; i < k_use; ++i) {
                 int alt = order[(size_t)i];
                 std::string alt_raw = tokenizer_id_to_token(alt);
                 std::string alt_preview = render_token_piece(alt_raw);
-                if (is_visible_piece(alt_preview) && !is_bad_leading_piece(alt_preview) && !is_eos_token(alt_raw) && !is_role_token(alt_raw)) {
+                if (is_visible_piece(alt_preview) && !is_eos_token(alt_raw) && !is_role_token(alt_raw)) {
                     next = alt;
                     raw_tok = alt_raw;
                     if (next >= 0 && (size_t)next < logits.size()) chosen_logit = logits[(size_t)next];
@@ -1447,10 +1432,9 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                     unsigned char b = (unsigned char)((hi << 4) | lo);
                     pending_bytes.push_back(b);
                 }
-                if (emit_json) {
-                    gen_ids.push_back(next);
-                    gen_token_strs.push_back(raw_tok);
-                }
+                // Track the id and raw token string for later emission/logging
+                pending_bytes_ids.push_back(next);
+                pending_bytes_raws.push_back(raw_tok);
                 ++gen_tokens_emitted;
             } else {
                 // Append token fragment to the pending fragment buffer
@@ -1491,8 +1475,30 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                         std::string pb;
                         pb.reserve(pending_bytes.size());
                         for (unsigned char c : pending_bytes) pb.push_back((char)c);
+
+                        // Record ids/raws for JSON/debug and log the emission
+                        for (size_t ii = 0; ii < pending_bytes_ids.size(); ++ii) {
+                            gen_ids.push_back(pending_bytes_ids[ii]);
+                            gen_token_strs.push_back(pending_bytes_raws[ii]);
+                        }
+                        if (chat_debug_enabled()) {
+                            std::ostringstream oh;
+                            oh << std::hex << std::setfill('0');
+                            for (unsigned char c : pb) oh << "\\x" << std::setw(2) << (int)((unsigned char)c);
+                            std::string hexs = oh.str();
+                            std::string cumul = tokenizer_decode(gen_ids);
+                            std::ostringstream oi;
+                            for (size_t ii = 0; ii < pending_bytes_ids.size(); ++ii) {
+                                if (ii) oi << ',';
+                                oi << pending_bytes_ids[ii];
+                            }
+                            fprintf(stderr, "[minxfmr] emit bytes ids=[%s] hex=%s cumulative='%s'\n", oi.str().c_str(), hexs.c_str(), cumul.c_str());
+                            fflush(stderr);
+                        }
                         if (callback) callback(pb.c_str());
                         pending_bytes.clear();
+                        pending_bytes_ids.clear();
+                        pending_bytes_raws.clear();
                     }
 
                     // Flush accumulated fragments as normal tokens
@@ -1501,12 +1507,21 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                         const std::string &raw_flush = pp.second;
                         std::string tok = render_token_piece(raw_flush);
                         if (tok.empty()) tok = " ";
-                        if (emit_json) {
-                            gen_ids.push_back(id_flush);
-                            gen_token_strs.push_back(raw_flush);
-                        } else {
-                            if (callback) callback(tok.c_str());
+
+                        // Record id/raw, then emit and log
+                        gen_ids.push_back(id_flush);
+                        gen_token_strs.push_back(raw_flush);
+                        if (chat_debug_enabled()) {
+                            std::ostringstream oh;
+                            oh << std::hex << std::setfill('0');
+                            for (unsigned char c : tok) oh << "\\x" << std::setw(2) << (int)((unsigned char)c);
+                            std::string hexs = oh.str();
+                            std::string cumul = tokenizer_decode(gen_ids);
+                            fprintf(stderr, "[minxfmr] emit id=%d raw='%s' rendered='%s' hex=%s cumulative='%s'\n",
+                                id_flush, raw_flush.c_str(), tok.c_str(), hexs.c_str(), cumul.c_str());
+                            fflush(stderr);
                         }
+                        if (callback) callback(tok.c_str());
                         ++gen_tokens_emitted;
                         recent_tokens.push_back(id_flush);
                         if (recent_tokens.size() > 48) recent_tokens.erase(recent_tokens.begin());
@@ -1545,8 +1560,28 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         std::string pb;
         pb.reserve(pending_bytes.size());
         for (unsigned char c : pending_bytes) pb.push_back((char)c);
+        for (size_t ii = 0; ii < pending_bytes_ids.size(); ++ii) {
+            gen_ids.push_back(pending_bytes_ids[ii]);
+            gen_token_strs.push_back(pending_bytes_raws[ii]);
+        }
+        if (chat_debug_enabled()) {
+            std::ostringstream oh;
+            oh << std::hex << std::setfill('0');
+            for (unsigned char c : pb) oh << "\\x" << std::setw(2) << (int)((unsigned char)c);
+            std::string hexs = oh.str();
+            std::string cumul = tokenizer_decode(gen_ids);
+            std::ostringstream oi;
+            for (size_t ii = 0; ii < pending_bytes_ids.size(); ++ii) {
+                if (ii) oi << ',';
+                oi << pending_bytes_ids[ii];
+            }
+            fprintf(stderr, "[minxfmr] emit bytes ids=[%s] hex=%s cumulative='%s'\n", oi.str().c_str(), hexs.c_str(), cumul.c_str());
+            fflush(stderr);
+        }
         if (callback) callback(pb.c_str());
         pending_bytes.clear();
+        pending_bytes_ids.clear();
+        pending_bytes_raws.clear();
     }
 
     // Flush any pending token fragments that were not part of suppressed
@@ -1557,12 +1592,19 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             const std::string &raw_flush = pp.second;
             std::string tok = render_token_piece(raw_flush);
             if (tok.empty()) tok = " ";
-            if (emit_json) {
-                gen_ids.push_back(id_flush);
-                gen_token_strs.push_back(raw_flush);
-            } else {
-                if (callback) callback(tok.c_str());
+            gen_ids.push_back(id_flush);
+            gen_token_strs.push_back(raw_flush);
+            if (chat_debug_enabled()) {
+                std::ostringstream oh;
+                oh << std::hex << std::setfill('0');
+                for (unsigned char c : tok) oh << "\\x" << std::setw(2) << (int)((unsigned char)c);
+                std::string hexs = oh.str();
+                std::string cumul = tokenizer_decode(gen_ids);
+                fprintf(stderr, "[minxfmr] emit id=%d raw='%s' rendered='%s' hex=%s cumulative='%s'\n",
+                    id_flush, raw_flush.c_str(), tok.c_str(), hexs.c_str(), cumul.c_str());
+                fflush(stderr);
             }
+            if (callback) callback(tok.c_str());
             ++gen_tokens_emitted;
             recent_tokens.push_back(id_flush);
             if (recent_tokens.size() > 48) recent_tokens.erase(recent_tokens.begin());

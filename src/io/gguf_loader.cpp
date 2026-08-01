@@ -70,7 +70,9 @@ bool gguf_try_load_projections_for_layer(const char* path, int layer, Tensor*& o
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
     if (layer == 0) {
-        gguf_log_tensor_name_hints(gf, layer);
+        // When verbose, print all tensor names (not just hints) to aid
+        // diagnostics for models that use non-standard naming conventions.
+        gguf_log_tensor_name_hints(gf, -1);
     }
     (void)0;
 
@@ -198,7 +200,7 @@ bool gguf_try_load_projection_biases_for_layer(const char* path, int layer, Tens
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
     if (layer == 0) {
-        gguf_log_tensor_name_hints(gf, layer);
+        gguf_log_tensor_name_hints(gf, -1);
     }
 
     auto make_candidates = [&](char proj) {
@@ -254,7 +256,7 @@ bool gguf_try_load_attn_out_for_layer(const char* path, int layer, Tensor*& outW
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
     if (layer == 0) {
-        gguf_log_tensor_name_hints(gf, layer);
+        gguf_log_tensor_name_hints(gf, -1);
     }
 
     std::vector<std::string> names;
@@ -303,7 +305,7 @@ bool gguf_try_load_norms_for_layer(const char* path, int layer, Tensor*& outAttn
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
     if (layer == 0) {
-        gguf_log_tensor_name_hints(gf, layer);
+        gguf_log_tensor_name_hints(gf, -1);
     }
 
     auto load_one = [&](const std::vector<std::string>& names, const char* tag, Tensor*& out) {
@@ -354,8 +356,10 @@ bool gguf_try_load_ffn_for_layer(const char* path, int layer, Tensor*& outWgate,
     outWgate = outWup = outWdown = nullptr;
     GGUF_File gf;
     if (!gguf_open(path, gf)) return false;
-    if (layer == 0) {
-        gguf_log_tensor_name_hints(gf, layer);
+    if (gguf_verbose_enabled()) {
+        // When verbose mode is enabled, dump all tensor names to aid diagnosis
+        // (helps identify naming mismatches across exporter conventions).
+        gguf_log_tensor_name_hints(gf, -1);
     }
 
     auto load_one = [&](const std::vector<std::string>& names, const char* tag, Tensor*& out) {
