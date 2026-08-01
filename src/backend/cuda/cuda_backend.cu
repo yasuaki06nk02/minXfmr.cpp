@@ -11,6 +11,11 @@
 #include <vector>
 #include <string>
 
+// Forward-declare device-side element dequant helpers (global scope).
+__device__ __forceinline__ float dequant_block_element_q4(const uint8_t* blk, int idx);
+__device__ __forceinline__ float dequant_block_element_q5(const uint8_t* blk, int idx);
+__device__ __forceinline__ float dequant_block_element_q8(const uint8_t* blk, int idx);
+
 namespace {
 
 struct CachedDeviceBuffer {
@@ -49,10 +54,27 @@ bool cuda_quant_kernels_enabled() {
     if (mode >= 0) return mode == 1;
     const char* v = std::getenv("MINXFMR_CUDA_QUANT");
     if (!v) {
-        // Default to a safe behavior: prefer staged (host-side) dequant path
-        // unless the user explicitly opts in via MINXFMR_CUDA_QUANT=1.
-        mode = 0;
-        std::fprintf(stderr, "[cuda] MINXFMR_CUDA_QUANT not set; defaulting to staged host-side dequant for numerical safety. Set MINXFMR_CUDA_QUANT=1 to enable direct quant kernels.\n");
+        // If the user explicitly selected the CUDA backend (MINXFMR_BACKEND=cuda),
+        // prefer direct device-side quant kernels by default for performance.
+        // Otherwise default to the conservative staged host-side dequant for safety.
+        const char* bk = std::getenv("MINXFMR_BACKEND");
+        if (bk) {
+            std::string bks(bk);
+            for (size_t i = 0; i < bks.size(); ++i) {
+                char ch = bks[i];
+                if (ch >= 'A' && ch <= 'Z') bks[i] = (char)(ch - 'A' + 'a');
+            }
+            if (bks == "cuda") {
+                mode = 1;
+                std::fprintf(stderr, "[cuda] MINXFMR_BACKEND=cuda detected; enabling direct quant kernels by default. Set MINXFMR_CUDA_QUANT=0 to force staged host-side dequant.\n");
+            } else {
+                mode = 0;
+                std::fprintf(stderr, "[cuda] MINXFMR_CUDA_QUANT not set; defaulting to staged host-side dequant for numerical safety. Set MINXFMR_CUDA_QUANT=1 to enable direct quant kernels.\n");
+            }
+        } else {
+            mode = 0;
+            std::fprintf(stderr, "[cuda] MINXFMR_CUDA_QUANT not set; defaulting to staged host-side dequant for numerical safety. Set MINXFMR_CUDA_QUANT=1 to enable direct quant kernels.\n");
+        }
     } else {
         mode = (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T') ? 1 : 0;
     }
@@ -73,6 +95,17 @@ bool cuda_quant_parity_mode_enabled() {
     env_mode = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
     if (env_mode == 1) {
         std::fprintf(stderr, "[cuda] quantized matmul parity mode enabled; host-side dequantizing weights to F32 device cache for numerical parity\n");
+    }
+    return env_mode == 1;
+}
+
+bool cuda_quant_atomic_safe_enabled() {
+    static int env_mode = -1;
+    if (env_mode >= 0) return env_mode == 1;
+    const char* v = std::getenv("MINXFMR_CUDA_QUANT_ATOMIC_SAFE");
+    env_mode = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
+    if (env_mode == 1) {
+        std::fprintf(stderr, "[cuda] MINXFMR_CUDA_QUANT_ATOMIC_SAFE=1 enabled; using per-thread element decode safe kernels (slower but conservative)\n");
     }
     return env_mode == 1;
 }
@@ -526,6 +559,156 @@ __global__ void matmul_rhs_quant_kernel(
     C[row * n + col] = acc;
 }
 
+// Debug kernels: decode each packed block element-wise on device into an
+// F32 output array for comparison with host-side dequant.
+__global__ void debug_dequant_q4_blocks_kernel(
+    const uint8_t* B,
+    float* out,
+    size_t rows,
+    size_t cols,
+    size_t row_bytes) {
+    const size_t row = (size_t)blockIdx.y;
+    const size_t block = (size_t)blockIdx.x;
+    const size_t idx = (size_t)threadIdx.x;
+    if (row >= rows) return;
+    if (idx >= TENSOR_Q4_K_QK_K) return;
+    const uint8_t* blk = B + row * row_bytes + block * TENSOR_Q4_K_BLOCK_SIZE;
+    const float v = dequant_block_element_q4(blk, (int)idx);
+    const size_t col = block * TENSOR_Q4_K_QK_K + idx;
+    out[row * cols + col] = v;
+}
+
+__global__ void debug_dequant_q5_blocks_kernel(
+    const uint8_t* B,
+    float* out,
+    size_t rows,
+    size_t cols,
+    size_t row_bytes) {
+    const size_t row = (size_t)blockIdx.y;
+    const size_t block = (size_t)blockIdx.x;
+    const size_t idx = (size_t)threadIdx.x;
+    if (row >= rows) return;
+    if (idx >= TENSOR_Q5_0_QK) return;
+    const uint8_t* blk = B + row * row_bytes + block * TENSOR_Q5_0_BLOCK_SIZE;
+    const float v = dequant_block_element_q5(blk, (int)idx);
+    const size_t col = block * TENSOR_Q5_0_QK + idx;
+    out[row * cols + col] = v;
+}
+
+__global__ void debug_dequant_q8_blocks_kernel(
+    const uint8_t* B,
+    float* out,
+    size_t rows,
+    size_t cols,
+    size_t row_bytes) {
+    const size_t row = (size_t)blockIdx.y;
+    const size_t block = (size_t)blockIdx.x;
+    const size_t idx = (size_t)threadIdx.x;
+    if (row >= rows) return;
+    if (idx >= TENSOR_Q8_0_QK) return;
+    const uint8_t* blk = B + row * row_bytes + block * TENSOR_Q8_0_BLOCK_SIZE;
+    const float v = dequant_block_element_q8(blk, (int)idx);
+    const size_t col = block * TENSOR_Q8_0_QK + idx;
+    out[row * cols + col] = v;
+}
+
+bool cuda_backend_compare_dequant_internal(const Tensor* t, size_t max_mismatches) {
+    if (!ensure_ready()) return false;
+    if (!t || !t->data || t->bytes == 0) return false;
+    if (!(t->type == DataType::Q4_K || t->type == DataType::Q5_0 || t->type == DataType::Q8_0)) return false;
+
+    const size_t rows = t->rows;
+    const size_t cols = t->cols;
+    const size_t total = rows * cols;
+    const size_t row_bytes = quant_row_bytes(t->type, cols);
+    if (row_bytes == 0) return false;
+
+    // Ensure device has a copy of the packed quant data.
+    uint8_t* dBq = nullptr;
+    if (!get_or_upload_persistent(t->data, t->bytes, (void**)&dBq)) {
+        std::fprintf(stderr, "[cuda][compare] failed to upload quant tensor\n");
+        return false;
+    }
+
+    float* d_out = nullptr;
+    if (cudaMalloc((void**)&d_out, total * sizeof(float)) != cudaSuccess) {
+        std::fprintf(stderr, "[cuda][compare] cudaMalloc failed for output\n");
+        return false;
+    }
+
+    bool launch_ok = true;
+    if (t->type == DataType::Q4_K) {
+        const size_t blocks_per_row = cols / TENSOR_Q4_K_QK_K;
+        dim3 grid((unsigned int)blocks_per_row, (unsigned int)rows);
+        dim3 block((unsigned int)TENSOR_Q4_K_QK_K);
+        debug_dequant_q4_blocks_kernel<<<grid, block>>>(dBq, d_out, rows, cols, row_bytes);
+    } else if (t->type == DataType::Q5_0) {
+        const size_t blocks_per_row = cols / TENSOR_Q5_0_QK;
+        dim3 grid((unsigned int)blocks_per_row, (unsigned int)rows);
+        dim3 block((unsigned int)TENSOR_Q5_0_QK);
+        debug_dequant_q5_blocks_kernel<<<grid, block>>>(dBq, d_out, rows, cols, row_bytes);
+    } else {
+        const size_t blocks_per_row = cols / TENSOR_Q8_0_QK;
+        dim3 grid((unsigned int)blocks_per_row, (unsigned int)rows);
+        dim3 block((unsigned int)TENSOR_Q8_0_QK);
+        debug_dequant_q8_blocks_kernel<<<grid, block>>>(dBq, d_out, rows, cols, row_bytes);
+    }
+
+    if (cudaGetLastError() != cudaSuccess) launch_ok = false;
+    if (launch_ok && cudaDeviceSynchronize() != cudaSuccess) launch_ok = false;
+    if (!launch_ok) {
+        std::fprintf(stderr, "[cuda][compare] kernel launch/sync failed\n");
+        cudaFree(d_out);
+        return false;
+    }
+
+    std::vector<float> host_device_out(total);
+    if (cudaMemcpy(host_device_out.data(), d_out, total * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        std::fprintf(stderr, "[cuda][compare] cudaMemcpy D2H failed\n");
+        cudaFree(d_out);
+        return false;
+    }
+
+    // Host-side dequant for reference
+    std::vector<float> host_ref(total);
+    float* tmp = (float*)std::malloc(cols * sizeof(float));
+    if (!tmp) {
+        cudaFree(d_out);
+        return false;
+    }
+    for (size_t r = 0; r < rows; ++r) {
+        if (!tensor_dequant_row(t, r, tmp)) {
+            std::fprintf(stderr, "[cuda][compare] tensor_dequant_row failed for row %zu\n", r);
+            std::free(tmp);
+            cudaFree(d_out);
+            return false;
+        }
+        std::memcpy(host_ref.data() + r * cols, tmp, cols * sizeof(float));
+    }
+    std::free(tmp);
+
+    // Compare
+    double max_abs = 0.0;
+    double sum_abs = 0.0;
+    size_t mismatches = 0;
+    for (size_t i = 0; i < total; ++i) {
+        double d = std::fabs((double)host_ref[i] - (double)host_device_out[i]);
+        sum_abs += d;
+        if (d > max_abs) max_abs = d;
+        if (d > 1e-6 && mismatches < max_mismatches) {
+            size_t r = i / cols;
+            size_t c = i % cols;
+            std::fprintf(stderr, "[cuda][compare] mismatch @ r=%zu c=%zu ref=%g dev=%g diff=%g\n", r, c, host_ref[i], host_device_out[i], d);
+            ++mismatches;
+        }
+    }
+    std::fprintf(stderr, "[cuda][compare] total=%zu mismatches_printed=%zu max_abs=%g mean_abs=%g\n", total, mismatches, max_abs, sum_abs / (double)total);
+
+    cudaFree(d_out);
+    return (max_abs < 1e-3);
+}
+
+
 __global__ void matmul_rhs_transposed_kernel(
     const float* A,
     const float* B,
@@ -613,7 +796,69 @@ __global__ void vec_mul_rows_cols_kernel(
     out[col] = acc;
 }
 
+
 } // namespace
+
+// Global wrapper exposed in the header — forwards to the anonymous-namespace
+// internal implementation that launches the debug kernels.
+bool cuda_backend_compare_dequant(const Tensor* t, size_t max_mismatches) {
+    return cuda_backend_compare_dequant_internal(t, max_mismatches);
+}
+
+// Forward declarations for atomic-safe kernels (global scope).
+__global__ void matmul_quant_atomic_q4_k_kernel(
+    const float* A,
+    const uint8_t* B,
+    float* C,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t row_bytes);
+
+__global__ void matmul_quant_atomic_q5_0_kernel(
+    const float* A,
+    const uint8_t* B,
+    float* C,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t row_bytes);
+
+__global__ void matmul_quant_atomic_q8_0_kernel(
+    const float* A,
+    const uint8_t* B,
+    float* C,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t row_bytes);
+
+__global__ void matmul_rhs_quant_atomic_q4_k_kernel(
+    const float* A,
+    const uint8_t* B,
+    float* C,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t row_bytes);
+
+__global__ void matmul_rhs_quant_atomic_q5_0_kernel(
+    const float* A,
+    const uint8_t* B,
+    float* C,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t row_bytes);
+
+__global__ void matmul_rhs_quant_atomic_q8_0_kernel(
+    const float* A,
+    const uint8_t* B,
+    float* C,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t row_bytes);
 
 void cuda_backend_set_quant_parity_mode(int mode) {
     if (mode < -1 || mode > 1) return;
@@ -773,32 +1018,65 @@ bool cuda_backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
         return false;
     }
     if (B->type == DataType::Q4_K) {
-        matmul_quant_kernel<TENSOR_Q4_K_QK_K, TENSOR_Q4_K_BLOCK_SIZE><<<grid, block>>>(
-            (const float*)dA,
-            dBq,
-            (float*)dC,
-            m,
-            n,
-            k,
-            row_bytes);
+        if (cuda_quant_atomic_safe_enabled()) {
+            matmul_quant_atomic_q4_k_kernel<<<grid, block>>>(
+                (const float*)dA,
+                dBq,
+                (float*)dC,
+                m,
+                n,
+                k,
+                row_bytes);
+        } else {
+            matmul_quant_kernel<TENSOR_Q4_K_QK_K, TENSOR_Q4_K_BLOCK_SIZE><<<grid, block>>>(
+                (const float*)dA,
+                dBq,
+                (float*)dC,
+                m,
+                n,
+                k,
+                row_bytes);
+        }
     } else if (B->type == DataType::Q5_0) {
-        matmul_quant_kernel<TENSOR_Q5_0_QK, TENSOR_Q5_0_BLOCK_SIZE><<<grid, block>>>(
-            (const float*)dA,
-            dBq,
-            (float*)dC,
-            m,
-            n,
-            k,
-            row_bytes);
+        if (cuda_quant_atomic_safe_enabled()) {
+            matmul_quant_atomic_q5_0_kernel<<<grid, block>>>(
+                (const float*)dA,
+                dBq,
+                (float*)dC,
+                m,
+                n,
+                k,
+                row_bytes);
+        } else {
+            matmul_quant_kernel<TENSOR_Q5_0_QK, TENSOR_Q5_0_BLOCK_SIZE><<<grid, block>>>(
+                (const float*)dA,
+                dBq,
+                (float*)dC,
+                m,
+                n,
+                k,
+                row_bytes);
+        }
     } else {
-        matmul_quant_kernel<TENSOR_Q8_0_QK, TENSOR_Q8_0_BLOCK_SIZE><<<grid, block>>>(
-            (const float*)dA,
-            dBq,
-            (float*)dC,
-            m,
-            n,
-            k,
-            row_bytes);
+        if (cuda_quant_atomic_safe_enabled()) {
+            matmul_quant_atomic_q8_0_kernel<<<grid, block>>>(
+                (const float*)dA,
+                dBq,
+                (float*)dC,
+                m,
+                n,
+                k,
+                row_bytes);
+        } else {
+            matmul_quant_kernel<TENSOR_Q8_0_QK, TENSOR_Q8_0_BLOCK_SIZE><<<grid, block>>>(
+                (const float*)dA,
+                dBq,
+                (float*)dC,
+                m,
+                n,
+                k,
+                row_bytes);
+        }
     }
 
     bool ok = (cudaGetLastError() == cudaSuccess) &&
@@ -919,32 +1197,65 @@ bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor
         return false;
     }
     if (B->type == DataType::Q4_K) {
-        matmul_rhs_quant_kernel<TENSOR_Q4_K_QK_K, TENSOR_Q4_K_BLOCK_SIZE><<<grid, block>>>(
-            (const float*)dA,
-            dBq,
-            (float*)dC,
-            m,
-            n,
-            k,
-            row_bytes);
+        if (cuda_quant_atomic_safe_enabled()) {
+            matmul_rhs_quant_atomic_q4_k_kernel<<<grid, block>>>(
+                (const float*)dA,
+                dBq,
+                (float*)dC,
+                m,
+                n,
+                k,
+                row_bytes);
+        } else {
+            matmul_rhs_quant_kernel<TENSOR_Q4_K_QK_K, TENSOR_Q4_K_BLOCK_SIZE><<<grid, block>>>(
+                (const float*)dA,
+                dBq,
+                (float*)dC,
+                m,
+                n,
+                k,
+                row_bytes);
+        }
     } else if (B->type == DataType::Q5_0) {
-        matmul_rhs_quant_kernel<TENSOR_Q5_0_QK, TENSOR_Q5_0_BLOCK_SIZE><<<grid, block>>>(
-            (const float*)dA,
-            dBq,
-            (float*)dC,
-            m,
-            n,
-            k,
-            row_bytes);
+        if (cuda_quant_atomic_safe_enabled()) {
+            matmul_rhs_quant_atomic_q5_0_kernel<<<grid, block>>>(
+                (const float*)dA,
+                dBq,
+                (float*)dC,
+                m,
+                n,
+                k,
+                row_bytes);
+        } else {
+            matmul_rhs_quant_kernel<TENSOR_Q5_0_QK, TENSOR_Q5_0_BLOCK_SIZE><<<grid, block>>>(
+                (const float*)dA,
+                dBq,
+                (float*)dC,
+                m,
+                n,
+                k,
+                row_bytes);
+        }
     } else {
-        matmul_rhs_quant_kernel<TENSOR_Q8_0_QK, TENSOR_Q8_0_BLOCK_SIZE><<<grid, block>>>(
-            (const float*)dA,
-            dBq,
-            (float*)dC,
-            m,
-            n,
-            k,
-            row_bytes);
+        if (cuda_quant_atomic_safe_enabled()) {
+            matmul_rhs_quant_atomic_q8_0_kernel<<<grid, block>>>(
+                (const float*)dA,
+                dBq,
+                (float*)dC,
+                m,
+                n,
+                k,
+                row_bytes);
+        } else {
+            matmul_rhs_quant_kernel<TENSOR_Q8_0_QK, TENSOR_Q8_0_BLOCK_SIZE><<<grid, block>>>(
+                (const float*)dA,
+                dBq,
+                (float*)dC,
+                m,
+                n,
+                k,
+                row_bytes);
+        }
     }
 
     bool ok = (cudaGetLastError() == cudaSuccess) &&
@@ -1098,4 +1409,242 @@ const char* cuda_backend_last_error_msg() {
     std::lock_guard<std::mutex> lock(s.mu);
     if (s.last_error.empty()) return "";
     return s.last_error.c_str();
+}
+
+// Conservative per-thread element-decode kernel: each thread decodes only the
+// single quantized element it needs instead of relying on a single-thread
+// decode + shared tile. This is slower but avoids shared-memory decode races
+// and is useful as a correctness fallback (enabled via
+// MINXFMR_CUDA_QUANT_ATOMIC_SAFE=1).
+// Atomic-safe specialized element decode functions (non-templated) for each
+// quant format. These avoid templated __global__ instantiation/link issues.
+__device__ __forceinline__ float dequant_block_element_q4(const uint8_t* blk, int idx) {
+    const float d = fp16_to_fp32_device(load_u16(blk + 0));
+    const float dmin = fp16_to_fp32_device(load_u16(blk + 2));
+    const uint8_t* scales = blk + 4;
+    const uint8_t* q = blk + 16;
+    const int chunk = idx / 64;
+    const int pos = idx % 64;
+    const int is = chunk * 2;
+    uint8_t sc = 0;
+    uint8_t m = 0;
+    if (pos < 32) {
+        get_scale_min_k4_device(is + 0, scales, sc, m);
+        const float d1 = d * sc;
+        const float m1 = dmin * m;
+        const uint8_t qv = q[chunk * 32 + pos];
+        return d1 * (float)(qv & 0xFu) - m1;
+    } else {
+        get_scale_min_k4_device(is + 1, scales, sc, m);
+        const float d2 = d * sc;
+        const float m2 = dmin * m;
+        const uint8_t qv = q[chunk * 32 + (pos - 32)];
+        return d2 * (float)(qv >> 4) - m2;
+    }
+}
+
+__device__ __forceinline__ float dequant_block_element_q5(const uint8_t* blk, int idx) {
+    const float d = fp16_to_fp32_device(load_u16(blk));
+    const uint8_t* qh = blk + 2;
+    const uint8_t* qs = blk + 6;
+    uint32_t hmask = 0;
+    hmask |= (uint32_t)qh[0];
+    hmask |= (uint32_t)qh[1] << 8;
+    hmask |= (uint32_t)qh[2] << 16;
+    hmask |= (uint32_t)qh[3] << 24;
+    if (idx < 16) {
+        const uint8_t ql = qs[idx];
+        const int low0 = (int)(ql & 0x0F);
+        const int high0 = (int)((hmask >> idx) & 1u);
+        const int q0 = (high0 << 4) | low0;
+        return d * (float)(q0 - 16);
+    } else {
+        const int i = idx - 16;
+        const uint8_t ql = qs[i];
+        const int low1 = (int)(ql >> 4);
+        const int high1 = (int)((hmask >> (i + 16)) & 1u);
+        const int q1 = (high1 << 4) | low1;
+        return d * (float)(q1 - 16);
+    }
+}
+
+__device__ __forceinline__ float dequant_block_element_q8(const uint8_t* blk, int idx) {
+    const float d = fp16_to_fp32_device(load_u16(blk));
+    const int8_t* qs = (const int8_t*)(blk + 2);
+    return d * (float)qs[idx];
+}
+
+// Atomic-safe kernels specialized per quant format.
+__global__ void matmul_quant_atomic_q4_k_kernel(
+    const float* A,
+    const uint8_t* B,
+    float* C,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t row_bytes) {
+    const size_t row = (size_t)blockIdx.y * blockDim.y + threadIdx.y;
+    const size_t col = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = (row < m) && (col < n);
+
+    const size_t block_col0 = (size_t)blockIdx.x * blockDim.x;
+    const size_t block = block_col0 / TENSOR_Q4_K_QK_K;
+    const size_t offset = col % TENSOR_Q4_K_QK_K;
+    float acc = 0.0f;
+
+    for (size_t kk = 0; kk < k; ++kk) {
+        const uint8_t* brow = B + kk * row_bytes + block * TENSOR_Q4_K_BLOCK_SIZE;
+        const float val = dequant_block_element_q4(brow, (int)offset);
+
+        if (active) {
+            const float* arow = A + row * k;
+            acc += arow[kk] * val;
+        }
+    }
+
+    if (active) C[row * n + col] = acc;
+}
+
+__global__ void matmul_quant_atomic_q5_0_kernel(
+    const float* A,
+    const uint8_t* B,
+    float* C,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t row_bytes) {
+    const size_t row = (size_t)blockIdx.y * blockDim.y + threadIdx.y;
+    const size_t col = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = (row < m) && (col < n);
+
+    const size_t block_col0 = (size_t)blockIdx.x * blockDim.x;
+    const size_t block = block_col0 / TENSOR_Q5_0_QK;
+    const size_t offset = col % TENSOR_Q5_0_QK;
+    float acc = 0.0f;
+
+    for (size_t kk = 0; kk < k; ++kk) {
+        const uint8_t* brow = B + kk * row_bytes + block * TENSOR_Q5_0_BLOCK_SIZE;
+        const float val = dequant_block_element_q5(brow, (int)offset);
+
+        if (active) {
+            const float* arow = A + row * k;
+            acc += arow[kk] * val;
+        }
+    }
+
+    if (active) C[row * n + col] = acc;
+}
+
+__global__ void matmul_quant_atomic_q8_0_kernel(
+    const float* A,
+    const uint8_t* B,
+    float* C,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t row_bytes) {
+    const size_t row = (size_t)blockIdx.y * blockDim.y + threadIdx.y;
+    const size_t col = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = (row < m) && (col < n);
+
+    const size_t block_col0 = (size_t)blockIdx.x * blockDim.x;
+    const size_t block = block_col0 / TENSOR_Q8_0_QK;
+    const size_t offset = col % TENSOR_Q8_0_QK;
+    float acc = 0.0f;
+
+    for (size_t kk = 0; kk < k; ++kk) {
+        const uint8_t* brow = B + kk * row_bytes + block * TENSOR_Q8_0_BLOCK_SIZE;
+        const float val = dequant_block_element_q8(brow, (int)offset);
+
+        if (active) {
+            const float* arow = A + row * k;
+            acc += arow[kk] * val;
+        }
+    }
+
+    if (active) C[row * n + col] = acc;
+}
+
+__global__ void matmul_rhs_quant_atomic_q4_k_kernel(
+    const float* A,
+    const uint8_t* B,
+    float* C,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t row_bytes) {
+    const size_t row = (size_t)blockIdx.y * blockDim.y + threadIdx.y;
+    const size_t col = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= m || col >= n) return;
+
+    const float* arow = A + row * k;
+    const size_t blocks_per_row = k / TENSOR_Q4_K_QK_K;
+    float acc = 0.0f;
+
+    for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+        const uint8_t* brow = B + col * row_bytes + blk * TENSOR_Q4_K_BLOCK_SIZE;
+        #pragma unroll
+        for (size_t i = 0; i < TENSOR_Q4_K_QK_K; ++i) {
+            const float qv = dequant_block_element_q4(brow, (int)i);
+            acc += arow[blk * TENSOR_Q4_K_QK_K + i] * qv;
+        }
+    }
+
+    C[row * n + col] = acc;
+}
+
+__global__ void matmul_rhs_quant_atomic_q5_0_kernel(
+    const float* A,
+    const uint8_t* B,
+    float* C,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t row_bytes) {
+    const size_t row = (size_t)blockIdx.y * blockDim.y + threadIdx.y;
+    const size_t col = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= m || col >= n) return;
+
+    const float* arow = A + row * k;
+    const size_t blocks_per_row = k / TENSOR_Q5_0_QK;
+    float acc = 0.0f;
+
+    for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+        const uint8_t* brow = B + col * row_bytes + blk * TENSOR_Q5_0_BLOCK_SIZE;
+        #pragma unroll
+        for (size_t i = 0; i < TENSOR_Q5_0_QK; ++i) {
+            const float qv = dequant_block_element_q5(brow, (int)i);
+            acc += arow[blk * TENSOR_Q5_0_QK + i] * qv;
+        }
+    }
+
+    C[row * n + col] = acc;
+}
+
+__global__ void matmul_rhs_quant_atomic_q8_0_kernel(
+    const float* A,
+    const uint8_t* B,
+    float* C,
+    size_t m,
+    size_t n,
+    size_t k,
+    size_t row_bytes) {
+    const size_t row = (size_t)blockIdx.y * blockDim.y + threadIdx.y;
+    const size_t col = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= m || col >= n) return;
+
+    const float* arow = A + row * k;
+    const size_t blocks_per_row = k / TENSOR_Q8_0_QK;
+    float acc = 0.0f;
+
+    for (size_t blk = 0; blk < blocks_per_row; ++blk) {
+        const uint8_t* brow = B + col * row_bytes + blk * TENSOR_Q8_0_BLOCK_SIZE;
+        #pragma unroll
+        for (size_t i = 0; i < TENSOR_Q8_0_QK; ++i) {
+            const float qv = dequant_block_element_q8(brow, (int)i);
+            acc += arow[blk * TENSOR_Q8_0_QK + i] * qv;
+        }
+    }
+
+    C[row * n + col] = acc;
 }
