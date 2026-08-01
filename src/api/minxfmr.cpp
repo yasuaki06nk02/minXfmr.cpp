@@ -105,11 +105,54 @@ static bool ensure_f32_tensor_shape(Tensor*& t, size_t rows, size_t cols) {
 // out_owned が使えるときはそこに書き込む。
 // F32 row-major のときは zero-copy view を返す（呼び出し側で in != out_owned なら free する）。
 static Tensor* token_embedding_row_into(const minxfmr_context* ctx, int token_id, Tensor* out_owned) {
-    if (!ctx || !ctx->Wemb || token_id < 0) return nullptr;
+    if (!ctx || token_id < 0) return nullptr;
     const Tensor* emb = ctx->Wemb;
 
+    // If the model did not include an explicit token embedding matrix, try to
+    // synthesize a per-token embedding from the output head `Wout` when
+    // available (common when embeddings are tied). This allows generation to
+    // proceed even when `tok_embeddings` is absent in the GGUF file.
+    if (!emb && ctx->Wout) {
+        const Tensor* out = ctx->Wout;
+        // Case A: Wout is vocab x dim (rows == vocab, cols == model_dim)
+        if (out->type == DataType::F32 && (size_t)token_id < out->rows) {
+            if (out->cols > 0) {
+                float* ptr = (float*)out->data + (size_t)token_id * out->cols;
+                return tensor_create_f32_view(1, out->cols, ptr);
+            }
+        }
+        // Case B: Wout is dim x vocab (rows == model_dim, cols == vocab)
+        if (out->type == DataType::F32 && (size_t)token_id < out->cols) {
+            const size_t dim = out->rows;
+            Tensor* row = out_owned;
+            if (!row || row->type != DataType::F32 || row->rows != 1 || row->cols != dim) {
+                row = tensor_create_f32_noinit(1, dim);
+                if (!row) return nullptr;
+            }
+            float* dst = (float*)row->data;
+            float* src = (float*)out->data;
+            for (size_t r = 0; r < dim; ++r) dst[r] = src[r * out->cols + (size_t)token_id];
+            return row;
+        }
+        // Case C: quantized Wout — try dequantizing a row if rows==vocab
+        if (is_supported_quantized_type(out->type) && (size_t)token_id < out->rows) {
+            const size_t cols = out->cols;
+            Tensor* row = out_owned;
+            if (!row || row->type != DataType::F32 || row->rows != 1 || row->cols != cols) {
+                row = tensor_create_f32_noinit(1, cols);
+                if (!row) return nullptr;
+            }
+            if (!tensor_dequant_row(out, (size_t)token_id, (float*)row->data)) {
+                if (row != out_owned) tensor_free(row);
+                return nullptr;
+            }
+            return row;
+        }
+        // If we couldn't synthesize from Wout fall through and produce a safe zero-vector below.
+    }
+
     // ---- F32, row-major: zero-copy view ----
-    if (emb->type == DataType::F32 && emb->rows >= emb->cols) {
+    if (emb && emb->type == DataType::F32 && emb->rows >= emb->cols) {
         if ((size_t)token_id >= emb->rows) return nullptr;
         float* ptr = (float*)emb->data + (size_t)token_id * emb->cols;
         return tensor_create_f32_view(1, emb->cols, ptr);
