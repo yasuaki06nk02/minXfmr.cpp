@@ -5,6 +5,7 @@
 #include "../cache/kv_cache.h"
 #include "feed_forward.h"
 #include "../backend/backend_runtime.h"
+#include "../backend/backend_context.h"
 #include "softmax.h"
 #include <cstdlib>
 #include <cstring>
@@ -12,24 +13,18 @@
 #include <cstddef>
 #include <algorithm>
 
-static bool g_transpose_square_wq = false;
-static bool g_transpose_square_wk = false;
-static bool g_transpose_square_wv = false;
-static bool g_transpose_square_wo = false;
-static int g_cache_append_log_enabled = -1;
-
 void transformer_set_transpose_square_weights(bool enabled) {
-    g_transpose_square_wq = enabled;
-    g_transpose_square_wk = enabled;
-    g_transpose_square_wv = enabled;
-    g_transpose_square_wo = enabled;
+    backend_context().transpose_square_wq = enabled;
+    backend_context().transpose_square_wk = enabled;
+    backend_context().transpose_square_wv = enabled;
+    backend_context().transpose_square_wo = enabled;
 }
 
 void transformer_set_transpose_square_weights_for_all(bool wq, bool wk, bool wv, bool wo) {
-    g_transpose_square_wq = wq;
-    g_transpose_square_wk = wk;
-    g_transpose_square_wv = wv;
-    g_transpose_square_wo = wo;
+    backend_context().transpose_square_wq = wq;
+    backend_context().transpose_square_wk = wk;
+    backend_context().transpose_square_wv = wv;
+    backend_context().transpose_square_wo = wo;
 }
 
 static Tensor* tensor_clone_f32(const Tensor* in) {
@@ -41,11 +36,11 @@ static Tensor* tensor_clone_f32(const Tensor* in) {
 }
 
 static bool cache_append_log_enabled() {
-    if (g_cache_append_log_enabled < 0) {
+    if (backend_context().cache_append_log_enabled < 0) {
         const char* v = std::getenv("MINXFMR_VERBOSE_CACHE");
-        g_cache_append_log_enabled = (v && v[0] == '1') ? 1 : 0;
+        backend_context().cache_append_log_enabled = (v && v[0] == '1') ? 1 : 0;
     }
-    return g_cache_append_log_enabled == 1;
+    return backend_context().cache_append_log_enabled == 1;
 }
 
 // Project input (seq x d_in) with a weight matrix that may be stored as
@@ -206,9 +201,9 @@ bool transformer_forward_single_layer(
     Tensor* Kraw = nullptr;
     Tensor* Vraw = nullptr;
 
-    bool q_ok = Wq_in ? project_with_weight(norm, Wq_in, Qraw, g_transpose_square_wq) : false;
-    bool k_ok = Wk_in ? project_with_weight(norm, Wk_in, Kraw, g_transpose_square_wk) : false;
-    bool v_ok = Wv_in ? project_with_weight(norm, Wv_in, Vraw, g_transpose_square_wv) : false;
+    bool q_ok = Wq_in ? project_with_weight(norm, Wq_in, Qraw, backend_context().transpose_square_wq) : false;
+    bool k_ok = Wk_in ? project_with_weight(norm, Wk_in, Kraw, backend_context().transpose_square_wk) : false;
+    bool v_ok = Wv_in ? project_with_weight(norm, Wv_in, Vraw, backend_context().transpose_square_wv) : false;
 
     if (q_ok && Qraw && Bq_in) add_bias_inplace(Qraw, Bq_in);
     if (k_ok && Kraw && Bk_in) add_bias_inplace(Kraw, Bk_in);
@@ -395,7 +390,7 @@ bool transformer_forward_single_layer(
 
     // Attention output projection (Wo)
     Tensor* attn_proj = nullptr;
-    if (Wo_in && project_with_weight(attn_out, Wo_in, attn_proj, g_transpose_square_wo) && attn_proj && attn_proj->rows == seq && attn_proj->cols == d) {
+    if (Wo_in && project_with_weight(attn_out, Wo_in, attn_proj, backend_context().transpose_square_wo) && attn_proj && attn_proj->rows == seq && attn_proj->cols == d) {
         // use projected output
     } else {
         tensor_free(attn_proj);

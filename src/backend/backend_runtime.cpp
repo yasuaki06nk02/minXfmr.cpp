@@ -1,4 +1,5 @@
 #include "backend_runtime.h"
+#include "backend_context.h"
 
 #include "cpu/cpu_backend.h"
 #include <algorithm>
@@ -10,9 +11,6 @@
 #if defined(MINXFMR_ENABLE_CUDA)
 #include "cuda/cuda_backend.h"
 #endif
-
-static BackendKind g_backend_kind = BackendKind::CPU;
-static bool g_backend_initialized = false;
 
 static bool ieq(const char* a, const char* b) {
     if (!a || !b) return false;
@@ -135,10 +133,12 @@ static float dot_q8_0_block(const uint8_t* blk, const float* x32) {
     return acc;
 }
 
+#include <iostream>
+
 static bool try_enable_cuda() {
 #if defined(MINXFMR_ENABLE_CUDA)
     if (!cuda_backend_is_available()) return false;
-    g_backend_kind = BackendKind::CUDA;
+    backend_context().backend = BackendKind::CUDA;
     return true;
 #else
     return false;
@@ -146,7 +146,7 @@ static bool try_enable_cuda() {
 }
 
 void backend_initialize_from_env() {
-    if (g_backend_initialized) return;
+    if (backend_context().initialized) return;
 
     const char* env = std::getenv("MINXFMR_BACKEND");
     bool want_cuda = false;
@@ -164,7 +164,7 @@ void backend_initialize_from_env() {
     if (!force_cpu && want_cuda && try_enable_cuda()) {
         std::fprintf(stderr, "[backend] selected CUDA backend\n");
     } else {
-        g_backend_kind = BackendKind::CPU;
+        backend_context().backend = BackendKind::CPU;
         if (env && ieq(env, "cuda")) {
             std::fprintf(stderr, "[backend] CUDA requested but unavailable, falling back to CPU\n");
         } else {
@@ -172,20 +172,20 @@ void backend_initialize_from_env() {
         }
     }
 
-    g_backend_initialized = true;
+    backend_context().initialized = true;
 }
 
 bool backend_set_kind(BackendKind kind) {
     if (kind == BackendKind::CPU) {
-        g_backend_kind = BackendKind::CPU;
-        g_backend_initialized = true;
+        backend_context().backend = BackendKind::CPU;
+        backend_context().initialized = true;
         return true;
     }
 
     if (kind == BackendKind::CUDA) {
-        g_backend_initialized = true;
+        backend_context().initialized = true;
         if (try_enable_cuda()) return true;
-        g_backend_kind = BackendKind::CPU;
+        backend_context().backend = BackendKind::CPU;
         return false;
     }
 
@@ -194,7 +194,7 @@ bool backend_set_kind(BackendKind kind) {
 
 BackendKind backend_get_kind() {
     backend_initialize_from_env();
-    return g_backend_kind;
+    return backend_context().backend;
 }
 
 const char* backend_get_name() {
@@ -224,7 +224,7 @@ int backend_get_cuda_quant_parity_mode() {
 bool backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
     backend_initialize_from_env();
 #if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA) {
+    if (backend_context().backend == BackendKind::CUDA) {
         return cuda_backend_matmul(A, B, out);
     }
 #endif
@@ -234,7 +234,7 @@ bool backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
 bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out) {
     backend_initialize_from_env();
 #if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA) {
+    if (backend_context().backend == BackendKind::CUDA) {
         return cuda_backend_matmul_rhs_transposed(A, B, out);
     }
 #endif
@@ -360,7 +360,7 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
 bool backend_preload_tensor(const Tensor* t) {
     backend_initialize_from_env();
 #if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA) return cuda_backend_preload_tensor(t);
+    if (backend_context().backend == BackendKind::CUDA) return cuda_backend_preload_tensor(t);
 #endif
     (void)t;
     return false;
@@ -368,7 +368,7 @@ bool backend_preload_tensor(const Tensor* t) {
 
 const char* backend_last_preload_error() {
 #if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA) return cuda_backend_last_error_msg();
+    if (backend_context().backend == BackendKind::CUDA) return cuda_backend_last_error_msg();
 #endif
     return "";
 }
@@ -382,7 +382,7 @@ void backend_release_resources() {
 bool backend_matvec_strided(const float* vec, const float* mat, float* out, size_t K, size_t N, size_t mat_row_stride) {
     backend_initialize_from_env();
 #if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA) {
+    if (backend_context().backend == BackendKind::CUDA) {
         return cuda_backend_matvec_strided(vec, mat, out, K, N, mat_row_stride);
     }
 #endif
@@ -392,7 +392,7 @@ bool backend_matvec_strided(const float* vec, const float* mat, float* out, size
 bool backend_vec_dot_rows(const float* vec, const float* mat_rows, float* out, size_t K, size_t Nrows, size_t row_stride) {
     backend_initialize_from_env();
 #if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA) {
+    if (backend_context().backend == BackendKind::CUDA) {
         return cuda_backend_vec_dot_rows(vec, mat_rows, out, K, Nrows, row_stride);
     }
 #endif
@@ -402,7 +402,7 @@ bool backend_vec_dot_rows(const float* vec, const float* mat_rows, float* out, s
 bool backend_vec_dot_rows_ring(const float* vec, const float* ring, size_t head, size_t seq_max, size_t len, size_t K, size_t row_stride, float* out) {
     backend_initialize_from_env();
 #if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA) {
+    if (backend_context().backend == BackendKind::CUDA) {
         return cuda_backend_vec_dot_rows_ring(vec, ring, head, seq_max, len, K, row_stride, out);
     }
 #endif
@@ -412,7 +412,7 @@ bool backend_vec_dot_rows_ring(const float* vec, const float* ring, size_t head,
 bool backend_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* out, size_t Nrows, size_t Ncols, size_t row_stride) {
     backend_initialize_from_env();
 #if defined(MINXFMR_ENABLE_CUDA)
-    if (g_backend_kind == BackendKind::CUDA) {
+    if (backend_context().backend == BackendKind::CUDA) {
         return cuda_backend_vec_mul_rows_cols(vec, mat_rows, out, Nrows, Ncols, row_stride);
     }
 #endif

@@ -2,6 +2,7 @@ add_library(minxfmr STATIC
     api/minxfmr.cpp
     tensor/tensor.cpp
     backend/backend_runtime.cpp
+    backend/backend_context.cpp
     backend/cpu/cpu_backend.cpp
     transformer/rmsnorm.cpp
     transformer/rope.cpp
