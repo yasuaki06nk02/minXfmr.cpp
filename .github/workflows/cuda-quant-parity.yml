@@ -1,0 +1,54 @@
+name: CI - CUDA quant parity tests
+
+on:
+  push:
+    branches: [ main, master, '**/fix/*', '**/ci/*', '**/feat/*' ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  # Standard build matrix (no GPU required) to sanity-check builds.
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build libomp-dev
+      - name: Configure (CPU only)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMINXFMR_ENABLE_CUDA=OFF
+      - name: Build
+        run: cmake --build build --config Release --target minxfmr_cli
+
+  # CUDA-enabled builder and parity test job.
+  cuda-parity-test:
+    # This job requires a self-hosted runner with GPU and CUDA toolchain installed.
+    # Configure a self-hosted runner with labels: 'self-hosted', 'linux', 'gpu'
+    runs-on: [self-hosted, linux, gpu]
+    needs: build
+    env:
+      # Force parity/staged dequant path for numerical verification
+      MINXFMR_CUDA_QUANT_PARITY: '1'
+      # Optionally enable direct quant kernels if you want to exercise them
+      # MINXFMR_CUDA_QUANT: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show GPU info
+        run: |
+          which nvidia-smi || true
+          nvidia-smi || true
+      - name: Install build deps (self-hosted)
+        run: |
+          sudo apt-get update || true
+          sudo apt-get install -y build-essential cmake ninja-build libomp-dev || true
+      - name: Configure (CUDA)
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMINXFMR_ENABLE_CUDA=ON -DMINXFMR_CUDA_AVAILABLE=ON
+      - name: Build test target
+        run: cmake --build build --config Release --target test_cuda_quantized_matmul
+      - name: Run CUDA parity test
+        run: |
+          export MINXFMR_CUDA_QUANT_PARITY=1
+          ./build/test_cuda_quantized_matmul || (echo "CUDA parity test failed" && exit 1)

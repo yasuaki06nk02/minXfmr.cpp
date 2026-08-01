@@ -49,13 +49,15 @@ bool cuda_quant_kernels_enabled() {
     if (mode >= 0) return mode == 1;
     const char* v = std::getenv("MINXFMR_CUDA_QUANT");
     if (!v) {
-        // llama.cpp-like default: keep quantized matmul on GPU unless explicitly disabled.
-        mode = 1;
+        // Default to a safe behavior: prefer staged (host-side) dequant path
+        // unless the user explicitly opts in via MINXFMR_CUDA_QUANT=1.
+        mode = 0;
+        std::fprintf(stderr, "[cuda] MINXFMR_CUDA_QUANT not set; defaulting to staged host-side dequant for numerical safety. Set MINXFMR_CUDA_QUANT=1 to enable direct quant kernels.\n");
     } else {
         mode = (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T') ? 1 : 0;
     }
     if (mode == 0) {
-        std::fprintf(stderr, "[cuda] quantized matmul kernels disabled by MINXFMR_CUDA_QUANT; falling back to CPU for quantized weights\n");
+        std::fprintf(stderr, "[cuda] quantized matmul kernels disabled by MINXFMR_CUDA_QUANT; falling back to host dequant (staged) for numerical parity\n");
     }
     return mode == 1;
 }
