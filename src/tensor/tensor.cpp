@@ -1,4 +1,5 @@
 #include "tensor/tensor.h"
+#include "runtime_config.h"
 #include <cstdlib>
 #include <new>
 #include <cstring>
@@ -25,6 +26,90 @@ static thread_local F32StorageCache g_f32_cache;
 static constexpr size_t kMaxCachedBytes = 64u * 1024u * 1024u;
 static constexpr size_t kMaxBucketEntries = 16;
 
+// forward declare helper used by arena init
+static void* alloc_aligned_64(size_t bytes);
+
+// Simple per-thread arena allocator used as a fast-path for transient F32 buffers.
+struct Arena {
+    void* base = nullptr;
+    size_t capacity = 0;
+    size_t offset = 0;
+};
+
+static thread_local Arena g_arena;
+
+static void* arena_acquire(size_t bytes) {
+    if (bytes == 0) return nullptr;
+    // Initialize arena lazily using environment config (fallback default 64MB).
+    if (!g_arena.base) {
+        int cfg = RuntimeConfig::Instance().getInt("MINXFMR_ARENA_BYTES", 64 * 1024 * 1024);
+        if (cfg <= 0) return nullptr;
+        size_t cap = (size_t)cfg;
+        void* p = alloc_aligned_64(cap);
+        if (!p) return nullptr;
+        g_arena.base = p;
+        g_arena.capacity = cap;
+        g_arena.offset = 0;
+    }
+    // Align allocations to 64 bytes
+    size_t need = ((bytes + 63) / 64) * 64;
+    if (g_arena.offset + need > g_arena.capacity) return nullptr;
+    void* p = (char*)g_arena.base + g_arena.offset;
+    g_arena.offset += need;
+    return p;
+}
+
+// forward-declare internal reset so the public wrapper can call it.
+static void tensor_arena_reset_impl();
+
+static bool arena_owns_pointer(void* p) {
+    if (!p || !g_arena.base) return false;
+    uintptr_t b = (uintptr_t)g_arena.base;
+    uintptr_t e = b + g_arena.capacity;
+    uintptr_t x = (uintptr_t)p;
+    return x >= b && x < e;
+}
+
+static void tensor_arena_reset_impl() {
+    if (g_arena.base) g_arena.offset = 0;
+}
+
+// Cache for small TensorImpl objects to avoid frequent new/delete churn.
+static thread_local std::vector<TensorImpl*> g_impl_cache;
+static constexpr size_t kMaxImplCacheEntries = 256;
+
+static TensorImpl* acquire_impl() {
+    if (!g_impl_cache.empty()) {
+        TensorImpl* impl = g_impl_cache.back();
+        g_impl_cache.pop_back();
+        // Clear any stale state; the caller will set the fields it needs.
+        impl->storage = nullptr;
+        impl->t.data = nullptr;
+        impl->t.type = DataType::F32;
+        impl->t.rows = 0;
+        impl->t.cols = 0;
+        impl->t.bytes = 0;
+        return impl;
+    }
+    return new (std::nothrow) TensorImpl();
+}
+
+static void release_impl(TensorImpl* impl) {
+    if (!impl) return;
+    if (g_impl_cache.size() >= kMaxImplCacheEntries) {
+        delete impl;
+        return;
+    }
+    // Keep impl for reuse; clear fields to avoid dangling pointers.
+    impl->storage = nullptr;
+    impl->t.data = nullptr;
+    impl->t.type = DataType::F32;
+    impl->t.rows = 0;
+    impl->t.cols = 0;
+    impl->t.bytes = 0;
+    g_impl_cache.push_back(impl);
+}
+
 static void* alloc_aligned_64(size_t bytes) {
 #ifdef _WIN32
     return _aligned_malloc(bytes, 64);
@@ -45,6 +130,10 @@ static void free_aligned_64(void* p) {
 }
 
 static void* acquire_f32_storage(size_t bytes) {
+    // Fast path: allocate from per-thread arena for transient buffers.
+    void* ap = arena_acquire(bytes);
+    if (ap) return ap;
+
     // Reuse same-size buffers to reduce malloc/free churn in repeated inference calls.
     auto it = g_f32_cache.buckets.find(bytes);
     if (it != g_f32_cache.buckets.end() && !it->second.empty()) {
@@ -58,6 +147,10 @@ static void* acquire_f32_storage(size_t bytes) {
 
 static void release_f32_storage(void* p, size_t bytes) {
     if (!p || bytes == 0) return;
+    // If buffer belongs to the arena, do nothing; arena memory is reclaimed
+    // by calling tensor_arena_reset() once per-generation (or when desired).
+    if (arena_owns_pointer(p)) return;
+
     std::vector<void*>& bucket = g_f32_cache.buckets[bytes];
     // Keep cache bounded to avoid unbounded memory growth.
     if (bucket.size() >= kMaxBucketEntries || g_f32_cache.bytes_cached + bytes > kMaxCachedBytes) {
@@ -72,6 +165,11 @@ static void release_f32_storage(void* p, size_t bytes) {
 size_t tensor_q4_k_row_bytes(size_t cols) {
     if (cols == 0 || (cols % TENSOR_Q4_K_QK_K) != 0) return 0;
     return (cols / TENSOR_Q4_K_QK_K) * TENSOR_Q4_K_BLOCK_SIZE;
+}
+
+// Public wrapper with external linkage to reset per-thread arena.
+void tensor_arena_reset() {
+    tensor_arena_reset_impl();
 }
 
 size_t tensor_q5_0_row_bytes(size_t cols) {
@@ -93,11 +191,11 @@ Tensor* tensor_create_f32(size_t rows, size_t cols) {
 
 Tensor* tensor_create_f32_noinit(size_t rows, size_t cols) {
     if (rows == 0 || cols == 0) return nullptr;
-    TensorImpl* impl = new (std::nothrow) TensorImpl();
+    TensorImpl* impl = acquire_impl();
     if (!impl) return nullptr;
     size_t bytes = rows * cols * sizeof(float);
     impl->storage = acquire_f32_storage(bytes);
-    if (!impl->storage) { delete impl; return nullptr; }
+    if (!impl->storage) { release_impl(impl); return nullptr; }
     impl->t.data = impl->storage;
     impl->t.type = DataType::F32;
     impl->t.rows = rows;
@@ -108,7 +206,7 @@ Tensor* tensor_create_f32_noinit(size_t rows, size_t cols) {
 
 Tensor* tensor_create_f32_view(size_t rows, size_t cols, float* buffer) {
     if (rows == 0 || cols == 0 || buffer == nullptr) return nullptr;
-    TensorImpl* impl = new (std::nothrow) TensorImpl();
+    TensorImpl* impl = acquire_impl();
     if (!impl) return nullptr;
     impl->storage = nullptr; // we don't own the external buffer
     impl->t.data = buffer;
@@ -128,7 +226,7 @@ Tensor* tensor_create_q4_k_from_bytes(size_t rows, size_t cols, const uint8_t* p
     const size_t need = rows * row_bytes;
     if (packed_bytes < need) return nullptr;
 
-    TensorImpl* impl = new (std::nothrow) TensorImpl();
+    TensorImpl* impl = acquire_impl();
     if (!impl) return nullptr;
 
 #ifdef _WIN32
@@ -136,7 +234,7 @@ Tensor* tensor_create_q4_k_from_bytes(size_t rows, size_t cols, const uint8_t* p
     if (!impl->storage) { delete impl; return nullptr; }
 #else
     void* p = nullptr;
-    if (posix_memalign(&p, 64, need) != 0) { delete impl; return nullptr; }
+    if (posix_memalign(&p, 64, need) != 0) { release_impl(impl); return nullptr; }
     impl->storage = p;
 #endif
 
@@ -159,15 +257,15 @@ Tensor* tensor_create_q5_0_from_bytes(size_t rows, size_t cols, const uint8_t* p
     const size_t need = rows * row_bytes;
     if (packed_bytes < need) return nullptr;
 
-    TensorImpl* impl = new (std::nothrow) TensorImpl();
+    TensorImpl* impl = acquire_impl();
     if (!impl) return nullptr;
 
 #ifdef _WIN32
     impl->storage = _aligned_malloc(need, 64);
-    if (!impl->storage) { delete impl; return nullptr; }
+    if (!impl->storage) { release_impl(impl); return nullptr; }
 #else
     void* p = nullptr;
-    if (posix_memalign(&p, 64, need) != 0) { delete impl; return nullptr; }
+    if (posix_memalign(&p, 64, need) != 0) { release_impl(impl); return nullptr; }
     impl->storage = p;
 #endif
 
@@ -190,15 +288,15 @@ Tensor* tensor_create_q8_0_from_bytes(size_t rows, size_t cols, const uint8_t* p
     const size_t need = rows * row_bytes;
     if (packed_bytes < need) return nullptr;
 
-    TensorImpl* impl = new (std::nothrow) TensorImpl();
+    TensorImpl* impl = acquire_impl();
     if (!impl) return nullptr;
 
 #ifdef _WIN32
     impl->storage = _aligned_malloc(need, 64);
-    if (!impl->storage) { delete impl; return nullptr; }
+    if (!impl->storage) { release_impl(impl); return nullptr; }
 #else
     void* p = nullptr;
-    if (posix_memalign(&p, 64, need) != 0) { delete impl; return nullptr; }
+    if (posix_memalign(&p, 64, need) != 0) { release_impl(impl); return nullptr; }
     impl->storage = p;
 #endif
 
@@ -224,7 +322,7 @@ void tensor_free(Tensor* t) {
             free_aligned_64(impl->storage);
         }
     }
-    delete impl;
+    release_impl(impl);
 }
 
 float tensor_get_f32(const Tensor* t, size_t r, size_t c) {

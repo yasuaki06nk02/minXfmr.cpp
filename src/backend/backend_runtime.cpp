@@ -166,7 +166,7 @@ void backend_initialize_from_env() {
         std::fprintf(stderr, "[backend] selected CUDA backend\n");
     } else {
         backend_context().backend = BackendKind::CPU;
-        if (env && ieq(env, "cuda")) {
+        if (!env.empty() && ieq(env.c_str(), "cuda")) {
             std::fprintf(stderr, "[backend] CUDA requested but unavailable, falling back to CPU\n");
         } else {
             std::fprintf(stderr, "[backend] selected CPU backend\n");

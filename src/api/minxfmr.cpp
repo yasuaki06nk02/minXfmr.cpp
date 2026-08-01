@@ -1073,6 +1073,8 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
 
     // Reset per-call backend workspace allocations for this generation call.
     backend_workspace_reset();
+    // Reset tensor arena allocator (fast-path transient buffers).
+    tensor_arena_reset();
 
     // 1) Tokenize prompt and prefill cache by running prompt tokens.
     std::vector<int> ids = tokenizer_encode(prompt);

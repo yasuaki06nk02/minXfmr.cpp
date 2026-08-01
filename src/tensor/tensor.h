@@ -97,3 +97,7 @@ bool tensor_dequant_row(const Tensor* t, size_t row, float* dst);
 // Implementations currently support Q5_0 and Q8_0; Q4_K falls back to
 // dequant+F32 conversion if this cannot produce a packed transpose.
 bool tensor_transpose_packed_inplace(Tensor*& t);
+
+// Reset the per-thread tensor arena allocator (fast-path). Call at the
+// start of a generation/inference request to reuse transient allocations.
+void tensor_arena_reset();
