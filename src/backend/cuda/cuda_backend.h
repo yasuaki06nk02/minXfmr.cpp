@@ -24,3 +24,7 @@ bool cuda_backend_matvec_strided(const float* vec, const float* mat, float* out,
 bool cuda_backend_vec_dot_rows(const float* vec, const float* mat_rows, float* out, size_t K, size_t Nrows, size_t row_stride);
 bool cuda_backend_vec_dot_rows_ring(const float* vec, const float* ring, size_t head, size_t seq_max, size_t len, size_t K, size_t row_stride, float* out);
 bool cuda_backend_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* out, size_t Nrows, size_t Ncols, size_t row_stride);
+
+// Debug helper: decode quant blocks on device and compare to host-side dequant.
+// Prints up to `max_mismatches` mismatches and returns true if max abs diff < 1e-3.
+bool cuda_backend_compare_dequant(const Tensor* t, size_t max_mismatches);
