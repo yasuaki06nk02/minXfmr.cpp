@@ -1,110 +1,11 @@
 #include "cpu_backend.h"
+#include "../../tensor/tensor.h"
 #include <cstring>
 #include <cmath>
 #include <thread>
 #include <vector>
 #include <cstdlib>
 
-static float fp16_to_fp32_local(uint16_t h) {
-    uint32_t s = (h >> 15) & 1;
-    uint32_t e = (h >> 10) & 0x1f;
-    uint32_t f = h & 0x3ff;
-    uint32_t out;
-    if (e == 0) {
-        if (f == 0) {
-            out = s << 31;
-        } else {
-            e = 1;
-            while ((f & 0x400) == 0) { f <<= 1; --e; }
-            f &= 0x3ff;
-            out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
-        }
-    } else if (e == 31) {
-        out = (s << 31) | 0x7f800000 | (f << 13);
-    } else {
-        out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
-    }
-    float v;
-    std::memcpy(&v, &out, sizeof(v));
-    return v;
-}
-
-static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
-    if (j < 4) {
-        d = q[j] & 63;
-        m = q[j + 4] & 63;
-    } else {
-        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
-    }
-}
-
-static void dequant_q4_k_block(const uint8_t* blk, float* dst256) {
-    uint16_t hd = 0;
-    uint16_t hm = 0;
-    std::memcpy(&hd, blk + 0, sizeof(hd));
-    std::memcpy(&hm, blk + 2, sizeof(hm));
-    const float d = fp16_to_fp32_local(hd);
-    const float dmin = fp16_to_fp32_local(hm);
-
-    const uint8_t* scales = blk + 4;
-    const uint8_t* q = blk + 16;
-
-    int is = 0;
-    for (int j = 0; j < (int)TENSOR_Q4_K_QK_K; j += 64) {
-        uint8_t sc = 0;
-        uint8_t m = 0;
-
-        get_scale_min_k4(is + 0, scales, sc, m);
-        const float d1 = d * sc;
-        const float m1 = dmin * m;
-
-        get_scale_min_k4(is + 1, scales, sc, m);
-        const float d2 = d * sc;
-        const float m2 = dmin * m;
-
-        for (int l = 0; l < 32; ++l) dst256[j + l] = d1 * (q[l] & 0xF) - m1;
-        for (int l = 0; l < 32; ++l) dst256[j + 32 + l] = d2 * (q[l] >> 4) - m2;
-
-        q += 32;
-        is += 2;
-    }
-}
-
-static void dequant_q5_0_block(const uint8_t* blk, float* dst32) {
-    uint16_t hd = 0;
-    std::memcpy(&hd, blk, sizeof(hd));
-    const float d = fp16_to_fp32_local(hd);
-
-    const uint8_t* qh = blk + 2;  // 32 high bits
-    const uint8_t* qs = blk + 6;  // 32 low 4-bit quants (packed into 16 bytes)
-
-    uint32_t hmask = 0;
-    hmask |= (uint32_t)qh[0];
-    hmask |= (uint32_t)qh[1] << 8;
-    hmask |= (uint32_t)qh[2] << 16;
-    hmask |= (uint32_t)qh[3] << 24;
-
-    for (int i = 0; i < 16; ++i) {
-        const uint8_t ql = qs[i];
-        const int low0 = (int)(ql & 0x0F);
-        const int low1 = (int)(ql >> 4);
-        const int high0 = (int)((hmask >> i) & 1u);
-        const int high1 = (int)((hmask >> (i + 16)) & 1u);
-        const int q0 = (high0 << 4) | low0; // element i
-        const int q1 = (high1 << 4) | low1; // element i + 16
-        dst32[i]      = d * (float)(q0 - 16);
-        dst32[i + 16] = d * (float)(q1 - 16);
-    }
-}
-
-static void dequant_q8_0_block(const uint8_t* blk, float* dst32) {
-    uint16_t hd = 0;
-    std::memcpy(&hd, blk, sizeof(hd));
-    const float d = fp16_to_fp32_local(hd);
-    const int8_t* qs = (const int8_t*)(blk + 2);
-    for (int i = 0; i < 32; ++i) dst32[i] = d * (float)qs[i];
-}
 
 struct CpuMatmulThreadConfig {
     unsigned int nthreads;
@@ -247,7 +148,7 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
             n,
             row_bytes,
             blocks_per_row,
-            dequant_q4_k_block);
+            tensor_dequant_q4_k_block);
         return true;
     }
 
@@ -268,7 +169,7 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
             n,
             row_bytes,
             blocks_per_row,
-            dequant_q5_0_block);
+            tensor_dequant_q5_0_block);
         return true;
     }
 
@@ -289,7 +190,7 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
             n,
             row_bytes,
             blocks_per_row,
-            dequant_q8_0_block);
+            tensor_dequant_q8_0_block);
         return true;
     }
 

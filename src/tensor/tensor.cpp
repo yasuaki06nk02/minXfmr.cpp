@@ -252,3 +252,120 @@ Tensor* tensor_transpose_f32(const Tensor* in) {
     }
     return out;
 }
+
+float tensor_fp16_to_fp32(uint16_t h) {
+    uint32_t s = (h >> 15) & 1;
+    uint32_t e = (h >> 10) & 0x1f;
+    uint32_t f = h & 0x3ff;
+    uint32_t out;
+    if (e == 0) {
+        if (f == 0) {
+            out = s << 31;
+        } else {
+            e = 1;
+            while ((f & 0x400) == 0) { f <<= 1; --e; }
+            f &= 0x3ff;
+            out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+        }
+    } else if (e == 31) {
+        out = (s << 31) | 0x7f800000u | (f << 13);
+    } else {
+        out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+    }
+    float v;
+    std::memcpy(&v, &out, sizeof(v));
+    return v;
+}
+
+static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
+    if (j < 4) {
+        d = q[j] & 63;
+        m = q[j + 4] & 63;
+    } else {
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+    }
+}
+
+void tensor_dequant_q4_k_block(const uint8_t* blk, float* dst256) {
+    uint16_t hd = 0, hm = 0;
+    std::memcpy(&hd, blk + 0, sizeof(hd));
+    std::memcpy(&hm, blk + 2, sizeof(hm));
+    const float d = tensor_fp16_to_fp32(hd);
+    const float dmin = tensor_fp16_to_fp32(hm);
+    const uint8_t* scales = blk + 4;
+    const uint8_t* q = blk + 16;
+    int is = 0;
+    for (int j = 0; j < (int)TENSOR_Q4_K_QK_K; j += 64) {
+        uint8_t sc = 0, m = 0;
+        get_scale_min_k4(is + 0, scales, sc, m);
+        const float d1 = d * sc, m1 = dmin * m;
+        get_scale_min_k4(is + 1, scales, sc, m);
+        const float d2 = d * sc, m2 = dmin * m;
+        for (int l = 0; l < 32; ++l) dst256[j + l] = d1 * (q[l] & 0xF) - m1;
+        for (int l = 0; l < 32; ++l) dst256[j + 32 + l] = d2 * (q[l] >> 4) - m2;
+        q += 32;
+        is += 2;
+    }
+}
+
+void tensor_dequant_q5_0_block(const uint8_t* blk, float* dst32) {
+    uint16_t hd = 0;
+    std::memcpy(&hd, blk, sizeof(hd));
+    const float d = tensor_fp16_to_fp32(hd);
+    const uint8_t* qh = blk + 2;
+    const uint8_t* qs = blk + 6;
+    uint32_t hmask = (uint32_t)qh[0] | ((uint32_t)qh[1] << 8) |
+                     ((uint32_t)qh[2] << 16) | ((uint32_t)qh[3] << 24);
+    for (int i = 0; i < 16; ++i) {
+        const uint8_t ql = qs[i];
+        const int q0 = (((int)((hmask >> i) & 1u)) << 4) | (ql & 0x0F);
+        const int q1 = (((int)((hmask >> (i + 16)) & 1u)) << 4) | (ql >> 4);
+        dst32[i]      = d * (float)(q0 - 16);
+        dst32[i + 16] = d * (float)(q1 - 16);
+    }
+}
+
+void tensor_dequant_q8_0_block(const uint8_t* blk, float* dst32) {
+    uint16_t hd = 0;
+    std::memcpy(&hd, blk, sizeof(hd));
+    const float d = tensor_fp16_to_fp32(hd);
+    const int8_t* qs = (const int8_t*)(blk + 2);
+    for (int i = 0; i < 32; ++i) dst32[i] = d * (float)qs[i];
+}
+
+bool tensor_dequant_row(const Tensor* t, size_t row, float* dst) {
+    if (!t || !dst || row >= t->rows) return false;
+    if (t->type == DataType::F32) {
+        std::memcpy(dst, (const float*)t->data + row * t->cols, sizeof(float) * t->cols);
+        return true;
+    }
+    if (t->type == DataType::Q4_K) {
+        const size_t row_bytes = tensor_q4_k_row_bytes(t->cols);
+        if (row_bytes == 0) return false;
+        const uint8_t* src = (const uint8_t*)t->data + row * row_bytes;
+        const size_t blocks = t->cols / TENSOR_Q4_K_QK_K;
+        for (size_t b = 0; b < blocks; ++b)
+            tensor_dequant_q4_k_block(src + b * TENSOR_Q4_K_BLOCK_SIZE, dst + b * TENSOR_Q4_K_QK_K);
+        return true;
+    }
+    if (t->type == DataType::Q5_0) {
+        const size_t row_bytes = tensor_q5_0_row_bytes(t->cols);
+        if (row_bytes == 0) return false;
+        const uint8_t* src = (const uint8_t*)t->data + row * row_bytes;
+        const size_t blocks = t->cols / TENSOR_Q5_0_QK;
+        for (size_t b = 0; b < blocks; ++b)
+            tensor_dequant_q5_0_block(src + b * TENSOR_Q5_0_BLOCK_SIZE, dst + b * TENSOR_Q5_0_QK);
+        return true;
+    }
+    if (t->type == DataType::Q8_0) {
+        const size_t row_bytes = tensor_q8_0_row_bytes(t->cols);
+        if (row_bytes == 0) return false;
+        const uint8_t* src = (const uint8_t*)t->data + row * row_bytes;
+        const size_t blocks = t->cols / TENSOR_Q8_0_QK;
+        for (size_t b = 0; b < blocks; ++b)
+            tensor_dequant_q8_0_block(src + b * TENSOR_Q8_0_BLOCK_SIZE, dst + b * TENSOR_Q8_0_QK);
+        return true;
+    }
+    return false;
+}

@@ -56,6 +56,12 @@ struct minxfmr_context {
     // optional metadata
     std::string chat_template;
     std::vector<std::string> special_tokens;
+
+    // Reusable per-token workspaces (allocated once, reused every generate step)
+    Tensor* embed_buf;    // 1 x model_dim（量子化 embedding 用）
+    Tensor* hidden_buf;   // 1 x model_dim（forward 出力）
+    std::vector<double> logits_buf;
+    std::vector<int>    order_buf;
 };
 
 static std::string render_token_piece(const std::string& piece) {
@@ -81,107 +87,6 @@ static Tensor* tensor_clone_f32_local(const Tensor* in) {
     return out;
 }
 
-static float fp16_to_fp32_local_embed(uint16_t h) {
-    uint32_t s = (h >> 15) & 1;
-    uint32_t e = (h >> 10) & 0x1f;
-    uint32_t f = h & 0x3ff;
-    uint32_t out;
-    if (e == 0) {
-        if (f == 0) {
-            out = s << 31;
-        } else {
-            e = 1;
-            while ((f & 0x400) == 0) { f <<= 1; --e; }
-            f &= 0x3ff;
-            out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
-        }
-    } else if (e == 31) {
-        out = (s << 31) | 0x7f800000 | (f << 13);
-    } else {
-        out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
-    }
-    float v;
-    std::memcpy(&v, &out, sizeof(v));
-    return v;
-}
-
-static inline void get_scale_min_k4_embed(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
-    if (j < 4) {
-        d = q[j] & 63;
-        m = q[j + 4] & 63;
-    } else {
-        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
-    }
-}
-
-static void dequant_q4_k_block_embed(const uint8_t* blk, float* dst256) {
-    uint16_t hd = 0;
-    uint16_t hm = 0;
-    std::memcpy(&hd, blk + 0, sizeof(hd));
-    std::memcpy(&hm, blk + 2, sizeof(hm));
-    const float d = fp16_to_fp32_local_embed(hd);
-    const float dmin = fp16_to_fp32_local_embed(hm);
-
-    const uint8_t* scales = blk + 4;
-    const uint8_t* q = blk + 16;
-
-    int is = 0;
-    for (int j = 0; j < (int)TENSOR_Q4_K_QK_K; j += 64) {
-        uint8_t sc = 0;
-        uint8_t m = 0;
-
-        get_scale_min_k4_embed(is + 0, scales, sc, m);
-        const float d1 = d * sc;
-        const float m1 = dmin * m;
-
-        get_scale_min_k4_embed(is + 1, scales, sc, m);
-        const float d2 = d * sc;
-        const float m2 = dmin * m;
-
-        for (int l = 0; l < 32; ++l) dst256[j + l] = d1 * (q[l] & 0xF) - m1;
-        for (int l = 0; l < 32; ++l) dst256[j + 32 + l] = d2 * (q[l] >> 4) - m2;
-
-        q += 32;
-        is += 2;
-    }
-}
-
-static void dequant_q5_0_block_embed(const uint8_t* blk, float* dst32) {
-    uint16_t hd = 0;
-    std::memcpy(&hd, blk, sizeof(hd));
-    const float d = fp16_to_fp32_local_embed(hd);
-
-    const uint8_t* qh = blk + 2;
-    const uint8_t* qs = blk + 6;
-
-    uint32_t hmask = 0;
-    hmask |= (uint32_t)qh[0];
-    hmask |= (uint32_t)qh[1] << 8;
-    hmask |= (uint32_t)qh[2] << 16;
-    hmask |= (uint32_t)qh[3] << 24;
-
-    for (int i = 0; i < 16; ++i) {
-        const uint8_t ql = qs[i];
-        const int low0 = (int)(ql & 0x0F);
-        const int low1 = (int)(ql >> 4);
-        const int high0 = (int)((hmask >> i) & 1u);
-        const int high1 = (int)((hmask >> (i + 16)) & 1u);
-        const int q0 = (high0 << 4) | low0;
-        const int q1 = (high1 << 4) | low1;
-        dst32[i] = d * (float)(q0 - 16);
-        dst32[i + 16] = d * (float)(q1 - 16);
-    }
-}
-
-static void dequant_q8_0_block_embed(const uint8_t* blk, float* dst32) {
-    uint16_t hd = 0;
-    std::memcpy(&hd, blk, sizeof(hd));
-    const float d = fp16_to_fp32_local_embed(hd);
-    const int8_t* qs = (const int8_t*)(blk + 2);
-    for (int i = 0; i < 32; ++i) dst32[i] = d * (float)qs[i];
-}
-
 static bool is_supported_quantized_type(DataType t) {
     return t == DataType::Q4_K || t == DataType::Q5_0 || t == DataType::Q8_0;
 }
@@ -197,94 +102,50 @@ static bool ensure_f32_tensor_shape(Tensor*& t, size_t rows, size_t cols) {
     return t != nullptr;
 }
 
-static Tensor* token_embedding_row(const minxfmr_context* ctx, int token_id) {
+// out_owned が使えるときはそこに書き込む。
+// F32 row-major のときは zero-copy view を返す（呼び出し側で in != out_owned なら free する）。
+static Tensor* token_embedding_row_into(const minxfmr_context* ctx, int token_id, Tensor* out_owned) {
     if (!ctx || !ctx->Wemb || token_id < 0) return nullptr;
     const Tensor* emb = ctx->Wemb;
-    const size_t dim = ctx->model_dim > 0 ? ctx->model_dim : ((emb->rows > emb->cols) ? emb->cols : emb->rows);
 
-    if (emb->type == DataType::Q4_K) {
-        // Common GGUF layout is [vocab x dim] in packed Q4_K blocks.
-        if (emb->rows < emb->cols) {
-            return nullptr;
-        }
-
-        if ((size_t)token_id >= emb->rows) token_id = (int)((size_t)token_id % emb->rows);
-        const size_t row_bytes = tensor_q4_k_row_bytes(emb->cols);
-        if (row_bytes == 0 || emb->bytes < emb->rows * row_bytes) return nullptr;
-
-        Tensor* row = tensor_create_f32_noinit(1, emb->cols);
-        if (!row) return nullptr;
-
-        const uint8_t* src = (const uint8_t*)emb->data + (size_t)token_id * row_bytes;
-        float* dst = (float*)row->data;
-        const size_t blocks_per_row = emb->cols / TENSOR_Q4_K_QK_K;
-        for (size_t blk = 0; blk < blocks_per_row; ++blk) {
-            dequant_q4_k_block_embed(src + blk * TENSOR_Q4_K_BLOCK_SIZE, dst + blk * TENSOR_Q4_K_QK_K);
-        }
-        return row;
-    }
-
-    if (emb->type == DataType::Q5_0) {
-        if (emb->rows < emb->cols) {
-            return nullptr;
-        }
-
-        if ((size_t)token_id >= emb->rows) token_id = (int)((size_t)token_id % emb->rows);
-        const size_t row_bytes = tensor_q5_0_row_bytes(emb->cols);
-        if (row_bytes == 0 || emb->bytes < emb->rows * row_bytes) return nullptr;
-
-        Tensor* row = tensor_create_f32_noinit(1, emb->cols);
-        if (!row) return nullptr;
-
-        const uint8_t* src = (const uint8_t*)emb->data + (size_t)token_id * row_bytes;
-        float* dst = (float*)row->data;
-        const size_t blocks_per_row = emb->cols / TENSOR_Q5_0_QK;
-        for (size_t blk = 0; blk < blocks_per_row; ++blk) {
-            dequant_q5_0_block_embed(src + blk * TENSOR_Q5_0_BLOCK_SIZE, dst + blk * TENSOR_Q5_0_QK);
-        }
-        return row;
-    }
-
-    if (emb->type == DataType::Q8_0) {
-        if (emb->rows < emb->cols) {
-            return nullptr;
-        }
-
-        if ((size_t)token_id >= emb->rows) token_id = (int)((size_t)token_id % emb->rows);
-        const size_t row_bytes = tensor_q8_0_row_bytes(emb->cols);
-        if (row_bytes == 0 || emb->bytes < emb->rows * row_bytes) return nullptr;
-
-        Tensor* row = tensor_create_f32_noinit(1, emb->cols);
-        if (!row) return nullptr;
-
-        const uint8_t* src = (const uint8_t*)emb->data + (size_t)token_id * row_bytes;
-        float* dst = (float*)row->data;
-        const size_t blocks_per_row = emb->cols / TENSOR_Q8_0_QK;
-        for (size_t blk = 0; blk < blocks_per_row; ++blk) {
-            dequant_q8_0_block_embed(src + blk * TENSOR_Q8_0_BLOCK_SIZE, dst + blk * TENSOR_Q8_0_QK);
-        }
-        return row;
-    }
-
-    if (emb->type != DataType::F32) return nullptr;
-
-    // If embeddings are stored as rows (rows >= cols) we can return a lightweight
-    // view into the backing storage instead of copying the row.
-    if (emb->rows >= emb->cols) {
-        if ((size_t)token_id >= emb->rows) token_id = (int)((size_t)token_id % emb->rows);
+    // ---- F32, row-major: zero-copy view ----
+    if (emb->type == DataType::F32 && emb->rows >= emb->cols) {
+        if ((size_t)token_id >= emb->rows) return nullptr;
         float* ptr = (float*)emb->data + (size_t)token_id * emb->cols;
-        Tensor* view = tensor_create_f32_view(1, emb->cols, ptr);
-        return view;
+        return tensor_create_f32_view(1, emb->cols, ptr);
     }
 
-    // Otherwise the token vectors are laid out in columns; fall back to copying.
-    if ((size_t)token_id >= emb->cols) token_id = (int)((size_t)token_id % emb->cols);
-    Tensor* row = tensor_create_f32(1, emb->rows);
-    if (!row) return nullptr;
-    float* dst = (float*)row->data;
-    const float* src = (const float*)emb->data;
-    for (size_t r = 0; r < emb->rows; ++r) dst[r] = src[r * emb->cols + (size_t)token_id];
-    (void)dim;
+    // ---- それ以外: out_owned にコピー / dequant ----
+    const size_t cols = (emb->rows >= emb->cols) ? emb->cols : emb->rows;
+
+    // token_id 範囲チェック
+    if (emb->rows >= emb->cols) {
+        if ((size_t)token_id >= emb->rows) return nullptr;
+    } else {
+        if ((size_t)token_id >= emb->cols) return nullptr;
+    }
+
+    Tensor* row = out_owned;
+    if (!row || row->type != DataType::F32 || row->rows != 1 || row->cols != cols) {
+        row = tensor_create_f32_noinit(1, cols);
+        if (!row) return nullptr;
+    }
+
+    if (emb->type == DataType::F32) {
+        // column-major: 列 token_id を 1xD に集める
+        const float* src = (const float*)emb->data;
+        float* dst = (float*)row->data;
+        for (size_t r = 0; r < emb->rows; ++r) {
+            dst[r] = src[r * emb->cols + (size_t)token_id];
+        }
+        return row;
+    }
+
+    // 量子化: 共通 dequant を使用（1で入れた場合）
+    if (!tensor_dequant_row(emb, (size_t)token_id, (float*)row->data)) {
+        if (row != out_owned) tensor_free(row);
+        return nullptr;
+    }
     return row;
 }
 
@@ -579,6 +440,10 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     ctx->seq_max = 128;
     ctx->layer_buf_a = nullptr;
     ctx->layer_buf_b = nullptr;
+    ctx->embed_buf = nullptr;
+    ctx->hidden_buf = nullptr;
+    ctx->logits_buf.clear();
+    ctx->order_buf.clear();
 
     const char* ext = strrchr(model_path, '.');
     const bool looks_gguf = (ext != nullptr) && (_stricmp(ext, ".gguf") == 0);
@@ -1093,6 +958,10 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     ctx->scores_workspace.assign(ctx->seq_max + 128, 0.0f);
     ctx->layer_buf_a = nullptr;
     ctx->layer_buf_b = nullptr;
+    ctx->embed_buf = nullptr;
+    ctx->hidden_buf = nullptr;
+    ctx->logits_buf.clear();
+    ctx->order_buf.clear();
 
     preload_context_weights_to_backend(ctx);
 
@@ -1117,8 +986,10 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         std::string dbg = tokenizer_decode(ids);
         fprintf(stderr, "[minxfmr] prompt decoded: %s\n", dbg.c_str());
     }
+    
     size_t vocab_size_base = tokenizer_vocab_size();
     if (vocab_size_base == 0) vocab_size_base = 16;
+   
 
     KVCache* cache = ctx->cache;
     if (!cache) return -2;
@@ -1129,29 +1000,42 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
 
     const size_t dim = ctx->model_dim > 0 ? ctx->model_dim : cache->dim;
 
+    // 1トークン分の作業バッファを一度だけ確保（以降のステップで再利用）
+    if (!ensure_f32_tensor_shape(ctx->hidden_buf, 1, dim)) return -3;
+    if (!ensure_f32_tensor_shape(ctx->embed_buf, 1, dim))  return -3;
+
+    
+    if (vocab_size_base == 0) vocab_size_base = 16;
+    if (ctx->logits_buf.size() < vocab_size_base) {
+        ctx->logits_buf.assign(vocab_size_base, 0.0);
+    }
+    if (ctx->order_buf.size() < vocab_size_base) {
+        ctx->order_buf.resize(vocab_size_base);
+    }
+
     Tensor* last_out_prefill = nullptr;
     int last = ids.empty() ? 0 : ids.back();
     for (int id : ids) {
-        Tensor* in = token_embedding_row(ctx, id);
-        Tensor* out = tensor_create_f32(1, dim);
-        if (!in || !out) {
-            tensor_free(in);
-            tensor_free(out);
-            continue;
-        }
-        if (!run_stack_forward(ctx, in, out)) {
+        Tensor* in = token_embedding_row_into(ctx, id, ctx->embed_buf);
+        if (!in) continue;
+
+        // view（F32 row-major）のときだけ free が必要。embed_buf 再利用時は free しない。
+        const bool in_is_view = (in != ctx->embed_buf);
+
+        if (!run_stack_forward(ctx, in, ctx->hidden_buf)) {
             fprintf(stderr, "[minxfmr] forward failed during prompt prefill (token id=%d)\n", id);
             fflush(stderr);
-            tensor_free(in);
-            tensor_free(out);
+            if (in_is_view) tensor_free(in);
             if (last_out_prefill) tensor_free(last_out_prefill);
             return -3;
         }
-        tensor_free(in);
+        if (in_is_view) tensor_free(in);
+
         if (id == last) {
-            last_out_prefill = tensor_clone_f32_local(out);
+            if (last_out_prefill) tensor_free(last_out_prefill);
+            last_out_prefill = tensor_clone_f32_local(ctx->hidden_buf);
         }
-        tensor_free(out);
+        // hidden_buf は再利用するので free しない
     }
     // When temperature <= 0, use greedy sampling (deterministic argmax).
     bool sampler_greedy = (temperature <= 0.0);
@@ -1221,33 +1105,45 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             fprintf(stderr, "[minxfmr] gen loop step=%d last=%d emitted=%d\n", t, last, gen_tokens_emitted);
             fflush(stderr);
         }
-        Tensor* in = nullptr;
-        Tensor* out = nullptr;
+
+        Tensor* out = ctx->hidden_buf;
         int next = 0;
 
         if (t == 0 && last_out_prefill) {
-            out = tensor_clone_f32_local(last_out_prefill);
+            // prefill 最終 hidden を再利用バッファへコピー（clone テンソルを作らない）
+            std::memcpy(out->data, last_out_prefill->data, sizeof(float) * dim);
         } else {
-            in = token_embedding_row(ctx, last);
-            out = tensor_create_f32(1, dim);
-            if (in && out) {
-                if (!run_stack_forward(ctx, in, out)) {
-                    fprintf(stderr, "[minxfmr] forward failed during generation step=%d last=%d\n", t, last);
-                    fflush(stderr);
-                    tensor_free(in);
-                    tensor_free(out);
-                    if (last_out_prefill) tensor_free(last_out_prefill);
-                    return -3;
-                }
+            Tensor* in = token_embedding_row_into(ctx, last, ctx->embed_buf);
+            if (!in) {
+                fprintf(stderr, "[minxfmr] no input embedding at step=%d last=%d\n", t, last);
+                fflush(stderr);
+                gen_break_reason = "no_in";
+                break;
             }
+            const bool in_is_view = (in != ctx->embed_buf);
+            if (!run_stack_forward(ctx, in, out)) {
+                fprintf(stderr, "[minxfmr] forward failed during generation step=%d last=%d\n", t, last);
+                fflush(stderr);
+                if (in_is_view) tensor_free(in);
+                if (last_out_prefill) tensor_free(last_out_prefill);
+                return -3;
+            }
+            if (in_is_view) tensor_free(in);
         }
 
-        if (!out) { fprintf(stderr, "[minxfmr] no output tensor at step=%d last=%d\n", t, last); fflush(stderr); gen_break_reason = "no_out"; break; }
+        if (ctx->Wnorm) {
+            apply_final_norm_inplace(out, ctx->Wnorm, ctx->rmsnorm_epsilon);
+        }
 
-        if (ctx->Wnorm) apply_final_norm_inplace(out, ctx->Wnorm, ctx->rmsnorm_epsilon);
-
+        // ---- logits: 再利用バッファ ----
         size_t vocab_size = vocab_size_base;
-        std::vector<double> logits(vocab_size, 0.0);
+        std::vector<double>& logits = ctx->logits_buf;
+        if (logits.size() < vocab_size) {
+            logits.assign(vocab_size, 0.0);
+        } else {
+            std::fill(logits.begin(), logits.begin() + (std::ptrdiff_t)vocab_size, 0.0);
+        }
+
         const float* od = (const float*)out->data;
 
         if (ctx->Wout && (ctx->Wout->type == DataType::F32 || is_supported_quantized_type(ctx->Wout->type))) {
@@ -1356,11 +1252,15 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         if (k_use <= 0) k_use = 1;
         if ((size_t)k_use > vocab_size) k_use = (int)vocab_size;
 
-        std::vector<int> order(vocab_size);
+        std::vector<int>& order = ctx->order_buf;
+        if (order.size() < vocab_size) order.resize(vocab_size);
         for (size_t i = 0; i < vocab_size; ++i) order[i] = (int)i;
-        std::partial_sort(order.begin(), order.begin() + k_use, order.end(),
-            [&](int a, int b) { return logits[(size_t)a] > logits[(size_t)b]; });
 
+        std::partial_sort(order.begin(),
+                          order.begin() + k_use,
+                          order.begin() + (std::ptrdiff_t)vocab_size,
+            [&](int a, int b) { return logits[(size_t)a] > logits[(size_t)b]; });
+        
         std::vector<double> probs;
         probs.reserve((size_t)k_use);
         double maxs = logits[(size_t)order[0]];
@@ -1455,8 +1355,8 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                 fflush(stderr);
             }
             gen_break_reason = "repeat";
-            if (in) tensor_free(in);
-            if (out) tensor_free(out);
+            //if (in) tensor_free(in);
+            //if (out) tensor_free(out);
             break;
         }
 
@@ -1467,8 +1367,8 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                 fflush(stderr);
             }
             gen_break_reason = "eos";
-            if (in) tensor_free(in);
-            if (out) tensor_free(out);
+            //if (in) tensor_free(in);
+            //if (out) tensor_free(out);
             break;
         }
 
@@ -1582,8 +1482,8 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         // This caused premature truncation of replies; rely on explicit EOS
         // tokens and max token limits instead.
 
-        if (in) tensor_free(in);
-        if (out) tensor_free(out);
+        //if (in) tensor_free(in);
+        //if (out) tensor_free(out);
         last = next;
     }
 
@@ -1710,6 +1610,8 @@ void minxfmr_close(minxfmr_context* ctx) {
     if (ctx->Wout) tensor_free(ctx->Wout);
     if (ctx->layer_buf_a) tensor_free(ctx->layer_buf_a);
     if (ctx->layer_buf_b) tensor_free(ctx->layer_buf_b);
+    if (ctx->embed_buf) tensor_free(ctx->embed_buf);
+    if (ctx->hidden_buf) tensor_free(ctx->hidden_buf);
     free_layer_weights(ctx->Wq_layers);
     free_layer_weights(ctx->Wk_layers);
     free_layer_weights(ctx->Wv_layers);
