@@ -769,7 +769,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         return nullptr;
     };
 
-    if (looks_gguf && ctx->n_layer > 1) {
+    if (looks_gguf) {
         size_t attn_ready = 0;
         size_t wo_ready = 0;
         size_t ffn_ready = 0;
@@ -785,14 +785,21 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
             }
         }
 
-        if (attn_ready == 0 || wo_ready == 0 || ffn_ready == 0) {
+        // Ensure that essential decoder tensors exist either as per-layer
+        // weights or as global projection tensors (ctx->Wq).
+        bool attn_present = (attn_ready > 0) || (ctx->Wq != nullptr);
+        bool wo_present = (wo_ready > 0);
+        bool ffn_present = (ffn_ready > 0);
+
+        if (!attn_present || !wo_present || !ffn_present) {
             fprintf(stderr,
-                "[minxfmr] fatal: decoder tensors are missing (attn=%zu wo=%zu ffn=%zu of %zu layers).\n"
-                "[minxfmr] fatal: GGUF tensor resolution failed (naming mismatch, unsupported layout, or incomplete/truncated file); refusing to run to avoid gibberish output.\n",
-                attn_ready,
-                wo_ready,
-                ffn_ready,
+                "[minxfmr] fatal: decoder tensors are missing (attn_present=%d wo_present=%d ffn_present=%d layers=%zu).\n",
+                (int)attn_present,
+                (int)wo_present,
+                (int)ffn_present,
                 ctx->n_layer);
+            fprintf(stderr,
+                "[minxfmr] fatal: GGUF tensor resolution failed (naming mismatch, unsupported layout, or incomplete/truncated file); refusing to run to avoid gibberish output.\n");
             minxfmr_close(ctx);
             return nullptr;
         }
