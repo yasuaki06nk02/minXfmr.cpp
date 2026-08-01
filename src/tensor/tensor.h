@@ -89,3 +89,11 @@ void tensor_dequant_q8_0_block(const uint8_t* blk, float* dst32);   // 32 floats
 // Dequantize a single row of a quantized weight/embedding tensor into an F32 buffer.
 // dst must have room for `t->cols` floats. Returns false on type/shape mismatch.
 bool tensor_dequant_row(const Tensor* t, size_t row, float* dst);
+
+// Transpose a packed quantized tensor into the same packed format.
+// On success replaces `t` with a newly-allocated Tensor holding the
+// transposed packed data and returns true. On failure (unsupported
+// alignment or allocation failure) returns false and leaves `t` unchanged.
+// Implementations currently support Q5_0 and Q8_0; Q4_K falls back to
+// dequant+F32 conversion if this cannot produce a packed transpose.
+bool tensor_transpose_packed_inplace(Tensor*& t);

@@ -227,30 +227,76 @@ static bool normalize_linear_inplace(Tensor*& t, size_t in_dim, bool transpose_s
     if (!t) return false;
     if (in_dim == 0) return false;
 
-    if (t->type != DataType::F32) {
-        // Quantized weights are kept packed; only validate compatibility.
+    // Fast path: already F32.
+    if (t->type == DataType::F32) {
+        if (t->rows == in_dim && t->cols == in_dim) {
+            if (!transpose_square) return true;
+            Tensor* tr = tensor_transpose_f32(t);
+            if (!tr) return false;
+            tensor_free(t);
+            t = tr;
+            transposed = true;
+            return true;
+        }
+
+        if (t->rows == in_dim) return true;
+        if (t->cols == in_dim) {
+            Tensor* tr = tensor_transpose_f32(t);
+            if (!tr) return false;
+            tensor_free(t);
+            t = tr;
+            transposed = true;
+            return true;
+        }
+        return false;
+    }
+
+    // Handle quantized tensors by dequantizing -> physical transpose -> keep as F32.
+    // This avoids runtime transposition overhead for quantized square matrices
+    // at the cost of keeping an F32 copy in memory for the weight.
+    if (t->type == DataType::Q4_K || t->type == DataType::Q5_0 || t->type == DataType::Q8_0) {
+        // If already in a compatible orientation and no transpose requested, accept as-is.
+        if (t->rows == in_dim && t->cols == in_dim && !transpose_square) return true;
+        // If rows==in_dim and no transpose needed, OK.
+        if (t->rows == in_dim && t->cols != in_dim) return true;
+
+        // If we need to produce rows==in_dim (either because cols==in_dim or square+transpose),
+        // prefer doing a packed-format transpose when possible to avoid creating an F32 copy.
+        if (t->cols == in_dim || (t->rows == in_dim && t->cols == in_dim && transpose_square)) {
+            // Try packed in-place transpose for supported formats (Q5_0/Q8_0).
+            if (tensor_transpose_packed_inplace(t)) {
+                transposed = true;
+                return true;
+            }
+
+            // Fallback: dequantize entire tensor into an F32 buffer and transpose.
+            const size_t rows = t->rows;
+            const size_t cols = t->cols;
+            // Allocate temporary F32 buffer (rows x cols).
+            Tensor* tmp = tensor_create_f32_noinit(rows, cols);
+            if (!tmp) return false;
+            float* tmpd = (float*)tmp->data;
+            for (size_t r = 0; r < rows; ++r) {
+                if (!tensor_dequant_row(t, r, tmpd + r * cols)) {
+                    tensor_free(tmp);
+                    return false;
+                }
+            }
+            // Transpose the temporary f32 matrix into final tensor.
+            Tensor* tr = tensor_transpose_f32(tmp);
+            tensor_free(tmp);
+            if (!tr) return false;
+            tensor_free(t);
+            t = tr;
+            transposed = true;
+            return true;
+        }
+
+        // Otherwise the quantized tensor is incompatible with in_dim.
         return (t->rows == in_dim || t->cols == in_dim);
     }
 
-    if (t->rows == in_dim && t->cols == in_dim) {
-        if (!transpose_square) return true;
-        Tensor* tr = tensor_transpose_f32(t);
-        if (!tr) return false;
-        tensor_free(t);
-        t = tr;
-        transposed = true;
-        return true;
-    }
-
-    if (t->rows == in_dim) return true;
-    if (t->cols == in_dim) {
-        Tensor* tr = tensor_transpose_f32(t);
-        if (!tr) return false;
-        tensor_free(t);
-        t = tr;
-        transposed = true;
-        return true;
-    }
+    // Unknown type.
     return false;
 }
 
@@ -263,30 +309,39 @@ static bool quantized_square_needs_runtime_transpose(const Tensor* t, size_t in_
 
 static bool arch_uses_square_transpose(const std::string& arch_lc) {
     // Architectures whose exported square attention matrices are commonly laid out
-    // in the opposite orientation for this runtime.
-    if (arch_lc.rfind("qwen", 0) == 0) return true;
-    if (arch_lc == "llama") return true;
-    if (arch_lc == "mistral") return true;
-    if (arch_lc == "mixtral") return true;
-    if (arch_lc == "qwen2") return true;
-    if (arch_lc == "qwen2moe") return true;
-    if (arch_lc == "gemma") return true;
-    // Explicitly-known non-LLAMA families (keep square transpose off by default).
-    if (arch_lc == "gptneox") return false;
-    if (arch_lc == "gpt2") return false;
-    if (arch_lc == "falcon") return false;
-    if (arch_lc == "bloom") return false;
-    if (arch_lc == "mpt") return false;
-    if (arch_lc == "phi") return false;
-    if (arch_lc == "phi2") return false;
-    if (arch_lc == "phi3") return false;
+    // in the opposite orientation for this runtime. This list is heuristic-based
+    // and mirrors common exporter conventions (inspired by llama.cpp heuristics).
+
+    // Positive matches: families known to export attention/project weights
+    // in the alternate orientation (require square transpose).
+    if (arch_lc.rfind("qwen", 0) == 0) return true; // qwen, qwen2, qwen2-* etc.
+    if (arch_lc.find("llama") != std::string::npos) return true;
+    if (arch_lc.find("mistral") != std::string::npos) return true;
+    if (arch_lc.find("mixtral") != std::string::npos) return true;
+    if (arch_lc.find("gemma") != std::string::npos) return true;
+    if (arch_lc.find("xgen") != std::string::npos) return true;
+    if (arch_lc.find("orca") != std::string::npos) return true;
+
+    // Negative matches: families typically using the "standard" layout.
+    if (arch_lc.find("gptneox") != std::string::npos) return false;
+    if (arch_lc.find("gpt2") != std::string::npos) return false;
+    if (arch_lc.find("falcon") != std::string::npos) return false;
+    if (arch_lc.find("bloom") != std::string::npos) return false;
+    if (arch_lc.find("mpt") != std::string::npos) return false;
+    if (arch_lc.find("phi") != std::string::npos) return false;
+
+    // Default conservative behavior: assume no square transpose required.
     return false;
 }
 
 static bool arch_prefers_cuda_quant_parity(const std::string& arch_lc) {
-    (void)arch_lc;
-    // Keep parity off by default to match llama.cpp-style CUDA behavior.
-    // Users can still opt in via MINXFMR_CUDA_QUANT_PARITY=1.
+    // Some architectures are known to produce quantized blocks that are
+    // numerically more stable when host-dequant parity mode is used.
+    // Enable parity (host dequant -> device F32) for those families.
+    if (arch_lc.empty()) return false;
+    if (arch_lc.rfind("qwen", 0) == 0) return true;
+    if (arch_lc.find("gemma") != std::string::npos) return true;
+    // Keep parity off by default for others; users may force via env var.
     return false;
 }
 

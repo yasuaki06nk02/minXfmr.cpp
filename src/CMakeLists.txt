@@ -75,6 +75,18 @@ if(MINXFMR_CUDA_AVAILABLE)
     )
     target_link_libraries(test_cuda_quant_kernel_parity PRIVATE minxfmr)
     add_test(NAME CudaQuantKernelParity COMMAND test_cuda_quant_kernel_parity)
+
+    add_executable(test_q4k_block_debug
+        ${CMAKE_SOURCE_DIR}/tests/test_q4k_block_debug.cpp
+    )
+    target_link_libraries(test_q4k_block_debug PRIVATE minxfmr)
+    add_test(NAME Q4KBlockDebug COMMAND test_q4k_block_debug)
+
+    add_executable(test_q8_block_debug
+        ${CMAKE_SOURCE_DIR}/tests/test_q8_block_debug.cpp
+    )
+    target_link_libraries(test_q8_block_debug PRIVATE minxfmr)
+    add_test(NAME Q8BlockDebug COMMAND test_q8_block_debug)
 endif()
 
 if(MSVC)

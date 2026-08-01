@@ -28,3 +28,8 @@ bool cuda_backend_vec_mul_rows_cols(const float* vec, const float* mat_rows, flo
 // Debug helper: decode quant blocks on device and compare to host-side dequant.
 // Prints up to `max_mismatches` mismatches and returns true if max abs diff < 1e-3.
 bool cuda_backend_compare_dequant(const Tensor* t, size_t max_mismatches);
+
+// Diagnostic: decode a single Q4_K block on the device into host memory.
+// out256 must point to a buffer of at least TENSOR_Q4_K_QK_K floats.
+// Returns true on success.
+bool cuda_backend_dequant_block_device(const Tensor* t, size_t row, size_t block, float* out256);
