@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstddef>
 #include <algorithm>
+#include "runtime_config.h"
 
 void transformer_set_transpose_square_weights(bool enabled) {
     backend_context().transpose_square_wq = enabled;
@@ -37,8 +38,7 @@ static Tensor* tensor_clone_f32(const Tensor* in) {
 
 static bool cache_append_log_enabled() {
     if (backend_context().cache_append_log_enabled < 0) {
-        const char* v = std::getenv("MINXFMR_VERBOSE_CACHE");
-        backend_context().cache_append_log_enabled = (v && v[0] == '1') ? 1 : 0;
+        backend_context().cache_append_log_enabled = RuntimeConfig::Instance().verbose_cache() ? 1 : 0;
     }
     return backend_context().cache_append_log_enabled == 1;
 }

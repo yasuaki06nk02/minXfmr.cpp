@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <cctype>
 #include "../backend/backend_runtime.h"
+#include "runtime_config.h"
 
 // Runtime context owned by minxfmr_open()/minxfmr_close().
 // This struct keeps both model weights and per-request reusable buffers.
@@ -193,9 +194,7 @@ static Tensor* token_embedding_row_into(const minxfmr_context* ctx, int token_id
 }
 
 static bool env_enabled(const char* key) {
-    const char* v = std::getenv(key);
-    if (!v || v[0] == '\0') return false;
-    return v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T';
+    return RuntimeConfig::Instance().getBool(key);
 }
 
 static bool chat_debug_enabled() {
@@ -204,12 +203,7 @@ static bool chat_debug_enabled() {
 
 // Enable verbose per-token generation logs when MINXFMR_VERBOSE_GEN=1.
 static bool gen_verbose_enabled() {
-    static int enabled = -1;
-    if (enabled < 0) {
-        const char* v = std::getenv("MINXFMR_VERBOSE_GEN");
-        enabled = (v && v[0] == '1') ? 1 : 0;
-    }
-    return enabled == 1;
+    return RuntimeConfig::Instance().gen_verbose();
 }
 
 static bool transpose_square_inplace(Tensor*& t) {
@@ -655,7 +649,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                         arch.c_str(),
                         needs_square_transpose ? "on" : "off");
 
-                    if (backend_using_cuda() && !std::getenv("MINXFMR_CUDA_QUANT_PARITY")) {
+                    if (backend_using_cuda() && !RuntimeConfig::Instance().cuda_quant_parity_set()) {
                         const bool prefer_parity = arch_prefers_cuda_quant_parity(arch_lc);
                         backend_set_cuda_quant_parity_mode(prefer_parity ? 1 : 0);
                         fprintf(stderr,
@@ -665,7 +659,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                     }
                 } else {
                     fprintf(stderr, "[minxfmr] auto orientation: architecture metadata missing, default square_transpose=off\n");
-                    if (backend_using_cuda() && !std::getenv("MINXFMR_CUDA_QUANT_PARITY")) {
+                    if (backend_using_cuda() && !RuntimeConfig::Instance().cuda_quant_parity_set()) {
                         backend_set_cuda_quant_parity_mode(0);
                     }
                 }
@@ -1164,20 +1158,15 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     static std::mt19937 rng((unsigned)std::random_device{}());
 
     int max_steps = 24;
-    if (const char* env_steps = std::getenv("MINXFMR_MAX_GEN_TOKENS")) {
-        int parsed = atoi(env_steps);
-        if (parsed >= 1 && parsed <= 256) max_steps = parsed;
-    }
+    int cfg_max = RuntimeConfig::Instance().max_gen_tokens();
+    if (cfg_max >= 1 && cfg_max <= 256) max_steps = cfg_max;
 
     std::vector<int> recent_tokens;
     recent_tokens.reserve(64);
 
     // If requested via environment, emit a single-line JSON object to stdout with
     // the generated token ids, token strings and base64-encoded decoded text.
-    bool emit_json = false;
-    if (const char* env_json = std::getenv("MINXFMR_EMIT_JSON")) {
-        if (env_json && env_json[0] != '\0') emit_json = true;
-    }
+    bool emit_json = RuntimeConfig::Instance().emit_json();
     std::vector<int> gen_ids;
     std::vector<std::string> gen_token_strs;
     // Buffer for consecutive byte-fallback tokens like <0xE3><0x81>...

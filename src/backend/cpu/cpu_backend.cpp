@@ -6,6 +6,8 @@
 #include <vector>
 #include <cstdlib>
 
+#include "runtime_config.h"
+
 
 struct CpuMatmulThreadConfig {
     unsigned int nthreads;
@@ -17,11 +19,8 @@ static CpuMatmulThreadConfig cpu_matmul_thread_config(size_t m, size_t n) {
     cfg.nthreads = std::thread::hardware_concurrency();
     if (cfg.nthreads == 0) cfg.nthreads = 1;
 
-    const char* env_th = std::getenv("MINXFMR_CPU_THREADS");
-    if (env_th) {
-        int v = std::atoi(env_th);
-        if (v > 0) cfg.nthreads = (unsigned int)v;
-    }
+    int env_th = RuntimeConfig::Instance().cpu_threads();
+    if (env_th > 0) cfg.nthreads = (unsigned int)env_th;
 
     cfg.split_cols = (m < n);
     if (cfg.split_cols) {

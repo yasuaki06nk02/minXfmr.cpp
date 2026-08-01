@@ -1,5 +1,6 @@
 add_library(minxfmr STATIC
     api/minxfmr.cpp
+    api/runtime_config.cpp
     tensor/tensor.cpp
     backend/backend_runtime.cpp
     backend/backend_context.cpp

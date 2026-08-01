@@ -6,18 +6,16 @@
 #include <thread>
 #include <algorithm>
 #include <cstdlib>
+#include "runtime_config.h"
 
 // Determine thread count used for dequant work.
 static size_t gguf_choose_thread_count(size_t rows) {
     unsigned int hw = std::thread::hardware_concurrency();
     size_t hwc = hw > 0 ? (size_t)hw : 1;
-    const char* env = std::getenv("MINXFMR_NUM_THREADS");
+    int env_threads = RuntimeConfig::Instance().getInt("MINXFMR_NUM_THREADS", 0);
     size_t req = hwc;
-    if (env) {
-        try {
-            size_t v = std::stoul(env);
-            if (v > 0) req = std::min<size_t>(v, hwc);
-        } catch(...) { /* ignore parse errors */ }
+    if (env_threads > 0) {
+        req = std::min<size_t>((size_t)env_threads, hwc);
     }
     if (req > rows) req = rows;
     if (req == 0) req = 1;
@@ -25,10 +23,7 @@ static size_t gguf_choose_thread_count(size_t rows) {
 }
 
 static bool gguf_verbose_meta() {
-    const char* env = std::getenv("MINXFMR_GGUF_VERBOSE");
-    if (!env || !env[0]) return false;
-    const char c = env[0];
-    return c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T';
+    return RuntimeConfig::Instance().gguf_verbose();
 }
 
 static bool rd_u32(const std::vector<uint8_t>& d, size_t& p, uint32_t& out) {
@@ -334,15 +329,10 @@ bool gguf_open(const char* path, GGUF_File& out) {
             if (key_matches_meta(key, "tokens") && elem_t == 8) {
                 // By default read the full vocabulary. A read limit can be enabled explicitly
                 // for debugging very large models via MINXFMR_VOCAB_READ_LIMIT.
-                const char* env = std::getenv("MINXFMR_VOCAB_READ_LIMIT");
+                int cfg_limit = RuntimeConfig::Instance().getInt("MINXFMR_VOCAB_READ_LIMIT", 0);
                 size_t max_read = (size_t)n;
-                if (env && env[0]) {
-                    try {
-                        size_t v = std::stoul(env);
-                        if (v > 0) max_read = std::min<size_t>(v, (size_t)n);
-                    } catch(...) {
-                        max_read = (size_t)n;
-                    }
+                if (cfg_limit > 0) {
+                    max_read = std::min<size_t>((size_t)cfg_limit, (size_t)n);
                 }
                 if (max_read < (size_t)n) {
                     std::fprintf(stderr,

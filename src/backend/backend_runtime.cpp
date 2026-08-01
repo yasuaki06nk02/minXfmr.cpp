@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "runtime_config.h"
 
 #if defined(MINXFMR_ENABLE_CUDA)
 #include "cuda/cuda_backend.h"
@@ -148,16 +149,16 @@ static bool try_enable_cuda() {
 void backend_initialize_from_env() {
     if (backend_context().initialized) return;
 
-    const char* env = std::getenv("MINXFMR_BACKEND");
+    std::string env = RuntimeConfig::Instance().getString("MINXFMR_BACKEND");
     bool want_cuda = false;
     bool force_cpu = false;
 
     // auto: try CUDA first, otherwise keep CPU reference path.
-    if (!env || env[0] == '\0' || ieq(env, "auto")) {
+    if (env.empty() || ieq(env.c_str(), "auto")) {
         want_cuda = true;
-    } else if (ieq(env, "cuda")) {
+    } else if (ieq(env.c_str(), "cuda")) {
         want_cuda = true;
-    } else if (ieq(env, "cpu")) {
+    } else if (ieq(env.c_str(), "cpu")) {
         force_cpu = true;
     }
 

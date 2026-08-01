@@ -10,6 +10,7 @@
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include "runtime_config.h"
 
 // Forward-declare device-side element dequant helpers (global scope).
 __device__ __forceinline__ float dequant_block_element_q4(const uint8_t* blk, int idx);
@@ -52,31 +53,22 @@ std::atomic<int>& quant_parity_mode_override() {
 bool cuda_quant_kernels_enabled() {
     static int mode = -1;
     if (mode >= 0) return mode == 1;
-    const char* v = std::getenv("MINXFMR_CUDA_QUANT");
-    if (!v) {
+    auto &cfg = RuntimeConfig::Instance();
+    if (!cfg.has("MINXFMR_CUDA_QUANT")) {
         // If the user explicitly selected the CUDA backend (MINXFMR_BACKEND=cuda),
         // prefer direct device-side quant kernels by default for performance.
         // Otherwise default to the conservative staged host-side dequant for safety.
-        const char* bk = std::getenv("MINXFMR_BACKEND");
-        if (bk) {
-            std::string bks(bk);
-            for (size_t i = 0; i < bks.size(); ++i) {
-                char ch = bks[i];
-                if (ch >= 'A' && ch <= 'Z') bks[i] = (char)(ch - 'A' + 'a');
-            }
-            if (bks == "cuda") {
-                mode = 1;
-                std::fprintf(stderr, "[cuda] MINXFMR_BACKEND=cuda detected; enabling direct quant kernels by default. Set MINXFMR_CUDA_QUANT=0 to force staged host-side dequant.\n");
-            } else {
-                mode = 0;
-                std::fprintf(stderr, "[cuda] MINXFMR_CUDA_QUANT not set; defaulting to staged host-side dequant for numerical safety. Set MINXFMR_CUDA_QUANT=1 to enable direct quant kernels.\n");
-            }
+        std::string bks = cfg.getString("MINXFMR_BACKEND");
+        for (size_t i = 0; i < bks.size(); ++i) bks[i] = (char)std::tolower((unsigned char)bks[i]);
+        if (bks == "cuda") {
+            mode = 1;
+            std::fprintf(stderr, "[cuda] MINXFMR_BACKEND=cuda detected; enabling direct quant kernels by default. Set MINXFMR_CUDA_QUANT=0 to force staged host-side dequant.\n");
         } else {
             mode = 0;
             std::fprintf(stderr, "[cuda] MINXFMR_CUDA_QUANT not set; defaulting to staged host-side dequant for numerical safety. Set MINXFMR_CUDA_QUANT=1 to enable direct quant kernels.\n");
         }
     } else {
-        mode = (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T') ? 1 : 0;
+        mode = cfg.getBool("MINXFMR_CUDA_QUANT") ? 1 : 0;
     }
     if (mode == 0) {
         std::fprintf(stderr, "[cuda] quantized matmul kernels disabled by MINXFMR_CUDA_QUANT; falling back to host dequant (staged) for numerical parity\n");
@@ -91,10 +83,14 @@ bool cuda_quant_parity_mode_enabled() {
     static int env_mode = -1;
     if (env_mode >= 0) return env_mode == 1;
 
-    const char* v = std::getenv("MINXFMR_CUDA_QUANT_PARITY");
-    env_mode = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
-    if (env_mode == 1) {
-        std::fprintf(stderr, "[cuda] quantized matmul parity mode enabled; host-side dequantizing weights to F32 device cache for numerical parity\n");
+    auto &cfg = RuntimeConfig::Instance();
+    if (cfg.has("MINXFMR_CUDA_QUANT_PARITY")) {
+        env_mode = cfg.getBool("MINXFMR_CUDA_QUANT_PARITY") ? 1 : 0;
+        if (env_mode == 1) {
+            std::fprintf(stderr, "[cuda] quantized matmul parity mode enabled; host-side dequantizing weights to F32 device cache for numerical parity\n");
+        }
+    } else {
+        env_mode = 0;
     }
     return env_mode == 1;
 }
@@ -102,10 +98,14 @@ bool cuda_quant_parity_mode_enabled() {
 bool cuda_quant_atomic_safe_enabled() {
     static int env_mode = -1;
     if (env_mode >= 0) return env_mode == 1;
-    const char* v = std::getenv("MINXFMR_CUDA_QUANT_ATOMIC_SAFE");
-    env_mode = (v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T')) ? 1 : 0;
-    if (env_mode == 1) {
-        std::fprintf(stderr, "[cuda] MINXFMR_CUDA_QUANT_ATOMIC_SAFE=1 enabled; using per-thread element decode safe kernels (slower but conservative)\n");
+    auto &cfg = RuntimeConfig::Instance();
+    if (cfg.has("MINXFMR_CUDA_QUANT_ATOMIC_SAFE")) {
+        env_mode = cfg.getBool("MINXFMR_CUDA_QUANT_ATOMIC_SAFE") ? 1 : 0;
+        if (env_mode == 1) {
+            std::fprintf(stderr, "[cuda] MINXFMR_CUDA_QUANT_ATOMIC_SAFE=1 enabled; using per-thread element decode safe kernels (slower but conservative)\n");
+        }
+    } else {
+        env_mode = 0;
     }
     return env_mode == 1;
 }

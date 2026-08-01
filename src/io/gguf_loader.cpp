@@ -7,10 +7,10 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include "runtime_config.h"
 
 static bool gguf_verbose_enabled() {
-    const char* v = std::getenv("MINXFMR_GGUF_VERBOSE");
-    return v && v[0] == '1';
+    return RuntimeConfig::Instance().gguf_verbose();
 }
 
 static void gguf_log_tensor_name_hints(const GGUF_File& gf, int layer) {

@@ -18,6 +18,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#include "runtime_config.h"
 #ifdef _WIN32
 #include <io.h>
 #include <fcntl.h>
@@ -99,10 +100,7 @@ static void gen_collect_callback(const char* token) {
 }
 
 static bool chat_debug_enabled() {
-    const char* v = std::getenv("MINXFMR_CHAT_DEBUG");
-    if (!v || !v[0]) return false;
-    const char c = v[0];
-    return c == '1' || c == 'y' || c == 'Y' || c == 't' || c == 'T';
+    return RuntimeConfig::Instance().chat_debug();
 }
 
 static std::string utf8_truncate_for_history(const std::string& text, size_t max_bytes) {
@@ -222,10 +220,7 @@ int main(int argc, char** argv) {
         transformer_set_transpose_square_weights_for_all(transpose_wq, transpose_wk, transpose_wv, transpose_wo);
     }
 
-    const bool env_transpose_override = []() {
-        const char* v = std::getenv("MINXFMR_TRANSPOSE_USER_OVERRIDE");
-        return v && (v[0] == '1' || v[0] == 'y' || v[0] == 'Y' || v[0] == 't' || v[0] == 'T');
-    }();
+    const bool env_transpose_override = RuntimeConfig::Instance().transpose_user_override();
     if (max_gen_tokens < 1) max_gen_tokens = 1;
     if (max_gen_tokens > 256) max_gen_tokens = 256;
 #ifdef _WIN32
