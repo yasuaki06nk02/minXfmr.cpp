@@ -69,6 +69,12 @@ if(MINXFMR_CUDA_AVAILABLE)
     )
     target_link_libraries(test_cuda_quantized_matmul PRIVATE minxfmr)
     add_test(NAME CudaQuantizedMatmul COMMAND test_cuda_quantized_matmul)
+
+    add_executable(test_cuda_quant_kernel_parity
+        ${CMAKE_SOURCE_DIR}/tests/test_cuda_quant_kernel_parity.cpp
+    )
+    target_link_libraries(test_cuda_quant_kernel_parity PRIVATE minxfmr)
+    add_test(NAME CudaQuantKernelParity COMMAND test_cuda_quant_kernel_parity)
 endif()
 
 if(MSVC)
