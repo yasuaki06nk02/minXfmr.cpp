@@ -1,5 +1,7 @@
 #include <iostream>
 #include <cmath>
+#include <cstring>
+#include <vector>
 #include "../src/tensor/tensor.h"
 #include "../src/backend/cpu/cpu_backend.h"
 #include "../src/backend/cuda/cuda_backend.h"
@@ -13,8 +15,36 @@ bool allclose(const float* a, const float* b, size_t n, float rtol = 1e-3f, floa
     return true;
 }
 
+bool test_q4k_dequant_regression() {
+    std::vector<uint8_t> block(TENSOR_Q4_K_BLOCK_SIZE, 0);
+    uint16_t hd = 0x3c00; // 1.0f
+    uint16_t hm = 0x3c00; // 1.0f
+    std::memcpy(block.data() + 0, &hd, sizeof(hd));
+    std::memcpy(block.data() + 2, &hm, sizeof(hm));
+
+    // Set scale/min values that exercise the j >= 4 path.
+    // For the 3rd chunk, the correct path should produce value -1.0f.
+    block[4 + 4] = 0x40; // contributes high bits for scale/min
+    block[4 + 8] = 0x10; // contributes low bits for scale/min
+    block[4 + 0] = 0x00;
+
+    // Put a low nibble in the third chunk's first q entry.
+    block[16 + 64] = 0x01;
+
+    std::vector<float> out(TENSOR_Q4_K_QK_K, 0.0f);
+    tensor_dequant_q4_k_block(block.data(), out.data());
+
+    const float expected = -1.0f;
+    const float actual = out[128];
+    const bool ok = std::fabs(actual - expected) < 1e-5f;
+    std::cout << (ok ? "  ✓ Q4_K dequant regression passed" : "  ✗ Q4_K dequant regression failed") << std::endl;
+    return ok;
+}
+
 int main() {
     std::cout << "[TEST] Simple matmul parity test" << std::endl;
+    if (!test_q4k_dequant_regression()) return 1;
+
     Tensor* A = tensor_create_f32(2, 3);
     Tensor* B = tensor_create_f32(3, 2);
     Tensor* C_cpu = tensor_create_f32(2, 2);

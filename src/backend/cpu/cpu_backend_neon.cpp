@@ -29,7 +29,7 @@ void tensor_dequant_q4_k_block_neon(const uint8_t* blk, float* dst256) {
 			m = q[j + 4] & 63;
 		} else {
 			d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-			m = (q[j + 4] >> 4) | ((q[j - 4] >> 6) << 4);
+			m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
 		}
 	};
 
