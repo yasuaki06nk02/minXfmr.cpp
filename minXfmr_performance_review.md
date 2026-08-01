@@ -16,6 +16,12 @@
 
 ---
 
+**更新履歴 (2026-08-01)**
+- **Phase 1 (安定性強化)**: CUDA 量子化パリティの不一致を修正しました。`src/backend/cuda/cuda_backend.cu` の共有タイルデコードを per-thread 要素デコードに変更し、Q4_K / Q5_0 / Q8_0 の CUDA パリティを確認済みです。関連のテストを追加・実行しました: `tests/test_cuda_quant_kernel_parity.cpp`, `tests/test_cuda_quantized_matmul.cpp`, `tests/test_q4k_block_debug.cpp`, `tests/test_q8_block_debug.cpp`。修正はコミットして `main` ブランチへ push 済みです。
+- **CI**: `.github/workflows/cuda-quant-parity.yml` に parity ジョブがあり、自己ホスト GPU ランナー向けにパリティチェックを実行できます。
+- **Phase 2**: Tile 化（`src/backend/cpu/cpu_matmul_tiled.cpp`）と NEON 実装雛形（`src/backend/cpu/cpu_backend_neon.cpp`）がリポジトリに存在します。Tile 化は CMake フラグ `MINXFMR_ENABLE_TILED_MATMUL` で有効化できます。`softmax` の SIMD 最適化は未着手です。
+- **Phase 3 / Phase 4**: 設計テンプレートはあるものの、n-layer GPU オフロードや FlashAttention、KV キャッシュ量子化の本実装は未完了です。
+
 ## 1️⃣ メモリ効率分析
 
 ### 1.1 メモリ所有権設計（優秀）
