@@ -16,6 +16,21 @@ add_library(minxfmr STATIC
     ../third_party/gguf/gguf_reader.cpp
 )
 
+# Optional tiled matmul optimization
+option(MINXFMR_ENABLE_TILED_MATMUL "Enable tiled matmul optimization" ON)
+if(MINXFMR_ENABLE_TILED_MATMUL)
+    target_sources(minxfmr PRIVATE backend/cpu/cpu_matmul_tiled.cpp)
+    target_compile_definitions(minxfmr PRIVATE MINXFMR_TILED_MATMUL)
+endif()
+
+# Optional ARM NEON optimized dequant/matmul (only add on aarch64)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
+    if(EXISTS ${CMAKE_SOURCE_DIR}/src/backend/cpu/cpu_backend_neon.cpp)
+        target_sources(minxfmr PRIVATE backend/cpu/cpu_backend_neon.cpp)
+        target_compile_options(minxfmr PRIVATE -march=armv8-a+simd)
+    endif()
+endif()
+
 if(MINXFMR_CUDA_AVAILABLE)
     target_sources(minxfmr PRIVATE
         backend/cuda/cuda_backend.cu
@@ -45,6 +60,15 @@ endif()
 if(MINXFMR_CUDA_AVAILABLE)
     find_package(CUDAToolkit REQUIRED)
     target_link_libraries(minxfmr PRIVATE CUDA::cudart CUDA::cublas)
+endif()
+
+if(MINXFMR_CUDA_AVAILABLE)
+    enable_testing()
+    add_executable(test_cuda_quantized_matmul
+        ${CMAKE_SOURCE_DIR}/tests/test_cuda_quantized_matmul.cpp
+    )
+    target_link_libraries(test_cuda_quantized_matmul PRIVATE minxfmr)
+    add_test(NAME CudaQuantizedMatmul COMMAND test_cuda_quantized_matmul)
 endif()
 
 if(MSVC)

@@ -128,7 +128,7 @@ static inline void get_scale_min_k4_host(int j, const uint8_t* q, uint8_t& d, ui
         m = q[j + 4] & 63;
     } else {
         d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
     }
 }
 
@@ -234,7 +234,7 @@ __device__ __forceinline__ void get_scale_min_k4_device(int j, const uint8_t* q,
         m = q[j + 4] & 63u;
     } else {
         d = (q[j + 4] & 0xFu) | ((q[j - 4] >> 6) << 4);
-        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
     }
 }
 

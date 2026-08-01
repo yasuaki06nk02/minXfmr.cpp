@@ -196,6 +196,11 @@ bool cpu_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
 
     const float* b = (const float*)B->data;
 
+#ifdef MINXFMR_TILED_MATMUL
+    // Use tiled optimized path when enabled (improves cache locality).
+    if (cpu_matmul_tiled_raw(a, b, o, m, n, k)) return true;
+#endif
+
     // zero out output
     std::memset(o, 0, sizeof(float) * m * n);
 

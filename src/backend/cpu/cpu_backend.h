@@ -38,3 +38,7 @@ bool cpu_vec_dot_rows_ring(const float* vec, const float* ring, size_t head, siz
 // Compute out[col] = sum_{row=0..Nrows-1} vec[row] * mat_rows[row*row_stride + col] for col in [0..Ncols)
 // This computes vec^T * Mat where Mat is Nrows x Ncols stored row-major with stride row_stride.
 bool cpu_vec_mul_rows_cols(const float* vec, const float* mat_rows, float* out, size_t Nrows, size_t Ncols, size_t row_stride);
+
+// Optional tiled raw matmul used by the CPU backend when enabled. A, B, C are
+// plain row-major float buffers with shapes A: m x k, B: k x n, C: m x n.
+bool cpu_matmul_tiled_raw(const float* A, const float* B, float* C, size_t m, size_t n, size_t k);
