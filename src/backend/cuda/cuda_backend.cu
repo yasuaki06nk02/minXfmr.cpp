@@ -162,7 +162,7 @@ static inline void get_scale_min_k4_host(int j, const uint8_t* q, uint8_t& d, ui
         d = q[j] & 63;
         m = q[j + 4] & 63;
     } else {
-        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        d = (q[j + 4] & 0xF) | ((q[j] >> 6) << 4);
         m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
     }
 }
@@ -268,7 +268,8 @@ __device__ __forceinline__ void get_scale_min_k4_device(int j, const uint8_t* q,
         d = q[j] & 63u;
         m = q[j + 4] & 63u;
     } else {
-        d = (q[j + 4] & 0xFu) | ((q[j - 4] >> 6) << 4);
+        // Match host: low 4 bits from q[j+4], top-2 bits from q[j] >> 6
+        d = (q[j + 4] & 0xFu) | ((q[j] >> 6) << 4);
         m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
     }
 }
@@ -501,14 +502,17 @@ __global__ void matmul_quant_kernel(
     for (size_t kk = 0; kk < k; ++kk) {
         const uint8_t* brow = B + kk * row_bytes + block * BlockSize;
 
-        // Decode one quant block per CTA, then reuse it across all threads.
-        if (threadIdx.x == 0 && threadIdx.y == 0) {
+        // Parallel per-thread element decode into shared `tile` so the
+        // shared-tile path matches the per-element (atomic-safe) decoder.
+        const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+        const int nthreads = blockDim.x * blockDim.y;
+        for (int i = tid; i < (int)BlockElems; i += nthreads) {
             if constexpr (BlockElems == TENSOR_Q4_K_QK_K) {
-                dequant_q4_k_block_device(brow, tile);
+                tile[i] = dequant_block_element_q4(brow, i);
             } else if constexpr (BlockElems == TENSOR_Q5_0_QK) {
-                dequant_q5_0_block_device(brow, tile);
+                tile[i] = dequant_block_element_q5(brow, i);
             } else {
-                dequant_q8_0_block_device(brow, tile);
+                tile[i] = dequant_block_element_q8(brow, i);
             }
         }
         __syncthreads();
@@ -803,6 +807,90 @@ __global__ void vec_mul_rows_cols_kernel(
 // internal implementation that launches the debug kernels.
 bool cuda_backend_compare_dequant(const Tensor* t, size_t max_mismatches) {
     return cuda_backend_compare_dequant_internal(t, max_mismatches);
+}
+
+// Kernel: decode a single Q4_K block into a 256-float array on device
+__global__ void debug_dequant_q4_single_block_kernel(
+    const uint8_t* B,
+    float* out,
+    size_t row,
+    size_t cols,
+    size_t row_bytes,
+    size_t block_idx) {
+    const int idx = threadIdx.x;
+    if (idx >= (int)TENSOR_Q4_K_QK_K) return;
+    const uint8_t* blk = B + row * row_bytes + block_idx * TENSOR_Q4_K_BLOCK_SIZE;
+    out[idx] = dequant_block_element_q4(blk, idx);
+}
+
+// Kernel: decode a single Q5_0 block into a 32-float array on device
+__global__ void debug_dequant_q5_single_block_kernel(
+    const uint8_t* B,
+    float* out,
+    size_t row,
+    size_t cols,
+    size_t row_bytes,
+    size_t block_idx) {
+    const int idx = threadIdx.x;
+    if (idx >= (int)TENSOR_Q5_0_QK) return;
+    const uint8_t* blk = B + row * row_bytes + block_idx * TENSOR_Q5_0_BLOCK_SIZE;
+    out[idx] = dequant_block_element_q5(blk, idx);
+}
+
+// Kernel: decode a single Q8_0 block into a 32-float array on device
+__global__ void debug_dequant_q8_single_block_kernel(
+    const uint8_t* B,
+    float* out,
+    size_t row,
+    size_t cols,
+    size_t row_bytes,
+    size_t block_idx) {
+    const int idx = threadIdx.x;
+    if (idx >= (int)TENSOR_Q8_0_QK) return;
+    const uint8_t* blk = B + row * row_bytes + block_idx * TENSOR_Q8_0_BLOCK_SIZE;
+    out[idx] = dequant_block_element_q8(blk, idx);
+}
+
+bool cuda_backend_dequant_block_device(const Tensor* t, size_t row, size_t block, float* out256) {
+    if (!ensure_ready()) return false;
+    if (!t || !t->data || t->bytes == 0) return false;
+    if (!(t->type == DataType::Q4_K || t->type == DataType::Q5_0 || t->type == DataType::Q8_0)) return false;
+
+    const size_t rows = t->rows;
+    const size_t cols = t->cols;
+    if (row >= rows) return false;
+    const size_t row_bytes = quant_row_bytes(t->type, cols);
+    size_t blocks_per_row = 0;
+    if (t->type == DataType::Q4_K) blocks_per_row = cols / TENSOR_Q4_K_QK_K;
+    else if (t->type == DataType::Q5_0) blocks_per_row = cols / TENSOR_Q5_0_QK;
+    else if (t->type == DataType::Q8_0) blocks_per_row = cols / TENSOR_Q8_0_QK;
+    if (blocks_per_row == 0 || block >= blocks_per_row) return false;
+
+    uint8_t* dBq = nullptr;
+    if (!get_or_upload_persistent(t->data, t->bytes, (void**)&dBq)) return false;
+
+    float* d_out = nullptr;
+    size_t elems = 0;
+    if (t->type == DataType::Q4_K) elems = TENSOR_Q4_K_QK_K;
+    else if (t->type == DataType::Q5_0) elems = TENSOR_Q5_0_QK;
+    else elems = TENSOR_Q8_0_QK;
+
+    if (cudaMalloc((void**)&d_out, elems * sizeof(float)) != cudaSuccess) return false;
+
+    if (t->type == DataType::Q4_K) {
+        debug_dequant_q4_single_block_kernel<<<1, (unsigned int)TENSOR_Q4_K_QK_K>>>(dBq, d_out, row, cols, row_bytes, block);
+    } else if (t->type == DataType::Q5_0) {
+        debug_dequant_q5_single_block_kernel<<<1, (unsigned int)TENSOR_Q5_0_QK>>>(dBq, d_out, row, cols, row_bytes, block);
+    } else {
+        debug_dequant_q8_single_block_kernel<<<1, (unsigned int)TENSOR_Q8_0_QK>>>(dBq, d_out, row, cols, row_bytes, block);
+    }
+
+    if (cudaGetLastError() != cudaSuccess) { cudaFree(d_out); return false; }
+    if (cudaDeviceSynchronize() != cudaSuccess) { cudaFree(d_out); return false; }
+
+    if (cudaMemcpy(out256, d_out, elems * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) { cudaFree(d_out); return false; }
+    cudaFree(d_out);
+    return true;
 }
 
 // Forward declarations for atomic-safe kernels (global scope).
