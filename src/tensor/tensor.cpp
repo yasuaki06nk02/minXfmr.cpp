@@ -283,11 +283,17 @@ static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t
         m = q[j + 4] & 63;
     } else {
         d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
-        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j - 4] >> 6) << 4);
     }
 }
 
 void tensor_dequant_q4_k_block(const uint8_t* blk, float* dst256) {
+    // If NEON is available use the optimized implementation in cpu_backend_neon.cpp
+#ifdef __ARM_NEON
+    extern void tensor_dequant_q4_k_block_neon(const uint8_t* blk, float* dst256);
+    tensor_dequant_q4_k_block_neon(blk, dst256);
+    return;
+#else
     uint16_t hd = 0, hm = 0;
     std::memcpy(&hd, blk + 0, sizeof(hd));
     std::memcpy(&hm, blk + 2, sizeof(hm));
@@ -307,6 +313,7 @@ void tensor_dequant_q4_k_block(const uint8_t* blk, float* dst256) {
         q += 32;
         is += 2;
     }
+#endif
 }
 
 void tensor_dequant_q5_0_block(const uint8_t* blk, float* dst32) {
