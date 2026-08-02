@@ -697,14 +697,18 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                         arch.c_str(),
                         needs_square_transpose ? "on" : "off");
 
-                    if (backend_using_cuda() && !RuntimeConfig::Instance().cuda_quant_parity_set()) {
-                        const bool prefer_parity = arch_prefers_cuda_quant_parity(arch_lc);
-                        backend_set_cuda_quant_parity_mode(prefer_parity ? 1 : 0);
-                        minxfmr_info(
-                            "[minxfmr] auto cuda quant policy from architecture='%s': %s\n",
-                            arch.c_str(),
-                            prefer_parity ? "parity(dequant_f32)" : "quant-kernel");
-                    }
+                        if (backend_using_cuda() && !RuntimeConfig::Instance().cuda_quant_parity_set()) {
+                            const bool prefer_parity = arch_prefers_cuda_quant_parity(arch_lc);
+                            backend_set_cuda_quant_parity_mode(prefer_parity ? 1 : 0);
+                            // Query effective parity mode from backend (may be overridden by env/override)
+                            int eff = backend_get_cuda_quant_parity_mode();
+                            const char* eff_str = (eff == 1) ? "parity(dequant_f32)" : (eff == 0 ? "quant-kernel(direct)" : "unset/auto");
+                            minxfmr_info(
+                                "[minxfmr] auto cuda quant policy from architecture='%s': preference=%s effective=%s\n",
+                                arch.c_str(),
+                                prefer_parity ? "parity(dequant_f32)" : "quant-kernel",
+                                eff_str);
+                            }
                 } else {
                     minxfmr_info("[minxfmr] auto orientation: architecture metadata missing, default square_transpose=off\n");
                     if (backend_using_cuda() && !RuntimeConfig::Instance().cuda_quant_parity_set()) {
