@@ -152,6 +152,32 @@ static Tensor* token_embedding_row_into(const minxfmr_context* ctx, int token_id
         // If we couldn't synthesize from Wout fall through and produce a safe zero-vector below.
     }
 
+    // If there is no explicit embedding matrix and we couldn't synthesize one
+    // from Wout, return a safe zero-vector (allocated in `out_owned` if
+    // provided) sized by the model dimension. This avoids null dereference
+    // later when the code inspects `emb->rows/cols`.
+    if (!emb) {
+        size_t cols = ctx->model_dim;
+        // If model_dim not set, try to infer a reasonable width from Wout.
+        if (cols == 0 && ctx->Wout) {
+            const Tensor* out = ctx->Wout;
+            if (out->type == DataType::F32) {
+                // Prefer the dimension that looks like model_dim.
+                if (out->rows > out->cols) cols = out->cols;
+                else cols = out->rows;
+            }
+        }
+        if (cols == 0) return nullptr;
+        Tensor* row = out_owned;
+        if (!row || row->type != DataType::F32 || row->rows != 1 || row->cols != cols) {
+            row = tensor_create_f32_noinit(1, cols);
+            if (!row) return nullptr;
+        }
+        // zero vector
+        std::memset(row->data, 0, cols * sizeof(float));
+        return row;
+    }
+
     // ---- F32, row-major: zero-copy view ----
     if (emb && emb->type == DataType::F32 && emb->rows >= emb->cols) {
         if ((size_t)token_id >= emb->rows) return nullptr;
