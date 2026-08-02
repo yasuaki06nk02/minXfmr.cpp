@@ -222,6 +222,29 @@ int backend_get_cuda_quant_parity_mode() {
 #endif
 }
 
+bool backend_cuda_quant_kernels_enabled() {
+    // Reconstruct the CUDA kernel enable decision using the same rules
+    // as the CUDA backend: honor explicit MINXFMR_CUDA_QUANT if set,
+    // otherwise enable when MINXFMR_BACKEND=cuda.
+    auto &cfg = RuntimeConfig::Instance();
+    if (cfg.has("MINXFMR_CUDA_QUANT")) return cfg.getBool("MINXFMR_CUDA_QUANT");
+    std::string bks = cfg.getString("MINXFMR_BACKEND");
+    for (char &c : bks) c = (char)std::tolower((unsigned char)c);
+    return bks == "cuda";
+}
+
+bool backend_cuda_quant_parity_enabled() {
+    // Match llama.cpp semantics: explicit environment/CLI flags win first,
+    // then any internal override set by model-load code. Default is false.
+    auto &cfg = RuntimeConfig::Instance();
+    if (cfg.has("MINXFMR_CUDA_QUANT_PARITY")) return cfg.getBool("MINXFMR_CUDA_QUANT_PARITY");
+
+    int override_mode = backend_get_cuda_quant_parity_mode();
+    if (override_mode >= 0) return override_mode == 1;
+
+    return false;
+}
+
 bool backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
     backend_initialize_from_env();
 #if defined(MINXFMR_ENABLE_CUDA)

@@ -27,6 +27,12 @@ bool backend_using_cuda();
 void backend_set_cuda_quant_parity_mode(int mode);
 int backend_get_cuda_quant_parity_mode();
 
+// Query effective CUDA quant mode predicates. These report the backend's
+// current decision taking into account overrides and environment variables.
+// When CUDA is not available these return false.
+bool backend_cuda_quant_kernels_enabled();
+bool backend_cuda_quant_parity_enabled();
+
 bool backend_matmul(const Tensor* A, const Tensor* B, Tensor* out);
 bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out);
 bool backend_matvec_strided(const float* vec, const float* mat, float* out, size_t K, size_t N, size_t mat_row_stride);

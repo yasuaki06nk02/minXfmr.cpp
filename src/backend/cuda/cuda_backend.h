@@ -13,6 +13,9 @@ bool cuda_backend_preload_tensor(const Tensor* t);
 void cuda_backend_set_quant_parity_mode(int mode);
 int cuda_backend_get_quant_parity_mode();
 
+// (Internal helpers for kernel/parity selection live inside the CUDA
+// translation unit; external code should query via backend wrappers.)
+
 // When the last CUDA operation failed in a way that prevented preload/upload,
 // this returns a human-readable message (owned by the backend). Empty when
 // no message is available.

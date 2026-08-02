@@ -62,22 +62,11 @@ static bool read_chat_line_utf8(std::string& out) {
 static void write_stdout_bytes(const char* token) {
     if (!token) return;
 #ifdef _WIN32
-    // If stdout is attached to a Windows console, write wide chars so
-    // UTF-8 is displayed correctly. Otherwise fall back to fwrite.
-    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    DWORD mode = 0;
-    if (hOut != INVALID_HANDLE_VALUE && GetConsoleMode(hOut, &mode)) {
-        int wlen = MultiByteToWideChar(CP_UTF8, 0, token, -1, NULL, 0);
-        if (wlen > 0) {
-            std::wstring wbuf;
-            wbuf.resize((size_t)wlen - 1);
-            MultiByteToWideChar(CP_UTF8, 0, token, -1, &wbuf[0], wlen);
-            DWORD written = 0;
-            WriteConsoleW(hOut, wbuf.c_str(), (DWORD)wbuf.size(), &written, NULL);
-            return;
-        }
-    }
-    // Fallback to byte-wise write (works for pipes/redirection).
+    // Use byte-wise UTF-8 writes even when attached to the Windows console.
+    // Mixing WriteConsoleW (wide API) with byte-based stderr/fprintf can
+    // produce garbled/duplicated output on some consoles. The program sets
+    // the console CP to UTF-8 earlier, so fwrite of UTF-8 bytes is reliable
+    // and avoids the wide/byte interop issues.
     std::fwrite(token, 1, std::strlen(token), stdout);
     std::fflush(stdout);
 #else
@@ -126,7 +115,12 @@ int main(int argc, char** argv) {
     int max_history = 12;
     float temperature = 1.0f;
     float top_p = 1.0f;
+    float min_p = 0.0f;
     int top_k = 8;
+    int repeat_last_n = 64;
+    float repeat_penalty = 1.0f;
+    float presence_penalty = 0.0f;
+    float frequency_penalty = 0.0f;
     int max_gen_tokens = 128;
     const char* stop_token = nullptr;
     const char* log_file = nullptr;
@@ -140,6 +134,8 @@ int main(int argc, char** argv) {
     bool transpose_user_override = false;
     bool emit_vocab = false;
     bool temp_set_by_user = false;
+    bool topp_set_by_user = false;
+    bool minp_set_by_user = false;
     bool topk_set_by_user = false;
     bool run_once = false;
     bool show_help = false;
@@ -161,8 +157,13 @@ int main(int argc, char** argv) {
             if (strcmp(a, "--system") == 0 && argi+1 < argc) { system_prompt = argv[argi+1]; argi += 2; continue; }
             if (strcmp(a, "--max-history") == 0 && argi+1 < argc) { max_history = (int)strtol(argv[argi+1], nullptr, 10); argi += 2; continue; }
             if (strcmp(a, "--temp") == 0 && argi+1 < argc) { temperature = (float)strtod(argv[argi+1], nullptr); temp_set_by_user = true; argi += 2; continue; }
-            if (strcmp(a, "--top_p") == 0 && argi+1 < argc) { top_p = (float)strtod(argv[argi+1], nullptr); argi += 2; continue; }
+            if (strcmp(a, "--top_p") == 0 && argi+1 < argc) { top_p = (float)strtod(argv[argi+1], nullptr); topp_set_by_user = true; argi += 2; continue; }
+            if ((strcmp(a, "--min_p") == 0 || strcmp(a, "--min-p") == 0) && argi+1 < argc) { min_p = (float)strtod(argv[argi+1], nullptr); minp_set_by_user = true; argi += 2; continue; }
             if (strcmp(a, "--top_k") == 0 && argi+1 < argc) { top_k = (int)strtol(argv[argi+1], nullptr, 10); topk_set_by_user = true; argi += 2; continue; }
+            if (strcmp(a, "--repeat-last-n") == 0 && argi+1 < argc) { repeat_last_n = (int)strtol(argv[argi+1], nullptr, 10); argi += 2; continue; }
+            if (strcmp(a, "--repeat-penalty") == 0 && argi+1 < argc) { repeat_penalty = (float)strtod(argv[argi+1], nullptr); argi += 2; continue; }
+            if (strcmp(a, "--presence-penalty") == 0 && argi+1 < argc) { presence_penalty = (float)strtod(argv[argi+1], nullptr); argi += 2; continue; }
+            if (strcmp(a, "--frequency-penalty") == 0 && argi+1 < argc) { frequency_penalty = (float)strtod(argv[argi+1], nullptr); argi += 2; continue; }
             if (strcmp(a, "--max-gen-tokens") == 0 && argi+1 < argc) { max_gen_tokens = (int)strtol(argv[argi+1], nullptr, 10); argi += 2; continue; }
             if (strcmp(a, "--stop") == 0 && argi+1 < argc) { stop_token = argv[argi+1]; argi += 2; continue; }
             if (strcmp(a, "--log-file") == 0 && argi+1 < argc) { log_file = argv[argi+1]; argi += 2; continue; }
@@ -193,6 +194,12 @@ int main(int argc, char** argv) {
         printf("  --chat                Enter chat mode (interactive).\n");
         printf("  --temp <n>            Sampling temperature (default 0.7 in chat).\n");
         printf("  --top_k <n>           Top-k sampling parameter.\n");
+        printf("  --top_p <n>           Top-p nucleus sampling (default 0.95 in chat).\n");
+        printf("  --min_p <n>           Min-p sampling (alias: --min-p, default 0.05 in chat).\n");
+        printf("  --repeat-last-n <n>   Last n tokens used for repetition penalties (default 64, 0=off).\n");
+        printf("  --repeat-penalty <n>  Repeat penalty (>1.0 stronger, 1.0=off).\n");
+        printf("  --presence-penalty <n> Presence penalty (default 0.0).\n");
+        printf("  --frequency-penalty <n> Frequency penalty (default 0.0).\n");
         printf("  --max-gen-tokens <n>  Maximum tokens to generate (1-256).\n");
         printf("  --help, -h            Show this help message.\n");
         printf("\nYou can also set environment variables such as MINXFMR_BACKEND, MINXFMR_GGUF_VERBOSE.\n");
@@ -204,6 +211,8 @@ int main(int argc, char** argv) {
         // pure greedy often gets trapped into short/repetitive fragments.
         if (!temp_set_by_user) temperature = 0.7f;
         if (!topk_set_by_user) top_k = 40;
+        if (!topp_set_by_user) top_p = 0.95f;
+        if (!minp_set_by_user) min_p = 0.05f;
     }
 
     if (log_file) {
@@ -544,7 +553,8 @@ int main(int argc, char** argv) {
 
             if (run_once && !chat_mode) {
                 if (debug_attn_once) attention_set_debug_once(true);
-                minxfmr_generate(ctx, prompt.c_str(), print_callback, temperature, top_k);
+                minxfmr_generate(ctx, prompt.c_str(), print_callback, temperature, top_k, top_p, min_p,
+                         repeat_last_n, repeat_penalty, frequency_penalty, presence_penalty);
                 printf("\n");
         } else if (chat_mode) {
             printf("Entering chat mode. Type 'reset' to clear history, 'exit' to quit.\n");
@@ -583,7 +593,8 @@ int main(int argc, char** argv) {
                 printf("assistant> ");
                 if (debug_attn_once) attention_set_debug_once(true);
                 minxfmr_reset(ctx);
-                minxfmr_generate(ctx, assembled.c_str(), gen_collect_callback, temperature, top_k);
+                minxfmr_generate(ctx, assembled.c_str(), gen_collect_callback, temperature, top_k, top_p, min_p,
+                                 repeat_last_n, repeat_penalty, frequency_penalty, presence_penalty);
                 printf("\n");
 
                 std::string sanitized = sanitize_assistant_text(gen_outbuf_global);
@@ -608,7 +619,8 @@ int main(int argc, char** argv) {
                 if (line == "exit") break;
                 if (line == "reset") { minxfmr_reset(ctx); printf("context reset\n"); continue; }
                 if (line.empty()) continue;
-                minxfmr_generate(ctx, line.c_str(), print_callback, temperature, top_k);
+                minxfmr_generate(ctx, line.c_str(), print_callback, temperature, top_k, top_p, min_p,
+                                 repeat_last_n, repeat_penalty, frequency_penalty, presence_penalty);
                 printf("\n");
             }
         }

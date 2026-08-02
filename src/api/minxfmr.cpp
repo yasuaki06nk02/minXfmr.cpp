@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <cctype>
 #include <cstdarg>
+#include <unordered_map>
 #include "../backend/backend_runtime.h"
 #include "runtime_config.h"
 
@@ -1113,11 +1114,37 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
 
     preload_context_weights_to_backend(ctx);
 
+    // Report the final execution path for CUDA quant handling so users see a
+    // single clear info-level message (avoids confusion from multiple [cuda]
+    // diagnostic lines). This prints whether the runtime will use direct
+    // quant kernels or the parity host-dequant->F32 path when using CUDA.
+    if (backend_using_cuda()) {
+        bool parity_enabled = backend_cuda_quant_parity_enabled();
+        bool kernels_enabled = backend_cuda_quant_kernels_enabled();
+        if (parity_enabled) {
+            minxfmr_info("[minxfmr] effective cuda execution path: parity(dequant_f32) - host dequant -> device F32 cache then SGEMM\n");
+        } else if (kernels_enabled) {
+            minxfmr_info("[minxfmr] effective cuda execution path: quant-kernel(direct) - device-side quantized kernels\n");
+        } else {
+            minxfmr_info("[minxfmr] effective cuda execution path: quant kernels disabled; will fall back to CPU or staged host dequant path\n");
+        }
+    }
+
     minxfmr_log("minxfmr: opened model %s\n", model_path);
     return ctx;
 }
 
-int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(const char* token), double temperature, int top_k) {
+int minxfmr_generate(minxfmr_context* ctx,
+                     const char* prompt,
+                     void (*callback)(const char* token),
+                     double temperature,
+                     int top_k,
+                     double top_p,
+                     double min_p,
+                     int repeat_last_n,
+                     double repeat_penalty,
+                     double frequency_penalty,
+                     double presence_penalty) {
     if (!ctx || !prompt) return -1;
 
     // Reset per-call backend workspace allocations for this generation call.
@@ -1213,6 +1240,9 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
 
     std::vector<int> recent_tokens;
     recent_tokens.reserve(64);
+    std::vector<int> token_history;
+    token_history.reserve(ids.size() + (size_t)max_steps + 8);
+    token_history.insert(token_history.end(), ids.begin(), ids.end());
 
     // If requested via environment, emit a single-line JSON object to stdout with
     // the generated token ids, token strings and base64-encoded decoded text.
@@ -1388,9 +1418,36 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             }
         }
 
-        for (size_t i = 0; i < recent_tokens.size(); ++i) {
-            int rid = recent_tokens[i];
-            if (rid >= 0 && (size_t)rid < logits.size()) logits[(size_t)rid] -= 0.75;
+        // llama.cpp-style repetition penalties over the last N accepted tokens.
+        // If N < 0, use all available history for this generation call.
+        const int hist_size = (int)token_history.size();
+        int penalty_n = repeat_last_n;
+        if (penalty_n < 0) penalty_n = hist_size;
+        if (penalty_n > hist_size) penalty_n = hist_size;
+        if (penalty_n > 0 && (repeat_penalty != 1.0 || frequency_penalty != 0.0 || presence_penalty != 0.0)) {
+            std::unordered_map<int, int> token_count;
+            token_count.reserve((size_t)penalty_n);
+            const int begin = hist_size - penalty_n;
+            for (int i = begin; i < hist_size; ++i) {
+                ++token_count[token_history[(size_t)i]];
+            }
+
+            for (const auto& kv : token_count) {
+                const int tid = kv.first;
+                const int count = kv.second;
+                if (tid < 0 || (size_t)tid >= logits.size()) continue;
+
+                double logit = logits[(size_t)tid];
+                if (repeat_penalty != 1.0) {
+                    if (logit <= 0.0) {
+                        logit *= repeat_penalty;
+                    } else {
+                        logit /= repeat_penalty;
+                    }
+                }
+                logit -= (double)count * frequency_penalty + (count > 0 ? presence_penalty : 0.0);
+                logits[(size_t)tid] = logit;
+            }
         }
 
         int k_use = top_k;
@@ -1410,6 +1467,11 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         probs.reserve((size_t)k_use);
         double maxs = logits[(size_t)order[0]];
 
+        // Clamp top-p/min-p to a usable range.
+        if (top_p <= 0.0 || top_p > 1.0) top_p = 1.0;
+        if (min_p < 0.0) min_p = 0.0;
+        if (min_p > 1.0) min_p = 1.0;
+
         if (sampler_greedy) {
             // Deterministic greedy: pick the highest-logit token.
             next = order[0];
@@ -1424,7 +1486,47 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
                 next = order[0];
             } else {
                 for (double& p : probs) p /= sum;
-                std::discrete_distribution<int> dist(probs.begin(), probs.end());
+
+                int sample_n = k_use;
+                if (top_p < 1.0) {
+                    double cum = 0.0;
+                    sample_n = 0;
+                    for (int i = 0; i < k_use; ++i) {
+                        cum += probs[(size_t)i];
+                        sample_n = i + 1;
+                        if (cum >= top_p) break;
+                    }
+                    if (sample_n < 1) sample_n = 1;
+
+                    double renorm = 0.0;
+                    for (int i = 0; i < sample_n; ++i) renorm += probs[(size_t)i];
+                    if (renorm > 0.0) {
+                        for (int i = 0; i < sample_n; ++i) probs[(size_t)i] /= renorm;
+                    }
+                }
+
+                // Min-p: keep tokens with p >= min_p * p_max among current candidates.
+                if (min_p > 0.0 && sample_n > 1) {
+                    const double p_max = probs[0];
+                    const double p_thr = p_max * min_p;
+                    int keep_n = 1;
+                    for (int i = 1; i < sample_n; ++i) {
+                        if (probs[(size_t)i] >= p_thr) {
+                            keep_n = i + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    sample_n = keep_n;
+
+                    double renorm2 = 0.0;
+                    for (int i = 0; i < sample_n; ++i) renorm2 += probs[(size_t)i];
+                    if (renorm2 > 0.0) {
+                        for (int i = 0; i < sample_n; ++i) probs[(size_t)i] /= renorm2;
+                    }
+                }
+
+                std::discrete_distribution<int> dist(probs.begin(), probs.begin() + sample_n);
                 int pick = dist(rng);
                 next = order[(size_t)pick];
             }
@@ -1641,6 +1743,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
 
         //if (in) tensor_free(in);
         //if (out) tensor_free(out);
+        token_history.push_back(next);
         last = next;
     }
 

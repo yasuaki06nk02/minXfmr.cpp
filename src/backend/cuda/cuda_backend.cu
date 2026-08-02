@@ -62,7 +62,8 @@ bool cuda_quant_kernels_enabled() {
         for (size_t i = 0; i < bks.size(); ++i) bks[i] = (char)std::tolower((unsigned char)bks[i]);
         if (bks == "cuda") {
             mode = 1;
-            std::fprintf(stderr, "[cuda] MINXFMR_BACKEND=cuda detected; enabling direct quant kernels by default. Set MINXFMR_CUDA_QUANT=0 to force staged host-side dequant.\n");
+            std::fprintf(stderr, "[cuda] MINXFMR_BACKEND=cuda detected; direct quant kernels are available by default (performance).\n");
+            std::fprintf(stderr, "[cuda] To force staged host-side dequant (parity) set MINXFMR_CUDA_QUANT=0 or MINXFMR_CUDA_QUANT_PARITY=1.\n");
         } else {
             mode = 0;
             std::fprintf(stderr, "[cuda] MINXFMR_CUDA_QUANT not set; defaulting to staged host-side dequant for numerical safety. Set MINXFMR_CUDA_QUANT=1 to enable direct quant kernels.\n");
@@ -77,22 +78,23 @@ bool cuda_quant_kernels_enabled() {
 }
 
 bool cuda_quant_parity_mode_enabled() {
+    // Check explicit environment/CLI flags first (llama.cpp semantics).
+    auto &cfg = RuntimeConfig::Instance();
+    if (cfg.has("MINXFMR_CUDA_QUANT_PARITY")) {
+        const bool env_val = cfg.getBool("MINXFMR_CUDA_QUANT_PARITY");
+        if (env_val) {
+            std::fprintf(stderr, "[cuda] quantized matmul parity mode enabled; host-side dequantizing weights to F32 device cache for numerical parity\n");
+        }
+        return env_val;
+    }
+
+    // No explicit env/CLI flag -> respect any internal override set by model-load
+    // or other programmatic callers (quant_parity_mode_override()).
     const int override_mode = quant_parity_mode_override().load(std::memory_order_relaxed);
     if (override_mode >= 0) return override_mode == 1;
 
-    static int env_mode = -1;
-    if (env_mode >= 0) return env_mode == 1;
-
-    auto &cfg = RuntimeConfig::Instance();
-    if (cfg.has("MINXFMR_CUDA_QUANT_PARITY")) {
-        env_mode = cfg.getBool("MINXFMR_CUDA_QUANT_PARITY") ? 1 : 0;
-        if (env_mode == 1) {
-            std::fprintf(stderr, "[cuda] quantized matmul parity mode enabled; host-side dequantizing weights to F32 device cache for numerical parity\n");
-        }
-    } else {
-        env_mode = 0;
-    }
-    return env_mode == 1;
+    // Default: parity off.
+    return false;
 }
 
 bool cuda_quant_atomic_safe_enabled() {

@@ -9,7 +9,17 @@ typedef struct minxfmr_context minxfmr_context;
 minxfmr_context* minxfmr_open(const char* model_path);
 minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_layer);
 
-int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(const char* token), double temperature, int top_k);
+int minxfmr_generate(minxfmr_context* ctx,
+					 const char* prompt,
+					 void (*callback)(const char* token),
+					 double temperature,
+					 int top_k,
+					 double top_p,
+					 double min_p,
+					 int repeat_last_n,
+					 double repeat_penalty,
+					 double frequency_penalty,
+					 double presence_penalty);
 
 void minxfmr_reset(minxfmr_context* ctx);
 
