@@ -1034,11 +1034,9 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         if (ctx->Wk && normalize_linear_inplace(ctx->Wk, ctx->model_dim, desired_transpose_wk, tr) && tr) ++n_wk;
         if (ctx->Wv && normalize_linear_inplace(ctx->Wv, ctx->model_dim, desired_transpose_wv, tr) && tr) ++n_wv;
 
-        fprintf(stderr,
-            "[minxfmr] normalized attention weights at load: Wq=%zu Wk=%zu Wv=%zu Wo=%zu bad=%zu\n",
+        minxfmr_log("[minxfmr] normalized attention weights at load: Wq=%zu Wk=%zu Wv=%zu Wo=%zu bad=%zu\n",
             n_wq, n_wk, n_wv, n_wo, bad_attn);
-        fprintf(stderr,
-            "[minxfmr] normalized ffn weights at load: gate=%zu up=%zu down=%zu bad=%zu\n",
+        minxfmr_log("[minxfmr] normalized ffn weights at load: gate=%zu up=%zu down=%zu bad=%zu\n",
             n_ffn_gate, n_ffn_up, n_ffn_down, bad_ffn);
 
         // Keep runtime square-transpose enabled only for quantized square matrices
@@ -1058,8 +1056,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         if (quantized_square_needs_runtime_transpose(ctx->Wv, ctx->model_dim, desired_transpose_wv)) rt_wv = true;
 
         transformer_set_transpose_square_weights_for_all(rt_wq, rt_wk, rt_wv, rt_wo);
-        fprintf(stderr,
-            "[minxfmr] runtime square transpose after normalization: wq=%s wk=%s wv=%s wo=%s\n",
+        minxfmr_log("[minxfmr] runtime square transpose after normalization: wq=%s wk=%s wv=%s wo=%s\n",
             rt_wq ? "on" : "off",
             rt_wk ? "on" : "off",
             rt_wv ? "on" : "off",
