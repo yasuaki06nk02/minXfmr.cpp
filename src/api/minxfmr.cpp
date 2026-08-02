@@ -16,6 +16,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cctype>
+#include <cstdarg>
 #include "../backend/backend_runtime.h"
 #include "runtime_config.h"
 
@@ -230,6 +231,17 @@ static bool chat_debug_enabled() {
 // Enable verbose per-token generation logs when MINXFMR_VERBOSE_GEN=1.
 static bool gen_verbose_enabled() {
     return RuntimeConfig::Instance().gen_verbose();
+}
+
+// Conditional logger for minxfmr internals. Only prints when
+// MINXFMR_CHAT_DEBUG is enabled to keep stderr clean for non-debug runs.
+static void minxfmr_log(const char* fmt, ...) {
+    if (!chat_debug_enabled()) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
 }
 
 static bool transpose_square_inplace(Tensor*& t) {
@@ -525,7 +537,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     if (!model_path) return nullptr;
 
     backend_initialize_from_env();
-    fprintf(stderr, "[minxfmr] backend=%s\n", backend_get_name());
+    minxfmr_log("[minxfmr] backend=%s\n", backend_get_name());
 
     minxfmr_context* ctx = new (std::nothrow) minxfmr_context();
     if (!ctx) return nullptr;
@@ -600,21 +612,21 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                         ctx->Wv = TWv;
                         ctx->model_dim = (size_t)d;
                         ctx->kv_dim = (size_t)d;
-                        fprintf(stderr, "[minxfmr] loaded weights from %s dim=%d\n", model_path, d);
+                        minxfmr_log("[minxfmr] loaded weights from %s dim=%d\n", model_path, d);
                     } else {
                         tensor_free(TWq);
                         tensor_free(TWk);
                         tensor_free(TWv);
                     }
                 } else {
-                    fprintf(stderr, "[minxfmr] weight file %s malformed: expected %zu floats, got %zu\n", model_path, need, buf.size());
+                    minxfmr_log("[minxfmr] weight file %s malformed: expected %zu floats, got %zu\n", model_path, need, buf.size());
                 }
             } else {
-                fprintf(stderr, "[minxfmr] could not read dim from %s\n", model_path);
+                minxfmr_log("[minxfmr] could not read dim from %s\n", model_path);
             }
             fclose(f);
         } else {
-            fprintf(stderr, "[minxfmr] weight file %s not found, proceeding without projections\n", model_path);
+            minxfmr_log("[minxfmr] weight file %s not found, proceeding without projections\n", model_path);
         }
     }
 
@@ -630,13 +642,13 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
             if (cfg.n_intermediate > 0) ctx->n_intermediate = (size_t)cfg.n_intermediate;
             if (cfg.rope_freq_base > 0.0f) ctx->rope_theta = cfg.rope_freq_base;
             if (cfg.rmsnorm_epsilon > 0.0f) ctx->rmsnorm_epsilon = cfg.rmsnorm_epsilon;
-            fprintf(stderr, "[minxfmr] gguf meta layers=%zu ctx=%zu embd=%zu head=%zu head_kv=%zu\n",
+            minxfmr_log("[minxfmr] gguf meta layers=%zu ctx=%zu embd=%zu head=%zu head_kv=%zu\n",
                 ctx->n_layer, ctx->seq_max, ctx->model_dim, (size_t)cfg.n_head, (size_t)cfg.n_head_kv);
-            fprintf(stderr, "[minxfmr] ffn intermediate=%zu\n", ctx->n_intermediate);
-            fprintf(stderr, "[minxfmr] rope theta=%g\n", (double)ctx->rope_theta);
-            fprintf(stderr, "[minxfmr] rmsnorm epsilon=%g\n", (double)ctx->rmsnorm_epsilon);
+            minxfmr_log("[minxfmr] ffn intermediate=%zu\n", ctx->n_intermediate);
+            minxfmr_log("[minxfmr] rope theta=%g\n", (double)ctx->rope_theta);
+            minxfmr_log("[minxfmr] rmsnorm epsilon=%g\n", (double)ctx->rmsnorm_epsilon);
             if (cfg.n_head == 0 || cfg.n_head_kv == 0) {
-                fprintf(stderr,
+                minxfmr_log(
                     "[minxfmr] warning: gguf head metadata missing (llama.attention.head_count / llama.attention.head_count_kv). "
                     "defaults may be incorrect for non-LLaMA architectures.\n");
             }
@@ -652,7 +664,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 desired_transpose_wv = env_enabled("MINXFMR_TRANSPOSE_WV");
                 desired_transpose_wo = env_enabled("MINXFMR_TRANSPOSE_WO");
                 desired_transpose_ffn_square = desired_transpose_wq || desired_transpose_wk || desired_transpose_wv || desired_transpose_wo;
-                fprintf(stderr,
+                minxfmr_log(
                     "[minxfmr] manual orientation: wq=%s wk=%s wv=%s wo=%s\n",
                     desired_transpose_wq ? "on" : "off",
                     desired_transpose_wk ? "on" : "off",
@@ -670,7 +682,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                     desired_transpose_wv = needs_square_transpose;
                     desired_transpose_wo = needs_square_transpose;
                     desired_transpose_ffn_square = needs_square_transpose;
-                    fprintf(stderr,
+                    minxfmr_log(
                         "[minxfmr] auto orientation from gguf architecture='%s': square_transpose=%s\n",
                         arch.c_str(),
                         needs_square_transpose ? "on" : "off");
@@ -678,13 +690,13 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                     if (backend_using_cuda() && !RuntimeConfig::Instance().cuda_quant_parity_set()) {
                         const bool prefer_parity = arch_prefers_cuda_quant_parity(arch_lc);
                         backend_set_cuda_quant_parity_mode(prefer_parity ? 1 : 0);
-                        fprintf(stderr,
+                        minxfmr_log(
                             "[minxfmr] auto cuda quant policy from architecture='%s': %s\n",
                             arch.c_str(),
                             prefer_parity ? "parity(dequant_f32)" : "quant-kernel");
                     }
                 } else {
-                    fprintf(stderr, "[minxfmr] auto orientation: architecture metadata missing, default square_transpose=off\n");
+                    minxfmr_log("[minxfmr] auto orientation: architecture metadata missing, default square_transpose=off\n");
                     if (backend_using_cuda() && !RuntimeConfig::Instance().cuda_quant_parity_set()) {
                         backend_set_cuda_quant_parity_mode(0);
                     }
@@ -695,7 +707,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         Tensor* wemb = nullptr;
         if (gguf_try_load_token_embedding(model_path, wemb)) {
             ctx->Wemb = wemb;
-            fprintf(stderr, "[minxfmr] loaded token embedding rows=%zu cols=%zu\n", wemb->rows, wemb->cols);
+            minxfmr_log("[minxfmr] loaded token embedding rows=%zu cols=%zu\n", wemb->rows, wemb->cols);
         }
 
         ctx->Wq_layers.resize(ctx->n_layer, nullptr);
@@ -721,7 +733,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
             int percent = (int)(((double)(l) / (double)ctx->n_layer) * 100.0);
             int bucket = percent / 10;
             if (bucket != last_progress_bucket || l == 0 || l + 1 == ctx->n_layer) {
-                fprintf(stderr, "[minxfmr] loading layers %zu/%zu (%d%%)\n", l, ctx->n_layer, percent);
+                minxfmr_log("[minxfmr] loading layers %zu/%zu (%d%%)\n", l, ctx->n_layer, percent);
                 last_progress_bucket = bucket;
             }
             Tensor* lq = nullptr;
@@ -768,9 +780,9 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 loaded_ffn_layers++;
             }
         }
-        fprintf(stderr, "[minxfmr] model load complete (100%%)\n");
+        minxfmr_log("[minxfmr] model load complete (100%%)\n");
         if (loaded_attn_layers > 0) {
-            fprintf(stderr, "[minxfmr] loaded per-layer projections: %zu/%zu layers\n", loaded_attn_layers, ctx->n_layer);
+            minxfmr_log("[minxfmr] loaded per-layer projections: %zu/%zu layers\n", loaded_attn_layers, ctx->n_layer);
             for (size_t i = 0; i < ctx->Wq_layers.size(); ++i) {
                 if (ctx->Wq_layers[i] && ctx->Wk_layers[i] && ctx->Wv_layers[i]) {
                     ctx->Wq = tensor_clone_f32_local(ctx->Wq_layers[i]);
@@ -780,19 +792,19 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 }
             }
         }
-        fprintf(stderr, "[minxfmr] projection load summary: attn=%zu bias=%zu wo=%zu norm=%zu ffn=%zu of %zu layers\n",
+        minxfmr_log("[minxfmr] projection load summary: attn=%zu bias=%zu wo=%zu norm=%zu ffn=%zu of %zu layers\n",
             loaded_attn_layers, loaded_attn_bias_layers, loaded_wo_layers, loaded_norm_layers, loaded_ffn_layers, ctx->n_layer);
         if (loaded_attn_bias_layers > 0) {
-            fprintf(stderr, "[minxfmr] loaded per-layer projection biases: %zu/%zu layers\n", loaded_attn_bias_layers, ctx->n_layer);
+            minxfmr_log("[minxfmr] loaded per-layer projection biases: %zu/%zu layers\n", loaded_attn_bias_layers, ctx->n_layer);
         }
         if (loaded_ffn_layers > 0) {
-            fprintf(stderr, "[minxfmr] loaded per-layer ffn weights: %zu/%zu layers\n", loaded_ffn_layers, ctx->n_layer);
+            minxfmr_log("[minxfmr] loaded per-layer ffn weights: %zu/%zu layers\n", loaded_ffn_layers, ctx->n_layer);
         }
         if (loaded_wo_layers > 0) {
-            fprintf(stderr, "[minxfmr] loaded per-layer Wo weights: %zu/%zu layers\n", loaded_wo_layers, ctx->n_layer);
+            minxfmr_log("[minxfmr] loaded per-layer Wo weights: %zu/%zu layers\n", loaded_wo_layers, ctx->n_layer);
         }
         if (loaded_norm_layers > 0) {
-            fprintf(stderr, "[minxfmr] loaded per-layer norm weights: %zu/%zu layers\n", loaded_norm_layers, ctx->n_layer);
+            minxfmr_log("[minxfmr] loaded per-layer norm weights: %zu/%zu layers\n", loaded_norm_layers, ctx->n_layer);
         }
 
         if (!ctx->Wq) {
@@ -803,7 +815,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 ctx->Wq = gWq;
                 ctx->Wk = gWk;
                 ctx->Wv = gWv;
-                fprintf(stderr, "[minxfmr] loaded projections from gguf %s layer=%d dim=%zux%zu\n", model_path, projection_layer, ctx->Wq->rows, ctx->Wq->cols);
+                minxfmr_log("[minxfmr] loaded projections from gguf %s layer=%d dim=%zux%zu\n", model_path, projection_layer, ctx->Wq->rows, ctx->Wq->cols);
             }
         }
 
@@ -814,11 +826,11 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 if (gguf_open(model_path, gf)) {
                     if (!gf.vocab_tokens.empty()) {
                         if (tokenizer_load_from_gguf(gf)) {
-                            fprintf(stderr, "[minxfmr] loaded tokenizer vocab+meta from gguf size=%zu\n", gf.vocab_tokens.size());
+                            minxfmr_log("[minxfmr] loaded tokenizer vocab+meta from gguf size=%zu\n", gf.vocab_tokens.size());
                             log_vocab_specials(gf.vocab_tokens);
                         } else {
                             tokenizer_load_from_list(gf.vocab_tokens);
-                            fprintf(stderr, "[minxfmr] loaded tokenizer vocab from gguf size=%zu\n", gf.vocab_tokens.size());
+                            minxfmr_log("[minxfmr] loaded tokenizer vocab from gguf size=%zu\n", gf.vocab_tokens.size());
                             log_vocab_specials(gf.vocab_tokens);
                         }
                     }
@@ -829,13 +841,13 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         Tensor* wout = nullptr;
         if (gguf_try_load_lm_head(model_path, wout)) {
             ctx->Wout = wout;
-            fprintf(stderr, "[minxfmr] loaded output head rows=%zu cols=%zu\n", wout->rows, wout->cols);
+            minxfmr_log("[minxfmr] loaded output head rows=%zu cols=%zu\n", wout->rows, wout->cols);
         }
 
         Tensor* wnorm = nullptr;
         if (gguf_try_load_final_norm(model_path, wnorm)) {
             ctx->Wnorm = wnorm;
-            fprintf(stderr, "[minxfmr] loaded final norm rows=%zu cols=%zu\n", wnorm->rows, wnorm->cols);
+            minxfmr_log("[minxfmr] loaded final norm rows=%zu cols=%zu\n", wnorm->rows, wnorm->cols);
         }
     }
 
@@ -867,13 +879,13 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         bool ffn_present = (ffn_ready > 0);
 
         if (!attn_present || !wo_present || !ffn_present) {
-            fprintf(stderr,
+            minxfmr_log(
                 "[minxfmr] fatal: decoder tensors are missing (attn_present=%d wo_present=%d ffn_present=%d layers=%zu).\n",
                 (int)attn_present,
                 (int)wo_present,
                 (int)ffn_present,
                 ctx->n_layer);
-            fprintf(stderr,
+            minxfmr_log(
                 "[minxfmr] fatal: GGUF tensor resolution failed (naming mismatch, unsupported layout, or incomplete/truncated file); refusing to run to avoid gibberish output.\n");
             minxfmr_close(ctx);
             return nullptr;
@@ -1062,20 +1074,20 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     std::string tmp_template;
     if (gguf_try_read_chat_template(model_path, tmp_template)) {
         ctx->chat_template = tmp_template;
-        fprintf(stderr, "[minxfmr] loaded chat template from gguf length=%zu\n", ctx->chat_template.size());
+        minxfmr_log("[minxfmr] loaded chat template from gguf length=%zu\n", ctx->chat_template.size());
     }
     std::vector<std::string> tmp_specials;
     if (gguf_try_read_special_tokens(model_path, tmp_specials)) {
         ctx->special_tokens = tmp_specials;
-        fprintf(stderr, "[minxfmr] loaded %zu special tokens from gguf\n", ctx->special_tokens.size());
+        minxfmr_log("[minxfmr] loaded %zu special tokens from gguf\n", ctx->special_tokens.size());
     }
 
     ctx->cache = kvcache_create(ctx->n_layer, ctx->seq_max, ctx->kv_dim);
     if (!ctx->cache) {
-        fprintf(stderr, "[minxfmr] failed to create kvcache with layers=%zu seq=%zu dim=%zu\n", ctx->n_layer, ctx->seq_max, ctx->kv_dim);
+        minxfmr_log("[minxfmr] failed to create kvcache with layers=%zu seq=%zu dim=%zu\n", ctx->n_layer, ctx->seq_max, ctx->kv_dim);
     }
 
-    fprintf(stderr, "[minxfmr] runtime config model_dim=%zu kv_dim=%zu layers=%zu seq_max=%zu\n",
+    minxfmr_log("[minxfmr] runtime config model_dim=%zu kv_dim=%zu layers=%zu seq_max=%zu\n",
         ctx->model_dim, ctx->kv_dim, ctx->n_layer, ctx->seq_max);
 
     // Preallocate scores workspace for attention.
@@ -1090,7 +1102,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
 
     preload_context_weights_to_backend(ctx);
 
-    fprintf(stderr, "minxfmr: opened model %s\n", model_path);
+    minxfmr_log("minxfmr: opened model %s\n", model_path);
     return ctx;
 }
 
@@ -1150,8 +1162,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         const bool in_is_view = (in != ctx->embed_buf);
 
         if (!run_stack_forward(ctx, in, ctx->hidden_buf)) {
-            fprintf(stderr, "[minxfmr] forward failed during prompt prefill (token id=%d)\n", id);
-            fflush(stderr);
+            minxfmr_log("[minxfmr] forward failed during prompt prefill (token id=%d)\n", id);
             if (in_is_view) tensor_free(in);
             if (last_out_prefill) tensor_free(last_out_prefill);
             return -3;
@@ -1240,15 +1251,13 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
         } else {
             Tensor* in = token_embedding_row_into(ctx, last, ctx->embed_buf);
             if (!in) {
-                fprintf(stderr, "[minxfmr] no input embedding at step=%d last=%d\n", t, last);
-                fflush(stderr);
+                minxfmr_log("[minxfmr] no input embedding at step=%d last=%d\n", t, last);
                 gen_break_reason = "no_in";
                 break;
             }
             const bool in_is_view = (in != ctx->embed_buf);
             if (!run_stack_forward(ctx, in, out)) {
-                fprintf(stderr, "[minxfmr] forward failed during generation step=%d last=%d\n", t, last);
-                fflush(stderr);
+                minxfmr_log("[minxfmr] forward failed during generation step=%d last=%d\n", t, last);
                 if (in_is_view) tensor_free(in);
                 if (last_out_prefill) tensor_free(last_out_prefill);
                 return -3;
@@ -1793,24 +1802,24 @@ void minxfmr_close(minxfmr_context* ctx) {
 
 void minxfmr_print_weights(minxfmr_context* ctx) {
     if (!ctx) {
-        fprintf(stderr, "[minxfmr] no context\n");
+        minxfmr_log("[minxfmr] no context\n");
         return;
     }
     if (ctx->Wq && ctx->Wk && ctx->Wv) {
-        fprintf(stderr, "[minxfmr] Wq dim=%zux%zu sample00=%f\n", ctx->Wq->rows, ctx->Wq->cols, tensor_get_f32(ctx->Wq, 0, 0));
-        fprintf(stderr, "[minxfmr] Wk dim=%zux%zu sample00=%f\n", ctx->Wk->rows, ctx->Wk->cols, tensor_get_f32(ctx->Wk, 0, 0));
-        fprintf(stderr, "[minxfmr] Wv dim=%zux%zu sample00=%f\n", ctx->Wv->rows, ctx->Wv->cols, tensor_get_f32(ctx->Wv, 0, 0));
+        minxfmr_log("[minxfmr] Wq dim=%zux%zu sample00=%f\n", ctx->Wq->rows, ctx->Wq->cols, tensor_get_f32(ctx->Wq, 0, 0));
+        minxfmr_log("[minxfmr] Wk dim=%zux%zu sample00=%f\n", ctx->Wk->rows, ctx->Wk->cols, tensor_get_f32(ctx->Wk, 0, 0));
+        minxfmr_log("[minxfmr] Wv dim=%zux%zu sample00=%f\n", ctx->Wv->rows, ctx->Wv->cols, tensor_get_f32(ctx->Wv, 0, 0));
     } else {
-        fprintf(stderr, "[minxfmr] no projection weights loaded\n");
+        minxfmr_log("[minxfmr] no projection weights loaded\n");
     }
     if (!ctx->Wq_layers.empty()) {
-        fprintf(stderr, "[minxfmr] per-layer projections loaded for %zu layers\n", ctx->Wq_layers.size());
+        minxfmr_log("[minxfmr] per-layer projections loaded for %zu layers\n", ctx->Wq_layers.size());
     }
     if (!ctx->Wffn_gate_layers.empty()) {
-        fprintf(stderr, "[minxfmr] per-layer ffn loaded for %zu layers\n", ctx->Wffn_gate_layers.size());
+        minxfmr_log("[minxfmr] per-layer ffn loaded for %zu layers\n", ctx->Wffn_gate_layers.size());
     }
     if (!ctx->Wo_layers.empty()) {
-        fprintf(stderr, "[minxfmr] per-layer Wo loaded for %zu layers\n", ctx->Wo_layers.size());
+        minxfmr_log("[minxfmr] per-layer Wo loaded for %zu layers\n", ctx->Wo_layers.size());
     }
 }
 
