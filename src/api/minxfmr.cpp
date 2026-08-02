@@ -244,6 +244,16 @@ static void minxfmr_log(const char* fmt, ...) {
     fflush(stderr);
 }
 
+// Informational logger for important runtime/model loading messages.
+// Always prints to stderr regardless of debug flag.
+static void minxfmr_info(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fflush(stderr);
+}
+
 static bool transpose_square_inplace(Tensor*& t) {
     if (!t || t->type != DataType::F32) return true;
     if (t->rows != t->cols) return true;
@@ -537,7 +547,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     if (!model_path) return nullptr;
 
     backend_initialize_from_env();
-    minxfmr_log("[minxfmr] backend=%s\n", backend_get_name());
+    minxfmr_info("[minxfmr] backend=%s\n", backend_get_name());
 
     minxfmr_context* ctx = new (std::nothrow) minxfmr_context();
     if (!ctx) return nullptr;
@@ -642,11 +652,11 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
             if (cfg.n_intermediate > 0) ctx->n_intermediate = (size_t)cfg.n_intermediate;
             if (cfg.rope_freq_base > 0.0f) ctx->rope_theta = cfg.rope_freq_base;
             if (cfg.rmsnorm_epsilon > 0.0f) ctx->rmsnorm_epsilon = cfg.rmsnorm_epsilon;
-            minxfmr_log("[minxfmr] gguf meta layers=%zu ctx=%zu embd=%zu head=%zu head_kv=%zu\n",
+            minxfmr_info("[minxfmr] gguf meta layers=%zu ctx=%zu embd=%zu head=%zu head_kv=%zu\n",
                 ctx->n_layer, ctx->seq_max, ctx->model_dim, (size_t)cfg.n_head, (size_t)cfg.n_head_kv);
-            minxfmr_log("[minxfmr] ffn intermediate=%zu\n", ctx->n_intermediate);
-            minxfmr_log("[minxfmr] rope theta=%g\n", (double)ctx->rope_theta);
-            minxfmr_log("[minxfmr] rmsnorm epsilon=%g\n", (double)ctx->rmsnorm_epsilon);
+            minxfmr_info("[minxfmr] ffn intermediate=%zu\n", ctx->n_intermediate);
+            minxfmr_info("[minxfmr] rope theta=%g\n", (double)ctx->rope_theta);
+            minxfmr_info("[minxfmr] rmsnorm epsilon=%g\n", (double)ctx->rmsnorm_epsilon);
             if (cfg.n_head == 0 || cfg.n_head_kv == 0) {
                 minxfmr_log(
                     "[minxfmr] warning: gguf head metadata missing (llama.attention.head_count / llama.attention.head_count_kv). "
@@ -682,7 +692,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                     desired_transpose_wv = needs_square_transpose;
                     desired_transpose_wo = needs_square_transpose;
                     desired_transpose_ffn_square = needs_square_transpose;
-                    minxfmr_log(
+                    minxfmr_info(
                         "[minxfmr] auto orientation from gguf architecture='%s': square_transpose=%s\n",
                         arch.c_str(),
                         needs_square_transpose ? "on" : "off");
@@ -690,13 +700,13 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                     if (backend_using_cuda() && !RuntimeConfig::Instance().cuda_quant_parity_set()) {
                         const bool prefer_parity = arch_prefers_cuda_quant_parity(arch_lc);
                         backend_set_cuda_quant_parity_mode(prefer_parity ? 1 : 0);
-                        minxfmr_log(
+                        minxfmr_info(
                             "[minxfmr] auto cuda quant policy from architecture='%s': %s\n",
                             arch.c_str(),
                             prefer_parity ? "parity(dequant_f32)" : "quant-kernel");
                     }
                 } else {
-                    minxfmr_log("[minxfmr] auto orientation: architecture metadata missing, default square_transpose=off\n");
+                    minxfmr_info("[minxfmr] auto orientation: architecture metadata missing, default square_transpose=off\n");
                     if (backend_using_cuda() && !RuntimeConfig::Instance().cuda_quant_parity_set()) {
                         backend_set_cuda_quant_parity_mode(0);
                     }
@@ -707,7 +717,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         Tensor* wemb = nullptr;
         if (gguf_try_load_token_embedding(model_path, wemb)) {
             ctx->Wemb = wemb;
-            minxfmr_log("[minxfmr] loaded token embedding rows=%zu cols=%zu\n", wemb->rows, wemb->cols);
+            minxfmr_info("[minxfmr] loaded token embedding rows=%zu cols=%zu\n", wemb->rows, wemb->cols);
         }
 
         ctx->Wq_layers.resize(ctx->n_layer, nullptr);
@@ -733,7 +743,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
             int percent = (int)(((double)(l) / (double)ctx->n_layer) * 100.0);
             int bucket = percent / 10;
             if (bucket != last_progress_bucket || l == 0 || l + 1 == ctx->n_layer) {
-                minxfmr_log("[minxfmr] loading layers %zu/%zu (%d%%)\n", l, ctx->n_layer, percent);
+                minxfmr_info("[minxfmr] loading layers %zu/%zu (%d%%)\n", l, ctx->n_layer, percent);
                 last_progress_bucket = bucket;
             }
             Tensor* lq = nullptr;
@@ -780,9 +790,9 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 loaded_ffn_layers++;
             }
         }
-        minxfmr_log("[minxfmr] model load complete (100%%)\n");
+        minxfmr_info("[minxfmr] model load complete (100%%)\n");
         if (loaded_attn_layers > 0) {
-            minxfmr_log("[minxfmr] loaded per-layer projections: %zu/%zu layers\n", loaded_attn_layers, ctx->n_layer);
+            minxfmr_info("[minxfmr] loaded per-layer projections: %zu/%zu layers\n", loaded_attn_layers, ctx->n_layer);
             for (size_t i = 0; i < ctx->Wq_layers.size(); ++i) {
                 if (ctx->Wq_layers[i] && ctx->Wk_layers[i] && ctx->Wv_layers[i]) {
                     ctx->Wq = tensor_clone_f32_local(ctx->Wq_layers[i]);
@@ -792,19 +802,19 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 }
             }
         }
-        minxfmr_log("[minxfmr] projection load summary: attn=%zu bias=%zu wo=%zu norm=%zu ffn=%zu of %zu layers\n",
+        minxfmr_info("[minxfmr] projection load summary: attn=%zu bias=%zu wo=%zu norm=%zu ffn=%zu of %zu layers\n",
             loaded_attn_layers, loaded_attn_bias_layers, loaded_wo_layers, loaded_norm_layers, loaded_ffn_layers, ctx->n_layer);
         if (loaded_attn_bias_layers > 0) {
-            minxfmr_log("[minxfmr] loaded per-layer projection biases: %zu/%zu layers\n", loaded_attn_bias_layers, ctx->n_layer);
+            minxfmr_info("[minxfmr] loaded per-layer projection biases: %zu/%zu layers\n", loaded_attn_bias_layers, ctx->n_layer);
         }
         if (loaded_ffn_layers > 0) {
-            minxfmr_log("[minxfmr] loaded per-layer ffn weights: %zu/%zu layers\n", loaded_ffn_layers, ctx->n_layer);
+            minxfmr_info("[minxfmr] loaded per-layer ffn weights: %zu/%zu layers\n", loaded_ffn_layers, ctx->n_layer);
         }
         if (loaded_wo_layers > 0) {
-            minxfmr_log("[minxfmr] loaded per-layer Wo weights: %zu/%zu layers\n", loaded_wo_layers, ctx->n_layer);
+            minxfmr_info("[minxfmr] loaded per-layer Wo weights: %zu/%zu layers\n", loaded_wo_layers, ctx->n_layer);
         }
         if (loaded_norm_layers > 0) {
-            minxfmr_log("[minxfmr] loaded per-layer norm weights: %zu/%zu layers\n", loaded_norm_layers, ctx->n_layer);
+            minxfmr_info("[minxfmr] loaded per-layer norm weights: %zu/%zu layers\n", loaded_norm_layers, ctx->n_layer);
         }
 
         if (!ctx->Wq) {
@@ -815,7 +825,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 ctx->Wq = gWq;
                 ctx->Wk = gWk;
                 ctx->Wv = gWv;
-                minxfmr_log("[minxfmr] loaded projections from gguf %s layer=%d dim=%zux%zu\n", model_path, projection_layer, ctx->Wq->rows, ctx->Wq->cols);
+                minxfmr_info("[minxfmr] loaded projections from gguf %s layer=%d dim=%zux%zu\n", model_path, projection_layer, ctx->Wq->rows, ctx->Wq->cols);
             }
         }
 
@@ -825,12 +835,12 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                 GGUF_File gf;
                 if (gguf_open(model_path, gf)) {
                     if (!gf.vocab_tokens.empty()) {
-                        if (tokenizer_load_from_gguf(gf)) {
-                            minxfmr_log("[minxfmr] loaded tokenizer vocab+meta from gguf size=%zu\n", gf.vocab_tokens.size());
+                            if (tokenizer_load_from_gguf(gf)) {
+                            minxfmr_info("[minxfmr] loaded tokenizer vocab+meta from gguf size=%zu\n", gf.vocab_tokens.size());
                             log_vocab_specials(gf.vocab_tokens);
                         } else {
                             tokenizer_load_from_list(gf.vocab_tokens);
-                            minxfmr_log("[minxfmr] loaded tokenizer vocab from gguf size=%zu\n", gf.vocab_tokens.size());
+                            minxfmr_info("[minxfmr] loaded tokenizer vocab from gguf size=%zu\n", gf.vocab_tokens.size());
                             log_vocab_specials(gf.vocab_tokens);
                         }
                     }
@@ -841,13 +851,13 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         Tensor* wout = nullptr;
         if (gguf_try_load_lm_head(model_path, wout)) {
             ctx->Wout = wout;
-            minxfmr_log("[minxfmr] loaded output head rows=%zu cols=%zu\n", wout->rows, wout->cols);
+            minxfmr_info("[minxfmr] loaded output head rows=%zu cols=%zu\n", wout->rows, wout->cols);
         }
 
         Tensor* wnorm = nullptr;
         if (gguf_try_load_final_norm(model_path, wnorm)) {
             ctx->Wnorm = wnorm;
-            minxfmr_log("[minxfmr] loaded final norm rows=%zu cols=%zu\n", wnorm->rows, wnorm->cols);
+            minxfmr_info("[minxfmr] loaded final norm rows=%zu cols=%zu\n", wnorm->rows, wnorm->cols);
         }
     }
 
