@@ -250,16 +250,18 @@ int main(int argc, char** argv) {
         }
     }
 #endif
-    if (transpose_user_override) {
-        fprintf(stderr, "[main] square-weight transpose mode (user): wq=%s wk=%s wv=%s wo=%s\n",
-            transpose_wq ? "on" : "off",
-            transpose_wk ? "on" : "off",
-            transpose_wv ? "on" : "off",
-            transpose_wo ? "on" : "off");
-    } else if (env_transpose_override) {
-        fprintf(stderr, "[main] square-weight transpose mode (user env): using MINXFMR_TRANSPOSE_* overrides\n");
-    } else {
-        fprintf(stderr, "[main] square-weight transpose mode: auto (by model architecture)\n");
+    if (chat_debug_enabled()) {
+        if (transpose_user_override) {
+            fprintf(stderr, "[main] square-weight transpose mode (user): wq=%s wk=%s wv=%s wo=%s\n",
+                transpose_wq ? "on" : "off",
+                transpose_wk ? "on" : "off",
+                transpose_wv ? "on" : "off",
+                transpose_wo ? "on" : "off");
+        } else if (env_transpose_override) {
+            fprintf(stderr, "[main] square-weight transpose mode (user env): using MINXFMR_TRANSPOSE_* overrides\n");
+        } else {
+            fprintf(stderr, "[main] square-weight transpose mode: auto (by model architecture)\n");
+        }
     }
 
     if (run_selftest) {
@@ -395,7 +397,7 @@ int main(int argc, char** argv) {
     }
     if (!model_specials.empty()) {
         tokenizer_add_special_tokens(model_specials);
-        fprintf(stderr, "[main] registered %zu model special tokens into tokenizer\n", model_specials.size());
+        if (chat_debug_enabled()) fprintf(stderr, "[main] registered %zu model special tokens into tokenizer\n", model_specials.size());
     }
 
     if (test_weights) {
