@@ -1226,7 +1226,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
     std::string last_emitted_raw_tok;
     int repeat_run = 0;
     for (t = 0; t < max_steps; ++t) {
-        if (gen_verbose_enabled()) {
+        if (chat_debug_enabled()) {
             fprintf(stderr, "[minxfmr] gen loop step=%d last=%d emitted=%d\n", t, last, gen_tokens_emitted);
             fflush(stderr);
         }
@@ -1444,7 +1444,7 @@ int minxfmr_generate(minxfmr_context* ctx, const char* prompt, void (*callback)(
             }
         }
 
-        if (gen_verbose_enabled()) {
+        if (chat_debug_enabled()) {
             fprintf(stderr, "[minxfmr] step=%d selected id=%d logit=%f sampler=%s k=%d raw_tok='%s' preview='%s' pending_bytes=%zu pending_fragments=%zu\n",
                 t, next, chosen_logit, sampler_greedy ? "greedy" : "sample", k_use, raw_tok.c_str(), preview.c_str(), pending_bytes.size(), pending_token_buf.size());
             fflush(stderr);
