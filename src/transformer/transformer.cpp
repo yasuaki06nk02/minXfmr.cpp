@@ -12,6 +12,8 @@
 #include <cmath>
 #include <cstddef>
 #include <algorithm>
+#include <sstream>
+#include <iomanip>
 #include "runtime_config.h"
 
 void transformer_set_transpose_square_weights(bool enabled) {
@@ -19,13 +21,26 @@ void transformer_set_transpose_square_weights(bool enabled) {
     backend_context().transpose_square_wk = enabled;
     backend_context().transpose_square_wv = enabled;
     backend_context().transpose_square_wo = enabled;
+    backend_context().transpose_square_ffn_gate = enabled;
+    backend_context().transpose_square_ffn_up = enabled;
+    backend_context().transpose_square_ffn_down = enabled;
 }
 
-void transformer_set_transpose_square_weights_for_all(bool wq, bool wk, bool wv, bool wo) {
+void transformer_set_transpose_square_weights_for_all(
+    bool wq,
+    bool wk,
+    bool wv,
+    bool wo,
+    bool ffn_gate,
+    bool ffn_up,
+    bool ffn_down) {
     backend_context().transpose_square_wq = wq;
     backend_context().transpose_square_wk = wk;
     backend_context().transpose_square_wv = wv;
     backend_context().transpose_square_wo = wo;
+    backend_context().transpose_square_ffn_gate = ffn_gate;
+    backend_context().transpose_square_ffn_up = ffn_up;
+    backend_context().transpose_square_ffn_down = ffn_down;
 }
 
 static Tensor* tensor_clone_f32(const Tensor* in) {
@@ -47,14 +62,61 @@ static bool cache_append_log_enabled() {
 // [d_in x d_out] or [d_out x d_in].
 static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out, bool transpose_square) {
     out = nullptr;
-    if (!in || !W || in->type != DataType::F32) return false;
-    if (W->type != DataType::F32 && W->type != DataType::Q4_K && W->type != DataType::Q5_0 && W->type != DataType::Q8_0) return false;
+    bool debug = RuntimeConfig::Instance().getBool("MINXFMR_CHAT_DEBUG");
+    const bool prefer_ggml_mul_mat_layout = backend_context().prefer_ggml_mul_mat_layout;
+    auto dtype_to_str = [](DataType t)->const char* {
+        switch (t) {
+            case DataType::F32: return "F32";
+            case DataType::Q4_K: return "Q4_K";
+            case DataType::Q5_0: return "Q5_0";
+            case DataType::Q8_0: return "Q8_0";
+            default: return "UNKNOWN";
+        }
+    };
+    if (!in || !W) {
+        if (debug) fprintf(stderr, "[transformer] project_with_weight: null input or weight (in=%p W=%p)\n", (const void*)in, (const void*)W);
+        return false;
+    }
+    if (in->type != DataType::F32) {
+        if (debug) fprintf(stderr, "[transformer] project_with_weight: input not F32 (type=%s)\n", dtype_to_str(in->type));
+        return false;
+    }
+    if (W->type != DataType::F32 && W->type != DataType::Q4_K && W->type != DataType::Q5_0 && W->type != DataType::Q8_0) {
+        if (debug) fprintf(stderr, "[transformer] project_with_weight: unsupported weight type=%s\n", dtype_to_str(W->type));
+        return false;
+    }
     const size_t d_in = in->cols;
 
     // Some checkpoints store square matrices in the opposite orientation.
     if (transpose_square && W->rows == d_in && W->cols == d_in && W->type != DataType::F32) {
+        if (debug) fprintf(stderr, "[transformer] project_with_weight: using square_rhs_transposed path in_cols=%zu W=%zux%zu type=%s\n", d_in, W->rows, W->cols, dtype_to_str(W->type));
         out = tensor_create_f32_noinit(in->rows, d_in);
-        if (!out || !backend_matmul_rhs_transposed(in, W, out)) {
+        if (!out) {
+            if (debug) fprintf(stderr, "[transformer] project_with_weight: failed to allocate out tensor\n");
+            return false;
+        }
+        if (!backend_matmul_rhs_transposed(in, W, out)) {
+            if (debug) fprintf(stderr, "[transformer] project_with_weight: backend_matmul_rhs_transposed failed: %s\n", backend_last_preload_error());
+            tensor_free(out);
+            out = nullptr;
+            return false;
+        }
+        return true;
+    }
+
+    // llama.cpp / ggml convention: loaded GGUF linear weights are usually
+    // interpreted as [out x in], so cols==input_dim is the native multiply
+    // direction. Prefer this for architectures that opt into ggml layout
+    // compatibility, especially when square weights are ambiguous.
+    if (prefer_ggml_mul_mat_layout && W->cols == d_in) {
+        if (debug) fprintf(stderr, "[transformer] project_with_weight: using ggml/rhs_transposed path in_cols=%zu W_rows=%zu W_cols=%zu type=%s\n", d_in, W->rows, W->cols, dtype_to_str(W->type));
+        out = tensor_create_f32_noinit(in->rows, W->rows);
+        if (!out) {
+            if (debug) fprintf(stderr, "[transformer] project_with_weight: failed to allocate out tensor\n");
+            return false;
+        }
+        if (!backend_matmul_rhs_transposed(in, W, out)) {
+            if (debug) fprintf(stderr, "[transformer] project_with_weight: backend_matmul_rhs_transposed failed: %s\n", backend_last_preload_error());
             tensor_free(out);
             out = nullptr;
             return false;
@@ -63,9 +125,14 @@ static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out,
     }
 
     if (W->rows == d_in) {
+        if (debug) fprintf(stderr, "[transformer] project_with_weight: using matmul path in_cols=%zu W_rows=%zu W_cols=%zu type=%s\n", d_in, W->rows, W->cols, dtype_to_str(W->type));
         out = tensor_create_f32_noinit(in->rows, W->cols);
-        if (!out) return false;
+        if (!out) {
+            if (debug) fprintf(stderr, "[transformer] project_with_weight: failed to allocate out tensor\n");
+            return false;
+        }
         if (!backend_matmul(in, W, out)) {
+            if (debug) fprintf(stderr, "[transformer] project_with_weight: backend_matmul failed: %s\n", backend_last_preload_error());
             tensor_free(out);
             out = nullptr;
             return false;
@@ -74,8 +141,14 @@ static bool project_with_weight(const Tensor* in, const Tensor* W, Tensor*& out,
     }
 
     if (W->cols == d_in) {
+        if (debug) fprintf(stderr, "[transformer] project_with_weight: using rhs_transposed path in_cols=%zu W_rows=%zu W_cols=%zu type=%s\n", d_in, W->rows, W->cols, dtype_to_str(W->type));
         out = tensor_create_f32_noinit(in->rows, W->rows);
-        if (!out || !backend_matmul_rhs_transposed(in, W, out)) {
+        if (!out) {
+            if (debug) fprintf(stderr, "[transformer] project_with_weight: failed to allocate out tensor\n");
+            return false;
+        }
+        if (!backend_matmul_rhs_transposed(in, W, out)) {
+            if (debug) fprintf(stderr, "[transformer] project_with_weight: backend_matmul_rhs_transposed failed: %s\n", backend_last_preload_error());
             tensor_free(out);
             out = nullptr;
             return false;
@@ -140,6 +213,120 @@ static bool apply_norm_scale(Tensor* x, const Tensor* w) {
     return false;
 }
 
+static void compare_dump_tensor_stats(const char* phase, size_t layer, const Tensor* t) {
+    if (!phase || !backend_context().compare_trace_enabled) return;
+    if (!t || t->type != DataType::F32 || !t->data) return;
+    const size_t n = t->rows * t->cols;
+    if (n == 0) return;
+
+    const float* d = (const float*)t->data;
+    double mn = (double)d[0];
+    double mx = (double)d[0];
+    double sum = 0.0;
+    double sum2 = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double v = (double)d[i];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        sum += v;
+        sum2 += v * v;
+    }
+    const double mean = sum / (double)n;
+    double var = (sum2 / (double)n) - (mean * mean);
+    if (var < 0.0) var = 0.0;
+    const double stddev = std::sqrt(var);
+
+    std::ostringstream js;
+    js << "{\"phase\":\"" << phase << "\",\"t\":" << backend_context().compare_trace_step
+       << ",\"layer\":" << layer
+       << ",\"n\":" << n
+       << ",\"min\":" << std::fixed << std::setprecision(6) << mn
+       << ",\"max\":" << std::fixed << std::setprecision(6) << mx
+       << ",\"mean\":" << std::fixed << std::setprecision(6) << mean
+       << ",\"std\":" << std::fixed << std::setprecision(6) << stddev
+       << "}";
+    fprintf(stderr, "%s\n", js.str().c_str());
+    fflush(stderr);
+}
+
+static void compare_dump_tensor_last_row_stats(const char* phase, size_t layer, const Tensor* t) {
+    if (!phase || !backend_context().compare_trace_enabled) return;
+    if (!t || t->type != DataType::F32 || !t->data || t->rows == 0 || t->cols == 0) return;
+    const size_t row = t->rows - 1;
+    const size_t n = t->cols;
+    const float* d = ((const float*)t->data) + row * t->cols;
+
+    double mn = (double)d[0];
+    double mx = (double)d[0];
+    double sum = 0.0;
+    double sum2 = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double v = (double)d[i];
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        sum += v;
+        sum2 += v * v;
+    }
+    const double mean = sum / (double)n;
+    double var = (sum2 / (double)n) - (mean * mean);
+    if (var < 0.0) var = 0.0;
+    const double stddev = std::sqrt(var);
+
+    std::ostringstream js;
+    js << "{\"phase\":\"" << phase << "\",\"t\":" << backend_context().compare_trace_step
+       << ",\"layer\":" << layer
+       << ",\"row\":" << row
+       << ",\"n\":" << n
+       << ",\"min\":" << std::fixed << std::setprecision(6) << mn
+       << ",\"max\":" << std::fixed << std::setprecision(6) << mx
+       << ",\"mean\":" << std::fixed << std::setprecision(6) << mean
+       << ",\"std\":" << std::fixed << std::setprecision(6) << stddev
+       << "}";
+    fprintf(stderr, "%s\n", js.str().c_str());
+    fflush(stderr);
+}
+
+static const char* dtype_name(DataType t) {
+    switch (t) {
+        case DataType::F32: return "F32";
+        case DataType::Q4_K: return "Q4_K";
+        case DataType::Q5_0: return "Q5_0";
+        case DataType::Q8_0: return "Q8_0";
+        default: return "UNKNOWN";
+    }
+}
+
+static void compare_dump_projection_path(const char* phase, size_t layer, const Tensor* in, const Tensor* w, bool transpose_square) {
+    if (!backend_context().compare_trace_enabled) return;
+    if (!phase || !in || !w) return;
+
+    const size_t d_in = in->cols;
+    const char* path = "incompatible";
+    if (transpose_square && w->rows == d_in && w->cols == d_in && w->type != DataType::F32) {
+        path = "square_rhs_transposed";
+    } else if (backend_context().prefer_ggml_mul_mat_layout && w->cols == d_in) {
+        path = "ggml_rhs_transposed";
+    } else if (w->rows == d_in) {
+        path = "matmul";
+    } else if (w->cols == d_in) {
+        path = "rhs_transposed";
+    }
+
+    std::ostringstream os;
+    os << std::fixed << std::setprecision(0);
+    os << "{\"phase\":\"" << phase << "\",\"t\":" << backend_context().compare_trace_step
+       << ",\"layer\":" << layer
+       << ",\"in_cols\":" << d_in
+       << ",\"w_rows\":" << w->rows
+       << ",\"w_cols\":" << w->cols
+       << ",\"w_type\":\"" << dtype_name(w->type) << "\""
+       << ",\"transpose_square\":" << (transpose_square ? 1 : 0)
+       << ",\"path\":\"" << path << "\"}"
+       << "\n";
+    fputs(os.str().c_str(), stderr);
+    fflush(stderr);
+}
+
 bool transformer_forward_single_layer(
     const Tensor* input,
     Tensor* output,
@@ -162,6 +349,7 @@ bool transformer_forward_single_layer(
     float* scores_workspace,
     size_t scores_workspace_len,
     float rope_theta,
+    uint64_t rope_n_rot,
     float rmsnorm_epsilon) {
     if (!input || !output) return false;
     // Shapes: input seq x d
@@ -201,9 +389,26 @@ bool transformer_forward_single_layer(
     Tensor* Kraw = nullptr;
     Tensor* Vraw = nullptr;
 
+    bool debug_proj = RuntimeConfig::Instance().getBool("MINXFMR_CHAT_DEBUG");
+    if (debug_proj) {
+        fprintf(stderr, "[transformer] layer=%zu proj input shape=%zux%zu transpose_wq=%d transpose_wk=%d transpose_wv=%d\n",
+            layer, norm->rows, norm->cols,
+            backend_context().transpose_square_wq ? 1 : 0,
+            backend_context().transpose_square_wk ? 1 : 0,
+            backend_context().transpose_square_wv ? 1 : 0);
+        if (Wq_in) fprintf(stderr, "[transformer] layer=%zu Wq shape=%zux%zu type=%d\n", layer, Wq_in->rows, Wq_in->cols, (int)Wq_in->type);
+        if (Wk_in) fprintf(stderr, "[transformer] layer=%zu Wk shape=%zux%zu type=%d\n", layer, Wk_in->rows, Wk_in->cols, (int)Wk_in->type);
+        if (Wv_in) fprintf(stderr, "[transformer] layer=%zu Wv shape=%zux%zu type=%d\n", layer, Wv_in->rows, Wv_in->cols, (int)Wv_in->type);
+    }
+
     bool q_ok = Wq_in ? project_with_weight(norm, Wq_in, Qraw, backend_context().transpose_square_wq) : false;
     bool k_ok = Wk_in ? project_with_weight(norm, Wk_in, Kraw, backend_context().transpose_square_wk) : false;
     bool v_ok = Wv_in ? project_with_weight(norm, Wv_in, Vraw, backend_context().transpose_square_wv) : false;
+
+    if (debug_proj) {
+        fprintf(stderr, "[transformer] layer=%zu proj results q_ok=%d k_ok=%d v_ok=%d Qraw=%p Kraw=%p Vraw=%p\n",
+            layer, q_ok ? 1 : 0, k_ok ? 1 : 0, v_ok ? 1 : 0, (const void*)Qraw, (const void*)Kraw, (const void*)Vraw);
+    }
 
     if (q_ok && Qraw && Bq_in) add_bias_inplace(Qraw, Bq_in);
     if (k_ok && Kraw && Bk_in) add_bias_inplace(Kraw, Bk_in);
@@ -277,9 +482,17 @@ bool transformer_forward_single_layer(
     }
 
     // Stage 3: apply RoPE using logical sequence position before cache append.
+    // Clamp/normalize rotary dimensions per projection width to mirror llama.cpp
+    // behavior for architectures where metadata can exceed per-head width.
     const size_t start_pos = (cache != nullptr && layer < cache->layers) ? cache->lengths[layer] : 0;
-    rope_apply(Qraw, start_pos, use_n_head, head_dim, rope_theta);
-    rope_apply(Kraw, start_pos, use_n_head_kv, kv_head_dim, rope_theta);
+    size_t q_rot = (rope_n_rot > 0) ? (size_t)rope_n_rot : head_dim;
+    size_t k_rot = (rope_n_rot > 0) ? (size_t)rope_n_rot : kv_head_dim;
+    if (q_rot > head_dim) q_rot = head_dim;
+    if (k_rot > kv_head_dim) k_rot = kv_head_dim;
+    q_rot &= ~((size_t)1);
+    k_rot &= ~((size_t)1);
+    rope_apply(Qraw, start_pos, use_n_head, head_dim, q_rot, rope_theta);
+    rope_apply(Kraw, start_pos, use_n_head_kv, kv_head_dim, k_rot, rope_theta);
 
     Tensor* Q = Qraw;
     Tensor* K = Kraw;
@@ -309,13 +522,16 @@ bool transformer_forward_single_layer(
     float* od = (float*)attn_out->data;
     const size_t J = cached_rows + seq;
     float* scores = nullptr;
+    std::vector<float> scores_fallback;
     if (scores_workspace && scores_workspace_len >= J) {
         scores = scores_workspace;
     } else {
-        scores = backend_request_workspace(J);
+        scores_fallback.assign(J, 0.0f);
+        scores = scores_fallback.data();
     }
     const size_t group = use_n_head / use_n_head_kv;
     const float score_scale = 1.0f / sqrtf((float)head_dim);
+    std::vector<float> outvec_cur_buf(head_dim, 0.0f);
 
     for (size_t qi = 0; qi < seq; ++qi) {
         for (size_t h = 0; h < use_n_head; ++h) {
@@ -368,11 +584,7 @@ bool transformer_forward_single_layer(
             }
 
             if (seq > 0) {
-                float* outvec_cur = backend_request_workspace(head_dim);
-                if (!outvec_cur) {
-                    tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(attn_out);
-                    return false;
-                }
+                float* outvec_cur = outvec_cur_buf.data();
                 const float* v_cur_base = vd + kv_off;
                 if (!backend_vec_mul_rows_cols(scores + cached_rows, v_cur_base, outvec_cur, seq, head_dim, kv_dim)) {
                     tensor_free(norm); tensor_free(Q); tensor_free(K); tensor_free(V); tensor_free(attn_out);
@@ -400,6 +612,8 @@ bool transformer_forward_single_layer(
         tensor_free(norm); tensor_free(attn_out); tensor_free(Q); tensor_free(K); tensor_free(V);
         return false;
     }
+    compare_dump_tensor_stats("layer_attn_proj", layer, attn_proj);
+    if (backend_context().compare_trace_step < 0) compare_dump_tensor_last_row_stats("prefill_last_layer_attn_proj", layer, attn_proj);
 
     // First residual: x + attn_proj
     Tensor* resid1 = tensor_create_f32_noinit(seq, d);
@@ -413,6 +627,8 @@ bool transformer_forward_single_layer(
         float* r1_d = (float*)resid1->data;
         for (size_t i = 0; i < seq * d; ++i) r1_d[i] = in_d[i] + ap_d[i];
     }
+    compare_dump_tensor_stats("layer_resid1", layer, resid1);
+    if (backend_context().compare_trace_step < 0) compare_dump_tensor_last_row_stats("prefill_last_layer_resid1", layer, resid1);
 
     bool ok = false;
     Tensor* ffn_out = tensor_create_f32_noinit(seq, d);
@@ -431,9 +647,21 @@ bool transformer_forward_single_layer(
         Tensor* ffn_norm = tensor_create_f32_noinit(seq, d);
         if (ffn_norm && rmsnorm_forward(resid1, ffn_norm, rmsnorm_epsilon)) {
             if (Wffn_norm_in) apply_norm_scale(ffn_norm, Wffn_norm_in);
-            bool g_ok = project_with_weight(ffn_norm, Wffn_gate_in, gate, false);
-            bool u_ok = project_with_weight(ffn_norm, Wffn_up_in, up, false);
+            compare_dump_tensor_stats("layer_ffn_norm", layer, ffn_norm);
+            if (backend_context().compare_trace_step < 0) compare_dump_tensor_last_row_stats("prefill_last_layer_ffn_norm", layer, ffn_norm);
+            if (backend_context().compare_trace_step < 0) {
+                compare_dump_projection_path("prefill_last_layer_ffn_gate_proj", layer, ffn_norm, Wffn_gate_in, backend_context().transpose_square_ffn_gate);
+                compare_dump_projection_path("prefill_last_layer_ffn_up_proj", layer, ffn_norm, Wffn_up_in, backend_context().transpose_square_ffn_up);
+            }
+            bool g_ok = project_with_weight(ffn_norm, Wffn_gate_in, gate, backend_context().transpose_square_ffn_gate);
+            bool u_ok = project_with_weight(ffn_norm, Wffn_up_in, up, backend_context().transpose_square_ffn_up);
             if (g_ok && u_ok && gate && up && gate->rows == up->rows && gate->cols == up->cols) {
+                compare_dump_tensor_stats("layer_ffn_gate", layer, gate);
+                compare_dump_tensor_stats("layer_ffn_up", layer, up);
+                if (backend_context().compare_trace_step < 0) {
+                    compare_dump_tensor_last_row_stats("prefill_last_layer_ffn_gate", layer, gate);
+                    compare_dump_tensor_last_row_stats("prefill_last_layer_ffn_up", layer, up);
+                }
                 fused = tensor_create_f32_noinit(gate->rows, gate->cols);
                 if (fused) {
                     float* fd = (float*)fused->data;
@@ -443,7 +671,14 @@ bool transformer_forward_single_layer(
                     for (size_t i = 0; i < n; ++i) {
                         fd[i] = silu_f32(gd[i]) * ud[i];
                     }
-                    if (project_with_weight(fused, Wffn_down_in, down, false) && down && down->rows == seq && down->cols == d) {
+                    compare_dump_tensor_stats("layer_ffn_fused", layer, fused);
+                    if (backend_context().compare_trace_step < 0) compare_dump_tensor_last_row_stats("prefill_last_layer_ffn_fused", layer, fused);
+                    if (backend_context().compare_trace_step < 0) {
+                        compare_dump_projection_path("prefill_last_layer_ffn_down_proj", layer, fused, Wffn_down_in, backend_context().transpose_square_ffn_down);
+                    }
+                    if (project_with_weight(fused, Wffn_down_in, down, backend_context().transpose_square_ffn_down) && down && down->rows == seq && down->cols == d) {
+                        compare_dump_tensor_stats("layer_ffn_down", layer, down);
+                        if (backend_context().compare_trace_step < 0) compare_dump_tensor_last_row_stats("prefill_last_layer_ffn_down", layer, down);
                         memcpy(ffn_out->data, down->data, sizeof(float) * seq * d);
                         ok = true;
                     }
@@ -462,12 +697,15 @@ bool transformer_forward_single_layer(
         std::memset(ffn_out->data, 0, sizeof(float) * seq * d);
         ok = true;
     }
+    compare_dump_tensor_stats("layer_ffn_out", layer, ffn_out);
     if (ok) {
         float* od = (float*)output->data;
         const float* r1 = (const float*)resid1->data;
         float* fd = (float*)ffn_out->data;
         for (size_t i = 0; i < seq * d; ++i) od[i] = r1[i] + fd[i];
     }
+    compare_dump_tensor_stats("layer_output", layer, output);
+    if (backend_context().compare_trace_step < 0) compare_dump_tensor_last_row_stats("prefill_last_layer_output", layer, output);
     tensor_free(norm); tensor_free(attn_out); tensor_free(attn_proj); tensor_free(resid1); tensor_free(ffn_out);
 
     // now append current K/V rows to cache if present

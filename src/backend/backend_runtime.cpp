@@ -13,6 +13,27 @@
 #include "cuda/cuda_backend.h"
 #endif
 
+namespace {
+bool should_log_cuda_fallback_once(const char* site, const char* reason) {
+    static std::string last_matmul_reason;
+    static std::string last_rhs_reason;
+    if (!site) site = "";
+    if (!reason) reason = "";
+    std::string r(reason);
+    if (std::strcmp(site, "matmul") == 0) {
+        if (r == last_matmul_reason) return false;
+        last_matmul_reason = r;
+        return true;
+    }
+    if (std::strcmp(site, "rhs") == 0) {
+        if (r == last_rhs_reason) return false;
+        last_rhs_reason = r;
+        return true;
+    }
+    return true;
+}
+}
+
 static bool ieq(const char* a, const char* b) {
     if (!a || !b) return false;
     while (*a && *b) {
@@ -249,7 +270,13 @@ bool backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
     backend_initialize_from_env();
 #if defined(MINXFMR_ENABLE_CUDA)
     if (backend_context().backend == BackendKind::CUDA) {
-        return cuda_backend_matmul(A, B, out);
+        // Try CUDA path first; if it fails (for example CUDA quant kernels
+        // are disabled) fall back to the CPU implementation for parity.
+        if (cuda_backend_matmul(A, B, out)) return true;
+        const char* why = backend_last_preload_error();
+        if (should_log_cuda_fallback_once("matmul", why)) {
+            std::fprintf(stderr, "[backend] cuda_backend_matmul failed, falling back to CPU: %s\n", why);
+        }
     }
 #endif
     return cpu_matmul(A, B, out);
@@ -259,7 +286,14 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
     backend_initialize_from_env();
 #if defined(MINXFMR_ENABLE_CUDA)
     if (backend_context().backend == BackendKind::CUDA) {
-        return cuda_backend_matmul_rhs_transposed(A, B, out);
+        // Try CUDA path first; if it fails (e.g. quant kernels disabled),
+        // fall back to the CPU implementation which supports staged host
+        // dequantization and parity paths.
+        if (cuda_backend_matmul_rhs_transposed(A, B, out)) return true;
+        const char* why = backend_last_preload_error();
+        if (should_log_cuda_fallback_once("rhs", why)) {
+            std::fprintf(stderr, "[backend] cuda_backend_matmul_rhs_transposed failed, falling back to CPU: %s\n", why);
+        }
     }
 #endif
 

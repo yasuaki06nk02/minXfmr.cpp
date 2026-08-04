@@ -12,11 +12,14 @@
 #include "../transformer/rmsnorm.h"
 #include "../transformer/transformer.h"
 #include "../io/gguf_loader.h"
+#include "../backend/backend_context.h"
 #include "../../third_party/gguf/gguf_reader.h"
 #include <sstream>
 #include <iomanip>
 #include <cctype>
 #include <cstdarg>
+#include <cstdlib>
+#include <climits>
 #include <unordered_map>
 #include "../backend/backend_runtime.h"
 #include "runtime_config.h"
@@ -50,6 +53,7 @@ struct minxfmr_context {
     size_t n_head_kv;
     size_t n_intermediate;
     float rope_theta;
+    uint64_t rope_n_rot;
     float rmsnorm_epsilon;
     size_t seq_max;
     std::vector<float> scores_workspace;
@@ -59,12 +63,20 @@ struct minxfmr_context {
     // optional metadata
     std::string chat_template;
     std::vector<std::string> special_tokens;
+    bool tokenizer_add_bos_token;
+    int tokenizer_bos_token_id;
 
     // Reusable per-token workspaces (allocated once, reused every generate step)
     Tensor* embed_buf;    // 1 x model_dim（量子化 embedding 用）
     Tensor* hidden_buf;   // 1 x model_dim（forward 出力）
     std::vector<double> logits_buf;
     std::vector<int>    order_buf;
+
+    // Compare-trace controls used by run_stack_forward (generation only).
+    bool compare_trace_generation_active;
+    bool compare_trace_enabled;
+    int compare_trace_step;
+    int compare_trace_steps;
 };
 
 static std::string render_token_piece(const std::string& piece) {
@@ -94,6 +106,71 @@ static bool is_supported_quantized_type(DataType t) {
     return t == DataType::Q4_K || t == DataType::Q5_0 || t == DataType::Q8_0;
 }
 
+static bool is_supported_output_tensor_type(DataType t) {
+    return t == DataType::F32 || is_supported_quantized_type(t);
+}
+
+enum class OutProjLayout {
+    Invalid = 0,
+    DimByVocab, // [dim x vocab] -> A(1xdim) * B(dim x vocab)
+    VocabByDim  // [vocab x dim] -> A(1xdim) * B(vocab x dim) as rhs_transposed
+};
+
+static OutProjLayout resolve_out_proj_layout(const Tensor* out_proj, size_t dim, size_t& out_vocab) {
+    out_vocab = 0;
+    if (!out_proj || dim == 0) return OutProjLayout::Invalid;
+
+    const bool rows_match = (out_proj->rows == dim);
+    const bool cols_match = (out_proj->cols == dim);
+
+    if (rows_match && !cols_match) {
+        out_vocab = out_proj->cols;
+        return OutProjLayout::DimByVocab;
+    }
+    if (!rows_match && cols_match) {
+        out_vocab = out_proj->rows;
+        return OutProjLayout::VocabByDim;
+    }
+
+    // Ambiguous square case: prefer vocab-by-dim (llama.cpp-like lm_head layout).
+    if (rows_match && cols_match) {
+        out_vocab = out_proj->rows;
+        return OutProjLayout::VocabByDim;
+    }
+
+    return OutProjLayout::Invalid;
+}
+
+static const Tensor* choose_output_projection(minxfmr_context* ctx, size_t dim, bool& used_wemb_override) {
+    used_wemb_override = false;
+    if (!ctx) return nullptr;
+
+    auto valid_out_proj = [&](const Tensor* t) {
+        if (!t) return false;
+        if (!is_supported_output_tensor_type(t->type)) return false;
+        size_t out_vocab = 0;
+        return resolve_out_proj_layout(t, dim, out_vocab) != OutProjLayout::Invalid && out_vocab > 0;
+    };
+
+    // Always prefer lm_head/output.weight when available.
+    if (valid_out_proj(ctx->Wout)) return ctx->Wout;
+
+    // Only fall back to token embedding if explicitly requested and lm_head is unavailable.
+    const bool use_wemb_as_wout = RuntimeConfig::Instance().getBool("MINXFMR_USE_WEMB_AS_WOUT");
+    if (use_wemb_as_wout && valid_out_proj(ctx->Wemb)) {
+        used_wemb_override = true;
+        return ctx->Wemb;
+    }
+
+    // As a safety net, still allow tied embedding fallback when lm_head is missing.
+    if (valid_out_proj(ctx->Wemb)) {
+        used_wemb_override = true;
+        return ctx->Wemb;
+    }
+
+    return nullptr;
+}
+
 static bool ensure_f32_tensor_shape(Tensor*& t, size_t rows, size_t cols) {
     if (rows == 0 || cols == 0) return false;
     if (t && t->type == DataType::F32 && t->rows == rows && t->cols == cols) return true;
@@ -104,6 +181,29 @@ static bool ensure_f32_tensor_shape(Tensor*& t, size_t rows, size_t cols) {
     t = tensor_create_f32_noinit(rows, cols);
     return t != nullptr;
 }
+
+static bool dequant_tensor_to_f32_inplace(Tensor*& t) {
+    if (!t) return false;
+    if (t->type == DataType::F32) return true;
+    if (!is_supported_quantized_type(t->type)) return false;
+    if (t->rows == 0 || t->cols == 0) return false;
+
+    Tensor* out = tensor_create_f32_noinit(t->rows, t->cols);
+    if (!out) return false;
+    float* dst = (float*)out->data;
+    for (size_t r = 0; r < t->rows; ++r) {
+        if (!tensor_dequant_row(t, r, dst + r * t->cols)) {
+            tensor_free(out);
+            return false;
+        }
+    }
+
+    tensor_free(t);
+    t = out;
+    return true;
+}
+
+static bool strict_gguf_mode_enabled();
 
 // out_owned が使えるときはそこに書き込む。
 // F32 row-major のときは zero-copy view を返す（呼び出し側で in != out_owned なら free する）。
@@ -151,47 +251,68 @@ static Tensor* token_embedding_row_into(const minxfmr_context* ctx, int token_id
             }
             return row;
         }
-        // If we couldn't synthesize from Wout fall through and produce a safe zero-vector below.
+        // Case D: quantized Wout in dim x vocab layout. Reconstruct embedding
+        // column by dequantizing each source row and selecting token_id.
+        if (is_supported_quantized_type(out->type) && (size_t)token_id < out->cols) {
+            const size_t dim = out->rows;
+            Tensor* row = out_owned;
+            if (!row || row->type != DataType::F32 || row->rows != 1 || row->cols != dim) {
+                row = tensor_create_f32_noinit(1, dim);
+                if (!row) return nullptr;
+            }
+            float* dst = (float*)row->data;
+            std::vector<float> tmp_row(out->cols, 0.0f);
+            for (size_t r = 0; r < dim; ++r) {
+                if (!tensor_dequant_row(out, r, tmp_row.data())) {
+                    if (row != out_owned) tensor_free(row);
+                    return nullptr;
+                }
+                dst[r] = tmp_row[(size_t)token_id];
+            }
+            return row;
+        }
+        // If we couldn't synthesize from Wout, fail fast instead of silently
+        // injecting a zero-vector embedding.
     }
 
-    // If there is no explicit embedding matrix and we couldn't synthesize one
-    // from Wout, return a safe zero-vector (allocated in `out_owned` if
-    // provided) sized by the model dimension. This avoids null dereference
-    // later when the code inspects `emb->rows/cols`.
+    // If there is no explicit embedding matrix and we couldn't synthesize one,
+    // fail fast. Silent zero-vector fallback can produce plausible-but-broken
+    // generations that are hard to debug.
     if (!emb) {
-        size_t cols = ctx->model_dim;
-        // If model_dim not set, try to infer a reasonable width from Wout.
-        if (cols == 0 && ctx->Wout) {
-            const Tensor* out = ctx->Wout;
-            if (out->type == DataType::F32) {
-                // Prefer the dimension that looks like model_dim.
-                if (out->rows > out->cols) cols = out->cols;
-                else cols = out->rows;
-            }
-        }
-        if (cols == 0) return nullptr;
-        Tensor* row = out_owned;
-        if (!row || row->type != DataType::F32 || row->rows != 1 || row->cols != cols) {
-            row = tensor_create_f32_noinit(1, cols);
-            if (!row) return nullptr;
-        }
-        // zero vector
-        std::memset(row->data, 0, cols * sizeof(float));
-        return row;
+        return nullptr;
+    }
+
+    // Resolve embedding orientation from model_dim instead of rows>=cols heuristics.
+    const bool strict = strict_gguf_mode_enabled();
+    const size_t d = ctx->model_dim;
+    bool row_major = false; // [vocab x dim]
+    bool col_major = false; // [dim x vocab]
+
+    if (d > 0) {
+        row_major = (emb->cols == d);
+        col_major = (emb->rows == d);
+        // If both match (square), row-major interpretation is preferred for token embeddings.
+        if (row_major && col_major) col_major = false;
+    }
+    if (!row_major && !col_major) {
+        if (strict) return nullptr;
+        // Legacy fallback in non-strict mode.
+        row_major = (emb->rows >= emb->cols);
+        col_major = !row_major;
     }
 
     // ---- F32, row-major: zero-copy view ----
-    if (emb && emb->type == DataType::F32 && emb->rows >= emb->cols) {
+    if (emb && emb->type == DataType::F32 && row_major) {
         if ((size_t)token_id >= emb->rows) return nullptr;
         float* ptr = (float*)emb->data + (size_t)token_id * emb->cols;
         return tensor_create_f32_view(1, emb->cols, ptr);
     }
 
     // ---- それ以外: out_owned にコピー / dequant ----
-    const size_t cols = (emb->rows >= emb->cols) ? emb->cols : emb->rows;
+    const size_t cols = row_major ? emb->cols : emb->rows;
 
     // token_id 範囲チェック
-    if (emb->rows >= emb->cols) {
+    if (row_major) {
         if ((size_t)token_id >= emb->rows) return nullptr;
     } else {
         if ((size_t)token_id >= emb->cols) return nullptr;
@@ -225,6 +346,11 @@ static bool env_enabled(const char* key) {
     return RuntimeConfig::Instance().getBool(key);
 }
 
+static bool strict_gguf_mode_enabled() {
+    // Strict mode defaults to ON for GGUF paths to avoid silent heuristic fallbacks.
+    if (!RuntimeConfig::Instance().has("MINXFMR_STRICT_GGUF")) return true;
+    return RuntimeConfig::Instance().getBool("MINXFMR_STRICT_GGUF");
+}
 static bool chat_debug_enabled() {
     return env_enabled("MINXFMR_CHAT_DEBUG");
 }
@@ -269,6 +395,7 @@ static bool normalize_linear_inplace(Tensor*& t, size_t in_dim, bool transpose_s
     transposed = false;
     if (!t) return false;
     if (in_dim == 0) return false;
+    const bool prefer_ggml_mul_mat_layout = backend_context().prefer_ggml_mul_mat_layout;
 
     // Fast path: already F32.
     if (t->type == DataType::F32) {
@@ -280,6 +407,13 @@ static bool normalize_linear_inplace(Tensor*& t, size_t in_dim, bool transpose_s
             t = tr;
             transposed = true;
             return true;
+        }
+
+        // For llama.cpp / ggml-compatible layouts, keep F32 tensors in the
+        // loaded [out x in] orientation so runtime path selection can stay
+        // consistent with quantized tensors and GGUF metadata.
+        if (prefer_ggml_mul_mat_layout) {
+            return (t->rows == in_dim || t->cols == in_dim);
         }
 
         if (t->rows == in_dim) return true;
@@ -294,48 +428,10 @@ static bool normalize_linear_inplace(Tensor*& t, size_t in_dim, bool transpose_s
         return false;
     }
 
-    // Handle quantized tensors by dequantizing -> physical transpose -> keep as F32.
-    // This avoids runtime transposition overhead for quantized square matrices
-    // at the cost of keeping an F32 copy in memory for the weight.
+    // Quantized tensors should keep original packed payload to preserve fidelity.
+    // Orientation is resolved at runtime by selecting matmul vs rhs-transposed path.
     if (t->type == DataType::Q4_K || t->type == DataType::Q5_0 || t->type == DataType::Q8_0) {
-        // If already in a compatible orientation and no transpose requested, accept as-is.
-        if (t->rows == in_dim && t->cols == in_dim && !transpose_square) return true;
-        // If rows==in_dim and no transpose needed, OK.
-        if (t->rows == in_dim && t->cols != in_dim) return true;
-
-        // If we need to produce rows==in_dim (either because cols==in_dim or square+transpose),
-        // prefer doing a packed-format transpose when possible to avoid creating an F32 copy.
-        if (t->cols == in_dim || (t->rows == in_dim && t->cols == in_dim && transpose_square)) {
-            // Try packed in-place transpose for supported formats (Q5_0/Q8_0).
-            if (tensor_transpose_packed_inplace(t)) {
-                transposed = true;
-                return true;
-            }
-
-            // Fallback: dequantize entire tensor into an F32 buffer and transpose.
-            const size_t rows = t->rows;
-            const size_t cols = t->cols;
-            // Allocate temporary F32 buffer (rows x cols).
-            Tensor* tmp = tensor_create_f32_noinit(rows, cols);
-            if (!tmp) return false;
-            float* tmpd = (float*)tmp->data;
-            for (size_t r = 0; r < rows; ++r) {
-                if (!tensor_dequant_row(t, r, tmpd + r * cols)) {
-                    tensor_free(tmp);
-                    return false;
-                }
-            }
-            // Transpose the temporary f32 matrix into final tensor.
-            Tensor* tr = tensor_transpose_f32(tmp);
-            tensor_free(tmp);
-            if (!tr) return false;
-            tensor_free(t);
-            t = tr;
-            transposed = true;
-            return true;
-        }
-
-        // Otherwise the quantized tensor is incompatible with in_dim.
+        (void)transpose_square;
         return (t->rows == in_dim || t->cols == in_dim);
     }
 
@@ -357,7 +453,6 @@ static bool arch_uses_square_transpose(const std::string& arch_lc) {
 
     // Positive matches: families known to export attention/project weights
     // in the alternate orientation (require square transpose).
-    if (arch_lc.rfind("qwen", 0) == 0) return true; // qwen, qwen2, qwen2-* etc.
     if (arch_lc.find("llama") != std::string::npos) return true;
     if (arch_lc.find("mistral") != std::string::npos) return true;
     if (arch_lc.find("mixtral") != std::string::npos) return true;
@@ -366,6 +461,10 @@ static bool arch_uses_square_transpose(const std::string& arch_lc) {
     if (arch_lc.find("orca") != std::string::npos) return true;
 
     // Negative matches: families typically using the "standard" layout.
+    // Qwen GGUF checkpoints should keep quantized square weights in their
+    // exported orientation; forcing runtime square transpose regresses step-0
+    // logits into repeated token loops like "achers...".
+    if (arch_lc.rfind("qwen", 0) == 0) return false;
     if (arch_lc.find("gptneox") != std::string::npos) return false;
     if (arch_lc.find("gpt2") != std::string::npos) return false;
     if (arch_lc.find("falcon") != std::string::npos) return false;
@@ -377,14 +476,14 @@ static bool arch_uses_square_transpose(const std::string& arch_lc) {
     return false;
 }
 
+static bool arch_prefers_ggml_mul_mat_layout(const std::string& arch_lc) {
+    return arch_lc.rfind("qwen", 0) == 0;
+}
+
 static bool arch_prefers_cuda_quant_parity(const std::string& arch_lc) {
-    // Some architectures are known to produce quantized blocks that are
-    // numerically more stable when host-dequant parity mode is used.
-    // Enable parity (host dequant -> device F32) for those families.
-    if (arch_lc.empty()) return false;
-    if (arch_lc.rfind("qwen", 0) == 0) return true;
-    if (arch_lc.find("gemma") != std::string::npos) return true;
-    // Keep parity off by default for others; users may force via env var.
+    (void)arch_lc;
+    // Keep direct quant kernels as the default for CUDA performance.
+    // Parity is still available via MINXFMR_CUDA_QUANT_PARITY=1.
     return false;
 }
 
@@ -450,6 +549,50 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
     Tensor* cur = ctx->layer_buf_a;
     Tensor* nxt = ctx->layer_buf_b;
 
+    backend_context().compare_trace_enabled =
+        ctx->compare_trace_enabled &&
+        ctx->compare_trace_generation_active &&
+        (ctx->compare_trace_step < ctx->compare_trace_steps);
+    backend_context().compare_trace_step = ctx->compare_trace_step;
+
+    auto dump_layer_stats = [&](size_t layer_idx, const Tensor* t) {
+        if (!ctx->compare_trace_enabled || !ctx->compare_trace_generation_active) return;
+        if (ctx->compare_trace_step >= ctx->compare_trace_steps) return;
+        if (!t || t->type != DataType::F32 || !t->data) return;
+        const size_t n = t->rows * t->cols;
+        if (n == 0) return;
+
+        const float* d = (const float*)t->data;
+        double mn = (double)d[0];
+        double mx = (double)d[0];
+        double sum = 0.0;
+        double sum2 = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double v = (double)d[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            sum += v;
+            sum2 += v * v;
+        }
+        const double mean = sum / (double)n;
+        double var = (sum2 / (double)n) - (mean * mean);
+        if (var < 0.0) var = 0.0;
+        const double stddev = std::sqrt(var);
+        const char* phase = (ctx->compare_trace_step < 0) ? "prefill_layer_hidden" : "layer_hidden";
+
+        std::ostringstream js;
+        js << "{\"phase\":\"" << phase << "\",\"t\":" << ctx->compare_trace_step
+           << ",\"layer\":" << layer_idx
+           << ",\"n\":" << n
+           << ",\"min\":" << std::fixed << std::setprecision(6) << mn
+           << ",\"max\":" << std::fixed << std::setprecision(6) << mx
+           << ",\"mean\":" << std::fixed << std::setprecision(6) << mean
+           << ",\"std\":" << std::fixed << std::setprecision(6) << stddev
+           << "}";
+        fprintf(stderr, "%s\n", js.str().c_str());
+        fflush(stderr);
+    };
+
     size_t layers_to_run = 1;
     if (!ctx->Wq_layers.empty() && ctx->Wq_layers.size() == ctx->Wk_layers.size() && ctx->Wq_layers.size() == ctx->Wv_layers.size()) {
         layers_to_run = ctx->Wq_layers.size();
@@ -491,19 +634,26 @@ static bool run_stack_forward(minxfmr_context* ctx, const Tensor* input, Tensor*
         float* scores_buf = ctx->scores_workspace.data();
         size_t scores_len = ctx->scores_workspace.size();
 
-        bool ok = transformer_forward_single_layer(cur, nxt, ctx->cache, l, ctx->n_head, ctx->n_head_kv, Wq, Wk, Wv, Bq, Bk, Bv, Wo, WattnNorm, WffnNorm, Wfg, Wfu, Wfd, scores_buf, scores_len, ctx->rope_theta, ctx->rmsnorm_epsilon);
+        bool ok = transformer_forward_single_layer(cur, nxt, ctx->cache, l, ctx->n_head, ctx->n_head_kv, Wq, Wk, Wv, Bq, Bk, Bv, Wo, WattnNorm, WffnNorm, Wfg, Wfu, Wfd, scores_buf, scores_len, ctx->rope_theta, ctx->rope_n_rot, ctx->rmsnorm_epsilon);
         if (!ok) {
+            backend_context().compare_trace_enabled = false;
+            backend_context().compare_trace_step = 0;
             return false;
         }
+        dump_layer_stats(l, nxt);
         Tensor* tmp = cur;
         cur = nxt;
         nxt = tmp;
     }
 
     if (output->rows != cur->rows || output->cols != cur->cols) {
+        backend_context().compare_trace_enabled = false;
+        backend_context().compare_trace_step = 0;
         return false;
     }
     memcpy(output->data, cur->data, sizeof(float) * cur->rows * cur->cols);
+    backend_context().compare_trace_enabled = false;
+    backend_context().compare_trace_step = 0;
     return true;
 }
 
@@ -577,6 +727,7 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     ctx->n_head_kv = 0;
     ctx->n_intermediate = 0;
     ctx->rope_theta = 10000.0f;
+    ctx->rope_n_rot = 0;
     ctx->rmsnorm_epsilon = 1e-6f;
     ctx->seq_max = 128;
     ctx->layer_buf_a = nullptr;
@@ -585,9 +736,14 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     ctx->hidden_buf = nullptr;
     ctx->logits_buf.clear();
     ctx->order_buf.clear();
+    ctx->compare_trace_generation_active = false;
+    ctx->compare_trace_enabled = false;
+    ctx->compare_trace_step = 0;
+    ctx->compare_trace_steps = 0;
 
     const char* ext = strrchr(model_path, '.');
     const bool looks_gguf = (ext != nullptr) && (_stricmp(ext, ".gguf") == 0);
+    const bool strict_gguf = looks_gguf && strict_gguf_mode_enabled();
 
     bool desired_transpose_wq = false;
     bool desired_transpose_wk = false;
@@ -652,17 +808,36 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
             if (cfg.n_head_kv > 0) ctx->n_head_kv = (size_t)cfg.n_head_kv;
             if (cfg.n_intermediate > 0) ctx->n_intermediate = (size_t)cfg.n_intermediate;
             if (cfg.rope_freq_base > 0.0f) ctx->rope_theta = cfg.rope_freq_base;
+            if (cfg.rope_n_rot > 0) ctx->rope_n_rot = cfg.rope_n_rot;
             if (cfg.rmsnorm_epsilon > 0.0f) ctx->rmsnorm_epsilon = cfg.rmsnorm_epsilon;
             minxfmr_info("[minxfmr] gguf meta layers=%zu ctx=%zu embd=%zu head=%zu head_kv=%zu\n",
                 ctx->n_layer, ctx->seq_max, ctx->model_dim, (size_t)cfg.n_head, (size_t)cfg.n_head_kv);
             minxfmr_info("[minxfmr] ffn intermediate=%zu\n", ctx->n_intermediate);
-            minxfmr_info("[minxfmr] rope theta=%g\n", (double)ctx->rope_theta);
+            if (ctx->rope_n_rot > 0) {
+                minxfmr_info("[minxfmr] rope theta=%g n_rot=%zu\n", (double)ctx->rope_theta, ctx->rope_n_rot);
+            } else {
+                minxfmr_info("[minxfmr] rope theta=%g\n", (double)ctx->rope_theta);
+            }
             minxfmr_info("[minxfmr] rmsnorm epsilon=%g\n", (double)ctx->rmsnorm_epsilon);
             if (cfg.n_head == 0 || cfg.n_head_kv == 0) {
                 minxfmr_log(
                     "[minxfmr] warning: gguf head metadata missing (llama.attention.head_count / llama.attention.head_count_kv). "
                     "defaults may be incorrect for non-LLaMA architectures.\n");
             }
+            if (strict_gguf) {
+                if (cfg.n_layer <= 0 || cfg.n_ctx <= 0 || cfg.n_embd <= 0 || cfg.n_head <= 0 || cfg.n_head_kv <= 0 || cfg.n_intermediate <= 0) {
+                    minxfmr_log(
+                        "[minxfmr] fatal(strict): GGUF required metadata missing/invalid: "
+                        "n_layer=%d n_ctx=%d n_embd=%d n_head=%d n_head_kv=%d n_intermediate=%d\n",
+                        cfg.n_layer, cfg.n_ctx, cfg.n_embd, cfg.n_head, cfg.n_head_kv, cfg.n_intermediate);
+                    minxfmr_close(ctx);
+                    return nullptr;
+                }
+            }
+        } else if (strict_gguf) {
+            minxfmr_log("[minxfmr] fatal(strict): failed to read GGUF model metadata\n");
+            minxfmr_close(ctx);
+            return nullptr;
         }
 
         // llama.cpp-like behavior: default layout policy from model architecture metadata.
@@ -681,6 +856,10 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                     desired_transpose_wk ? "on" : "off",
                     desired_transpose_wv ? "on" : "off",
                     desired_transpose_wo ? "on" : "off");
+
+                if (RuntimeConfig::Instance().has("MINXFMR_ROPE_NEOX")) {
+                    backend_context().rope_neox = RuntimeConfig::Instance().getBool("MINXFMR_ROPE_NEOX");
+                }
             } else {
                 std::string arch;
                 if (gguf_try_read_architecture(model_path, arch)) {
@@ -688,15 +867,26 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                     for (char& ch : arch_lc) ch = (char)std::tolower((unsigned char)ch);
 
                     const bool needs_square_transpose = arch_uses_square_transpose(arch_lc);
+                    const bool prefer_ggml_mul_mat_layout = arch_prefers_ggml_mul_mat_layout(arch_lc);
                     desired_transpose_wq = needs_square_transpose;
                     desired_transpose_wk = needs_square_transpose;
                     desired_transpose_wv = needs_square_transpose;
                     desired_transpose_wo = needs_square_transpose;
                     desired_transpose_ffn_square = needs_square_transpose;
+                    backend_context().prefer_ggml_mul_mat_layout = prefer_ggml_mul_mat_layout;
+
+                    bool rope_neox = false;
+                    if (RuntimeConfig::Instance().has("MINXFMR_ROPE_NEOX")) {
+                        rope_neox = RuntimeConfig::Instance().getBool("MINXFMR_ROPE_NEOX");
+                    }
+                    backend_context().rope_neox = rope_neox;
+
                     minxfmr_info(
-                        "[minxfmr] auto orientation from gguf architecture='%s': square_transpose=%s\n",
+                        "[minxfmr] auto orientation from gguf architecture='%s': square_transpose=%s ggml_mul_mat_layout=%s rope=%s\n",
                         arch.c_str(),
-                        needs_square_transpose ? "on" : "off");
+                        needs_square_transpose ? "on" : "off",
+                        prefer_ggml_mul_mat_layout ? "on" : "off",
+                        rope_neox ? "neox" : "norm");
 
                         if (backend_using_cuda() && !RuntimeConfig::Instance().cuda_quant_parity_set()) {
                             const bool prefer_parity = arch_prefers_cuda_quant_parity(arch_lc);
@@ -710,8 +900,14 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
                                 prefer_parity ? "parity(dequant_f32)" : "quant-kernel",
                                 eff_str);
                             }
+                } else if (strict_gguf) {
+                    minxfmr_log("[minxfmr] fatal(strict): gguf architecture metadata missing\n");
+                    minxfmr_close(ctx);
+                    return nullptr;
                 } else {
                     minxfmr_info("[minxfmr] auto orientation: architecture metadata missing, default square_transpose=off\n");
+                    backend_context().rope_neox = RuntimeConfig::Instance().getBool("MINXFMR_ROPE_NEOX");
+                    backend_context().prefer_ggml_mul_mat_layout = false;
                     if (backend_using_cuda() && !RuntimeConfig::Instance().cuda_quant_parity_set()) {
                         backend_set_cuda_quant_parity_mode(0);
                     }
@@ -892,13 +1088,15 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         bool attn_present = (attn_ready > 0) || (ctx->Wq != nullptr);
         bool wo_present = (wo_ready > 0);
         bool ffn_present = (ffn_ready > 0);
+        bool emb_present = (ctx->Wemb != nullptr) || (ctx->Wout != nullptr);
 
-        if (!attn_present || !wo_present || !ffn_present) {
+        if (!attn_present || !wo_present || !ffn_present || !emb_present) {
             minxfmr_log(
-                "[minxfmr] fatal: decoder tensors are missing (attn_present=%d wo_present=%d ffn_present=%d layers=%zu).\n",
+            "[minxfmr] fatal: decoder tensors are missing (attn_present=%d wo_present=%d ffn_present=%d emb_present=%d layers=%zu).\n",
                 (int)attn_present,
                 (int)wo_present,
                 (int)ffn_present,
+            (int)emb_present,
                 ctx->n_layer);
             minxfmr_log(
                 "[minxfmr] fatal: GGUF tensor resolution failed (naming mismatch, unsupported layout, or incomplete/truncated file); refusing to run to avoid gibberish output.\n");
@@ -936,13 +1134,35 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         ctx->model_dim = (ctx->Wemb->rows >= ctx->Wemb->cols) ? ctx->Wemb->cols : ctx->Wemb->rows;
     }
 
-    if (ctx->n_layer == 0) ctx->n_layer = 1;
-    if (ctx->seq_max < 16) ctx->seq_max = 16;
-    if (ctx->seq_max > 8192) ctx->seq_max = 8192;
-    if (ctx->model_dim == 0) ctx->model_dim = 4;
-    if (ctx->kv_dim == 0) ctx->kv_dim = ctx->model_dim;
-    if (ctx->n_head == 0) ctx->n_head = 1;
-    if (ctx->n_head_kv == 0) ctx->n_head_kv = 1;
+    if (strict_gguf) {
+        if (ctx->n_layer == 0 || ctx->seq_max < 16 || ctx->model_dim == 0 || ctx->kv_dim == 0 || ctx->n_head == 0 || ctx->n_head_kv == 0) {
+            minxfmr_log(
+                "[minxfmr] fatal(strict): invalid runtime dimensions n_layer=%zu seq_max=%zu model_dim=%zu kv_dim=%zu n_head=%zu n_head_kv=%zu\n",
+                ctx->n_layer, ctx->seq_max, ctx->model_dim, ctx->kv_dim, ctx->n_head, ctx->n_head_kv);
+            minxfmr_close(ctx);
+            return nullptr;
+        }
+        if ((ctx->model_dim % ctx->n_head) != 0) {
+            minxfmr_log("[minxfmr] fatal(strict): model_dim (%zu) is not divisible by n_head (%zu)\n", ctx->model_dim, ctx->n_head);
+            minxfmr_close(ctx);
+            return nullptr;
+        }
+        const size_t expected_kv_dim = (ctx->model_dim / ctx->n_head) * ctx->n_head_kv;
+        if (expected_kv_dim == 0 || ctx->kv_dim != expected_kv_dim) {
+            minxfmr_log(
+                "[minxfmr] fatal(strict): kv_dim mismatch kv_dim=%zu expected=%zu (model_dim=%zu n_head=%zu n_head_kv=%zu)\n",
+                ctx->kv_dim, expected_kv_dim, ctx->model_dim, ctx->n_head, ctx->n_head_kv);
+            minxfmr_close(ctx);
+            return nullptr;
+        }
+    } else {
+        if (ctx->n_layer == 0) ctx->n_layer = 1;
+        if (ctx->seq_max < 16) ctx->seq_max = 16;
+        if (ctx->model_dim == 0) ctx->model_dim = 4;
+        if (ctx->kv_dim == 0) ctx->kv_dim = ctx->model_dim;
+        if (ctx->n_head == 0) ctx->n_head = 1;
+        if (ctx->n_head_kv == 0) ctx->n_head_kv = 1;
+    }
 
     // Physical normalization: apply square-matrix transposes once at load time.
     // After this, runtime projection path can use non-transpose behavior.
@@ -1054,33 +1274,80 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
         minxfmr_log("[minxfmr] normalized ffn weights at load: gate=%zu up=%zu down=%zu bad=%zu\n",
             n_ffn_gate, n_ffn_up, n_ffn_down, bad_ffn);
 
+        // Optional debug mode: force FFN weights to F32 after canonicalization.
+        // This helps isolate quantized FFN matmul issues without touching attention.
+        if (RuntimeConfig::Instance().getBool("MINXFMR_FORCE_FFN_F32")) {
+            size_t n_force = 0;
+            size_t n_fail = 0;
+            for (size_t l = 0; l < ctx->n_layer; ++l) {
+                Tensor*& wfg = ctx->Wffn_gate_layers[l];
+                Tensor*& wfu = ctx->Wffn_up_layers[l];
+                Tensor*& wfd = ctx->Wffn_down_layers[l];
+                if (wfg && wfg->type != DataType::F32) {
+                    if (dequant_tensor_to_f32_inplace(wfg)) ++n_force; else ++n_fail;
+                }
+                if (wfu && wfu->type != DataType::F32) {
+                    if (dequant_tensor_to_f32_inplace(wfu)) ++n_force; else ++n_fail;
+                }
+                if (wfd && wfd->type != DataType::F32) {
+                    if (dequant_tensor_to_f32_inplace(wfd)) ++n_force; else ++n_fail;
+                }
+            }
+            minxfmr_info("[minxfmr] debug MINXFMR_FORCE_FFN_F32=1 converted=%zu failed=%zu\n", n_force, n_fail);
+        }
+
         // Keep runtime square-transpose enabled only for quantized square matrices
         // that could not be physically transposed at load-time.
         bool rt_wq = false;
         bool rt_wk = false;
         bool rt_wv = false;
         bool rt_wo = false;
+        bool rt_ffn_gate = false;
+        bool rt_ffn_up = false;
+        bool rt_ffn_down = false;
         for (size_t l = 0; l < ctx->n_layer; ++l) {
             if (quantized_square_needs_runtime_transpose(ctx->Wq_layers[l], ctx->model_dim, desired_transpose_wq)) rt_wq = true;
             if (quantized_square_needs_runtime_transpose(ctx->Wk_layers[l], ctx->model_dim, desired_transpose_wk)) rt_wk = true;
             if (quantized_square_needs_runtime_transpose(ctx->Wv_layers[l], ctx->model_dim, desired_transpose_wv)) rt_wv = true;
             if (quantized_square_needs_runtime_transpose(ctx->Wo_layers[l], ctx->model_dim, desired_transpose_wo)) rt_wo = true;
+
+            size_t ffn_hidden = ctx->n_intermediate;
+            const Tensor* wfg = ctx->Wffn_gate_layers[l];
+            const Tensor* wfu = ctx->Wffn_up_layers[l];
+            const Tensor* wfd = ctx->Wffn_down_layers[l];
+            if (wfg) {
+                if (wfg->rows == ctx->model_dim) ffn_hidden = wfg->cols;
+                else if (wfg->cols == ctx->model_dim) ffn_hidden = wfg->rows;
+            }
+            if (wfu && ffn_hidden == 0) {
+                if (wfu->rows == ctx->model_dim) ffn_hidden = wfu->cols;
+                else if (wfu->cols == ctx->model_dim) ffn_hidden = wfu->rows;
+            }
+
+            if (quantized_square_needs_runtime_transpose(wfg, ctx->model_dim, desired_transpose_ffn_square)) rt_ffn_gate = true;
+            if (quantized_square_needs_runtime_transpose(wfu, ctx->model_dim, desired_transpose_ffn_square)) rt_ffn_up = true;
+            if (ffn_hidden > 0 && quantized_square_needs_runtime_transpose(wfd, ffn_hidden, desired_transpose_ffn_square)) rt_ffn_down = true;
         }
         if (quantized_square_needs_runtime_transpose(ctx->Wq, ctx->model_dim, desired_transpose_wq)) rt_wq = true;
         if (quantized_square_needs_runtime_transpose(ctx->Wk, ctx->model_dim, desired_transpose_wk)) rt_wk = true;
         if (quantized_square_needs_runtime_transpose(ctx->Wv, ctx->model_dim, desired_transpose_wv)) rt_wv = true;
 
-        transformer_set_transpose_square_weights_for_all(rt_wq, rt_wk, rt_wv, rt_wo);
-        minxfmr_log("[minxfmr] runtime square transpose after normalization: wq=%s wk=%s wv=%s wo=%s\n",
+        transformer_set_transpose_square_weights_for_all(rt_wq, rt_wk, rt_wv, rt_wo, rt_ffn_gate, rt_ffn_up, rt_ffn_down);
+        minxfmr_log("[minxfmr] runtime square transpose after normalization: wq=%s wk=%s wv=%s wo=%s ffn_gate=%s ffn_up=%s ffn_down=%s\n",
             rt_wq ? "on" : "off",
             rt_wk ? "on" : "off",
             rt_wv ? "on" : "off",
-            rt_wo ? "on" : "off");
+            rt_wo ? "on" : "off",
+            rt_ffn_gate ? "on" : "off",
+            rt_ffn_up ? "on" : "off",
+            rt_ffn_down ? "on" : "off");
     }
 
     // optional chat metadata
     ctx->chat_template = std::string();
     ctx->special_tokens.clear();
+    ctx->tokenizer_add_bos_token = false;
+    ctx->tokenizer_bos_token_id = -1;
 
     // try to read optional metadata from gguf
     std::string tmp_template;
@@ -1092,6 +1359,14 @@ minxfmr_context* minxfmr_open_with_layer(const char* model_path, int projection_
     if (gguf_try_read_special_tokens(model_path, tmp_specials)) {
         ctx->special_tokens = tmp_specials;
         minxfmr_log("[minxfmr] loaded %zu special tokens from gguf\n", ctx->special_tokens.size());
+    }
+    GGUFLoaderTokenizerConfig tok_cfg{false, -1};
+    if (gguf_try_read_tokenizer_config(model_path, tok_cfg)) {
+        ctx->tokenizer_add_bos_token = tok_cfg.add_bos_token;
+        ctx->tokenizer_bos_token_id = tok_cfg.bos_token_id;
+        minxfmr_log("[minxfmr] tokenizer cfg add_bos_token=%d bos_token_id=%d\n",
+            ctx->tokenizer_add_bos_token ? 1 : 0,
+            ctx->tokenizer_bos_token_id);
     }
 
     ctx->cache = kvcache_create(ctx->n_layer, ctx->seq_max, ctx->kv_dim);
@@ -1144,8 +1419,22 @@ int minxfmr_generate(minxfmr_context* ctx,
                      int repeat_last_n,
                      double repeat_penalty,
                      double frequency_penalty,
-                     double presence_penalty) {
+                     double presence_penalty,
+                     bool compare_logits,
+                     int compare_top_n,
+                     int compare_steps) {
     if (!ctx || !prompt) return -1;
+
+    struct compare_trace_guard {
+        minxfmr_context* c;
+        ~compare_trace_guard() {
+            if (!c) return;
+            c->compare_trace_generation_active = false;
+            c->compare_trace_enabled = false;
+            c->compare_trace_step = 0;
+            c->compare_trace_steps = 0;
+        }
+    } trace_guard{ctx};
 
     // Reset per-call backend workspace allocations for this generation call.
     backend_workspace_reset();
@@ -1154,6 +1443,15 @@ int minxfmr_generate(minxfmr_context* ctx,
 
     // 1) Tokenize prompt and prefill cache by running prompt tokens.
     std::vector<int> ids = tokenizer_encode(prompt);
+    if (ctx->tokenizer_add_bos_token) {
+        int bos_id = ctx->tokenizer_bos_token_id;
+        if (bos_id >= 0 && (ids.empty() || ids.front() != bos_id)) {
+            ids.insert(ids.begin(), bos_id);
+            if (chat_debug_enabled()) {
+                fprintf(stderr, "[minxfmr] prepended BOS token id=%d due to gguf tokenizer.add_bos_token\n", bos_id);
+            }
+        }
+    }
     // debug: log prompt token ids and decoded prompt
     if (!ids.empty() && chat_debug_enabled()) {
         fprintf(stderr, "[minxfmr] prompt token count=%zu\n", ids.size());
@@ -1190,24 +1488,54 @@ int minxfmr_generate(minxfmr_context* ctx,
         ctx->order_buf.resize(vocab_size_base);
     }
 
+    const bool prefill_compare_dump = compare_logits || RuntimeConfig::Instance().compare_logits();
+    int prefill_compare_steps = compare_steps;
+    if (prefill_compare_steps <= 0) prefill_compare_steps = RuntimeConfig::Instance().compare_steps();
+    if (prefill_compare_steps <= 0) prefill_compare_steps = 3;
+
     Tensor* last_out_prefill = nullptr;
     int last = ids.empty() ? 0 : ids.back();
-    for (int id : ids) {
+    for (size_t prefill_i = 0; prefill_i < ids.size(); ++prefill_i) {
+        int id = ids[prefill_i];
         Tensor* in = token_embedding_row_into(ctx, id, ctx->embed_buf);
-        if (!in) continue;
+        if (!in) {
+            minxfmr_log("[minxfmr] missing token embedding during prompt prefill (token id=%d)\n", id);
+            if (last_out_prefill) tensor_free(last_out_prefill);
+            return -3;
+        }
 
         // view（F32 row-major）のときだけ free が必要。embed_buf 再利用時は free しない。
         const bool in_is_view = (in != ctx->embed_buf);
 
+        const bool trace_last_prefill = prefill_compare_dump && (prefill_i + 1 == ids.size());
+        if (trace_last_prefill) {
+            ctx->compare_trace_enabled = true;
+            ctx->compare_trace_generation_active = true;
+            ctx->compare_trace_steps = prefill_compare_steps;
+            ctx->compare_trace_step = -1;
+        }
+
         if (!run_stack_forward(ctx, in, ctx->hidden_buf)) {
             minxfmr_log("[minxfmr] forward failed during prompt prefill (token id=%d)\n", id);
+            if (trace_last_prefill) {
+                ctx->compare_trace_enabled = false;
+                ctx->compare_trace_generation_active = false;
+                ctx->compare_trace_steps = 0;
+                ctx->compare_trace_step = 0;
+            }
             if (in_is_view) tensor_free(in);
             if (last_out_prefill) tensor_free(last_out_prefill);
             return -3;
         }
+        if (trace_last_prefill) {
+            ctx->compare_trace_enabled = false;
+            ctx->compare_trace_generation_active = false;
+            ctx->compare_trace_steps = 0;
+            ctx->compare_trace_step = 0;
+        }
         if (in_is_view) tensor_free(in);
 
-        if (id == last) {
+        if (prefill_i + 1 == ids.size()) {
             if (last_out_prefill) tensor_free(last_out_prefill);
             last_out_prefill = tensor_clone_f32_local(ctx->hidden_buf);
         }
@@ -1247,6 +1575,62 @@ int minxfmr_generate(minxfmr_context* ctx,
     // If requested via environment, emit a single-line JSON object to stdout with
     // the generated token ids, token strings and base64-encoded decoded text.
     bool emit_json = RuntimeConfig::Instance().emit_json();
+    bool compare_dump = compare_logits || RuntimeConfig::Instance().compare_logits();
+    if (compare_top_n <= 0) compare_top_n = RuntimeConfig::Instance().compare_top_n();
+    if (compare_top_n <= 0) compare_top_n = 10;
+    if (compare_steps <= 0) compare_steps = RuntimeConfig::Instance().compare_steps();
+    if (compare_steps <= 0) compare_steps = 3;
+
+    auto parse_compare_ids = []() {
+        std::vector<int> out;
+        const char* raw = std::getenv("MINXFMR_COMPARE_IDS");
+        if (!raw || !*raw) return out;
+
+        std::string spec(raw);
+        for (char& c : spec) {
+            if (c == ';' || c == '|' || c == ':') c = ',';
+        }
+
+        std::stringstream ss(spec);
+        std::string part;
+        while (std::getline(ss, part, ',')) {
+            size_t b = 0;
+            while (b < part.size() && std::isspace((unsigned char)part[b])) ++b;
+            size_t e = part.size();
+            while (e > b && std::isspace((unsigned char)part[e - 1])) --e;
+            if (e <= b) continue;
+
+            std::string item = part.substr(b, e - b);
+            char* endp = nullptr;
+            long v = std::strtol(item.c_str(), &endp, 10);
+            if (endp == item.c_str() || *endp != '\0') continue;
+            if (v < 0 || v > INT_MAX) continue;
+            out.push_back((int)v);
+        }
+
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    };
+    std::vector<int> compare_focus_ids = parse_compare_ids();
+    if (compare_dump && !compare_focus_ids.empty()) {
+        std::ostringstream focus_ids_text;
+        for (size_t i = 0; i < compare_focus_ids.size(); ++i) {
+            if (i) focus_ids_text << ',';
+            focus_ids_text << compare_focus_ids[i];
+        }
+        minxfmr_info("[minxfmr] compare focus ids: %s\n", focus_ids_text.str().c_str());
+    }
+
+    const bool force_scalar_outproj = RuntimeConfig::Instance().getBool("MINXFMR_FORCE_SCALAR_OUTPROJ");
+    if (force_scalar_outproj) {
+        minxfmr_info("[minxfmr] debug MINXFMR_FORCE_SCALAR_OUTPROJ=1 (backend out projection bypassed)\n");
+    }
+    const bool skip_final_norm = RuntimeConfig::Instance().getBool("MINXFMR_SKIP_FINAL_NORM");
+    if (skip_final_norm) {
+        minxfmr_info("[minxfmr] debug MINXFMR_SKIP_FINAL_NORM=1 (final norm bypassed)\n");
+    }
+
     std::vector<int> gen_ids;
     std::vector<std::string> gen_token_strs;
     // Buffer for consecutive byte-fallback tokens like <0xE3><0x81>...
@@ -1263,13 +1647,193 @@ int minxfmr_generate(minxfmr_context* ctx,
     // from cpu_workspace because run_stack_forward may grow/reset that workspace.
     const size_t OUT_CHUNK = 4096;
     size_t global_out_vocab = 0;
-    if (ctx->Wout && (ctx->Wout->type == DataType::F32 || is_supported_quantized_type(ctx->Wout->type))) {
-        if (ctx->Wout->rows == dim) global_out_vocab = ctx->Wout->cols;
-        else if (ctx->Wout->cols == dim) global_out_vocab = ctx->Wout->rows;
+    if (ctx->Wout && is_supported_output_tensor_type(ctx->Wout->type)) {
+        size_t resolved_vocab = 0;
+        OutProjLayout resolved_layout = resolve_out_proj_layout(ctx->Wout, dim, resolved_vocab);
+        if (resolved_layout != OutProjLayout::Invalid) global_out_vocab = resolved_vocab;
     }
     size_t global_chunk_size = (global_out_vocab > 0) ? std::min(OUT_CHUNK, global_out_vocab) : 0;
     std::vector<float> logits_chunk_buffer;
     if (global_chunk_size > 0) logits_chunk_buffer.resize(global_chunk_size);
+
+    auto compare_json_escape = [](const std::string& s) {
+        std::string o;
+        o.reserve(s.size() * 2);
+        for (unsigned char c : s) {
+            if (c == '"') { o += "\\\""; }
+            else if (c == '\\') { o += "\\\\"; }
+            else if (c >= 0x20 && c <= 0x7E) { o.push_back((char)c); }
+            else {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04X", (unsigned int)c);
+                o += buf;
+            }
+        }
+        return o;
+    };
+
+    auto compare_dump_prompt = [&](const std::vector<int>& prompt_ids, const std::string& decoded_prompt) {
+        if (!compare_dump) return;
+        std::ostringstream js;
+        js << "{\"phase\":\"prompt\",\"ids\":[";
+        for (size_t i = 0; i < prompt_ids.size(); ++i) {
+            if (i) js << ',';
+            js << prompt_ids[i];
+        }
+        js << "],\"decoded\":\"" << compare_json_escape(decoded_prompt) << "\"}";
+        fprintf(stderr, "%s\n", js.str().c_str());
+        fflush(stderr);
+    };
+
+    auto compare_dump_step = [&](int step_idx, int last_id, const std::vector<int>& order, const std::vector<double>& logits, size_t vocab_limit, int selected_id) {
+        if (!compare_dump) return;
+        int n = compare_top_n;
+        if (n > (int)vocab_limit) n = (int)vocab_limit;
+        if (n <= 0) return;
+        std::ostringstream js;
+        js << "{\"phase\":\"step\",\"t\":" << step_idx << ",\"last\":" << last_id << ",\"selected\":" << selected_id << ",\"top\":[";
+        for (int i = 0; i < n; ++i) {
+            if (i) js << ',';
+            int tid = order[(size_t)i];
+            std::string raw = tokenizer_id_to_token(tid);
+            std::string preview = render_token_piece(raw);
+            double logit = (tid >= 0 && (size_t)tid < logits.size()) ? logits[(size_t)tid] : 0.0;
+            js << "{\"rank\":" << (i + 1)
+               << ",\"id\":" << tid
+               << ",\"logit\":" << std::fixed << std::setprecision(6) << logit
+               << ",\"raw\":\"" << compare_json_escape(raw)
+               << "\",\"preview\":\"" << compare_json_escape(preview) << "\"}";
+        }
+        js << "]}";
+        fprintf(stderr, "%s\n", js.str().c_str());
+        fflush(stderr);
+    };
+
+    auto compare_dump_vec_stats_f32 = [&](const char* phase, int step_idx, const float* data, size_t n) {
+        if (!compare_dump || !phase || !data || n == 0) return;
+        double mn = (double)data[0];
+        double mx = (double)data[0];
+        double sum = 0.0;
+        double sum2 = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            double v = (double)data[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            sum += v;
+            sum2 += v * v;
+        }
+        double mean = sum / (double)n;
+        double var = (sum2 / (double)n) - (mean * mean);
+        if (var < 0.0) var = 0.0;
+        double stddev = std::sqrt(var);
+
+        std::ostringstream js;
+        js << "{\"phase\":\"" << phase << "\",\"t\":" << step_idx
+           << ",\"n\":" << n
+           << ",\"min\":" << std::fixed << std::setprecision(6) << mn
+           << ",\"max\":" << std::fixed << std::setprecision(6) << mx
+           << ",\"mean\":" << std::fixed << std::setprecision(6) << mean
+           << ",\"std\":" << std::fixed << std::setprecision(6) << stddev
+           << "}";
+        fprintf(stderr, "%s\n", js.str().c_str());
+        fflush(stderr);
+    };
+
+    auto compare_dump_vec_stats_f64 = [&](const char* phase, int step_idx, const std::vector<double>& data, size_t n) {
+        if (!compare_dump || !phase || n == 0 || data.empty()) return;
+        if (n > data.size()) n = data.size();
+        double mn = data[0];
+        double mx = data[0];
+        double sum = 0.0;
+        double sum2 = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            double v = data[i];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+            sum += v;
+            sum2 += v * v;
+        }
+        double mean = sum / (double)n;
+        double var = (sum2 / (double)n) - (mean * mean);
+        if (var < 0.0) var = 0.0;
+        double stddev = std::sqrt(var);
+
+        std::ostringstream js;
+        js << "{\"phase\":\"" << phase << "\",\"t\":" << step_idx
+           << ",\"n\":" << n
+           << ",\"min\":" << std::fixed << std::setprecision(6) << mn
+           << ",\"max\":" << std::fixed << std::setprecision(6) << mx
+           << ",\"mean\":" << std::fixed << std::setprecision(6) << mean
+           << ",\"std\":" << std::fixed << std::setprecision(6) << stddev
+           << "}";
+        fprintf(stderr, "%s\n", js.str().c_str());
+        fflush(stderr);
+    };
+
+    auto compare_dump_top = [&](int step_idx, int prev_token, int chosen_token, const std::vector<double>& logits, size_t vocab_n) {
+        if (!compare_dump) return;
+        size_t k = (size_t)std::max(1, compare_top_n);
+        if (k > vocab_n) k = vocab_n;
+        if (vocab_n == 0) return;
+
+        std::vector<int> top_ids(vocab_n);
+        for (size_t i = 0; i < vocab_n; ++i) top_ids[i] = (int)i;
+        std::partial_sort(
+            top_ids.begin(),
+            top_ids.begin() + (std::ptrdiff_t)k,
+            top_ids.end(),
+            [&](int a, int b) {
+                return logits[(size_t)a] > logits[(size_t)b];
+            });
+
+        std::ostringstream js;
+        js << "{\"phase\":\"step\",\"t\":" << step_idx
+           << ",\"prev\":" << prev_token
+           << ",\"chosen\":" << chosen_token
+           << ",\"top\":[";
+        for (size_t i = 0; i < k; ++i) {
+            int id = top_ids[i];
+            double logit = 0.0;
+            if (id >= 0 && (size_t)id < logits.size()) logit = logits[(size_t)id];
+            std::string tok = tokenizer_id_to_token(id);
+            if (i) js << ",";
+            js << "{\"rank\":" << (i + 1)
+               << ",\"id\":" << id
+               << ",\"tok\":\"" << compare_json_escape(tok) << "\""
+               << ",\"logit\":" << std::fixed << std::setprecision(6) << logit
+               << "}";
+        }
+        if (!compare_focus_ids.empty()) {
+            js << ",\"focus\":[";
+            bool first_focus = true;
+            for (int id : compare_focus_ids) {
+                if (id < 0 || (size_t)id >= vocab_n || (size_t)id >= logits.size()) continue;
+                double target = logits[(size_t)id];
+                int rank = 1;
+                for (size_t j = 0; j < vocab_n; ++j) {
+                    if (logits[j] > target) ++rank;
+                }
+                std::string tok = tokenizer_id_to_token(id);
+                if (!first_focus) js << ",";
+                first_focus = false;
+                js << "{\"id\":" << id
+                   << ",\"tok\":\"" << compare_json_escape(tok) << "\""
+                   << ",\"rank\":" << rank
+                   << ",\"logit\":" << std::fixed << std::setprecision(6) << target
+                   << "}";
+            }
+            js << "]";
+        }
+        js << "]}";
+        fprintf(stderr, "%s\n", js.str().c_str());
+        fflush(stderr);
+    };
+
+    compare_dump_prompt(ids, tokenizer_decode(ids));
+
+    ctx->compare_trace_enabled = compare_dump;
+    ctx->compare_trace_steps = compare_steps > 0 ? compare_steps : 0;
+    ctx->compare_trace_step = 0;
 
     // 2) Autoregressive loop: predict one token at a time.
     int t = 0;
@@ -1278,6 +1842,8 @@ int minxfmr_generate(minxfmr_context* ctx,
     std::string last_emitted_raw_tok;
     int repeat_run = 0;
     for (t = 0; t < max_steps; ++t) {
+        ctx->compare_trace_generation_active = true;
+        ctx->compare_trace_step = t;
         if (chat_debug_enabled()) {
             fprintf(stderr, "[minxfmr] gen loop step=%d last=%d emitted=%d\n", t, last, gen_tokens_emitted);
             fflush(stderr);
@@ -1306,8 +1872,12 @@ int minxfmr_generate(minxfmr_context* ctx,
             if (in_is_view) tensor_free(in);
         }
 
-        if (ctx->Wnorm) {
+        if (ctx->Wnorm && !skip_final_norm) {
             apply_final_norm_inplace(out, ctx->Wnorm, ctx->rmsnorm_epsilon);
+        }
+
+        if (compare_dump && t < compare_steps) {
+            compare_dump_vec_stats_f32("hidden", t, (const float*)out->data, dim);
         }
 
         // ---- logits: 再利用バッファ ----
@@ -1321,25 +1891,67 @@ int minxfmr_generate(minxfmr_context* ctx,
 
         const float* od = (const float*)out->data;
 
-        if (ctx->Wout && (ctx->Wout->type == DataType::F32 || is_supported_quantized_type(ctx->Wout->type))) {
-            if (is_supported_quantized_type(ctx->Wout->type)) {
-                size_t out_vocab = 0;
-                bool rhs_transposed = false;
-                if (ctx->Wout->rows == dim) {
-                    out_vocab = ctx->Wout->cols;
-                } else if (ctx->Wout->cols == dim) {
-                    out_vocab = ctx->Wout->rows;
-                    rhs_transposed = true;
-                }
+        bool used_wemb_override = false;
+        const Tensor* out_proj = choose_output_projection(ctx, dim, used_wemb_override);
+
+        if (out_proj && is_supported_output_tensor_type(out_proj->type)) {
+            size_t out_vocab = 0;
+            OutProjLayout out_layout = resolve_out_proj_layout(out_proj, dim, out_vocab);
+            if (out_layout == OutProjLayout::Invalid || out_vocab == 0) {
+                minxfmr_log("[minxfmr] invalid output projection shape at step=%d (rows=%zu cols=%zu dim=%zu)\n",
+                            t,
+                            out_proj->rows,
+                            out_proj->cols,
+                            dim);
+                if (last_out_prefill) tensor_free(last_out_prefill);
+                return -3;
+            }
+            if (used_wemb_override && t == 0) {
+                minxfmr_info("[minxfmr] output projection source: token_embd fallback (lm_head unavailable/invalid)\n");
+            }
+
+            if (is_supported_quantized_type(out_proj->type)) {
+                const bool rhs_transposed = (out_layout == OutProjLayout::VocabByDim);
 
                 size_t use_vocab = std::min(vocab_size, out_vocab);
                 bool ok = false;
                 if (out_vocab > 0) {
                     Tensor* logits_t = tensor_create_f32(1, out_vocab);
                     if (logits_t) {
-                        ok = rhs_transposed ?
-                            backend_matmul_rhs_transposed(out, ctx->Wout, logits_t) :
-                            backend_matmul(out, ctx->Wout, logits_t);
+                        if (!force_scalar_outproj) {
+                            ok = rhs_transposed ?
+                                backend_matmul_rhs_transposed(out, out_proj, logits_t) :
+                                backend_matmul(out, out_proj, logits_t);
+                        }
+                        if (force_scalar_outproj) {
+                            std::vector<float> rowbuf(std::max(dim, out_vocab), 0.0f);
+                            float* ldata = (float*)logits_t->data;
+                            bool ref_ok = true;
+                            if (rhs_transposed) {
+                                for (size_t j = 0; j < out_vocab; ++j) {
+                                    if (!tensor_dequant_row(out_proj, j, rowbuf.data())) {
+                                        ref_ok = false;
+                                        break;
+                                    }
+                                    double s = 0.0;
+                                    for (size_t i = 0; i < dim; ++i) s += (double)od[i] * (double)rowbuf[i];
+                                    ldata[j] = (float)s;
+                                }
+                            } else {
+                                std::fill(ldata, ldata + out_vocab, 0.0f);
+                                for (size_t i = 0; i < dim; ++i) {
+                                    if (!tensor_dequant_row(out_proj, i, rowbuf.data())) {
+                                        ref_ok = false;
+                                        break;
+                                    }
+                                    const double scale = (double)od[i];
+                                    for (size_t j = 0; j < out_vocab; ++j) {
+                                        ldata[j] += (float)(scale * (double)rowbuf[j]);
+                                    }
+                                }
+                            }
+                            ok = ref_ok;
+                        }
                         if (ok) {
                             const float* ldata = (const float*)logits_t->data;
                             for (size_t j = 0; j < use_vocab; ++j) logits[j] = (double)ldata[j];
@@ -1350,23 +1962,27 @@ int minxfmr_generate(minxfmr_context* ctx,
                 }
 
                 if (!ok) {
-                    for (size_t i = 0; i < vocab_size; ++i) {
-                        size_t idx = (dim == 0) ? 0 : (i % dim);
-                        logits[i] = (double)od[idx];
-                    }
+                    minxfmr_log("[minxfmr] quantized output projection failed at step=%d (rows=%zu cols=%zu rhs_transposed=%d dim=%zu out_vocab=%zu)\n",
+                                t,
+                                out_proj ? out_proj->rows : 0,
+                                out_proj ? out_proj->cols : 0,
+                                rhs_transposed ? 1 : 0,
+                                dim,
+                                out_vocab);
+                    if (last_out_prefill) tensor_free(last_out_prefill);
+                    return -3;
                 }
             } else {
-            const float* wd = (const float*)ctx->Wout->data;
-            // Case A: Wout is [dim x vocab] (rows == dim)
-            if (ctx->Wout->rows == dim) {
-                size_t out_vocab = ctx->Wout->cols;
+            const float* wd = (const float*)out_proj->data;
+            // Case A: Wout is [dim x vocab]
+            if (out_layout == OutProjLayout::DimByVocab) {
                 size_t use_vocab = std::min(vocab_size, out_vocab);
                 const size_t CHUNK = OUT_CHUNK;
                 for (size_t off = 0; off < use_vocab; off += CHUNK) {
                     size_t cur = std::min(CHUNK, use_vocab - off);
                     float* ltmp = logits_chunk_buffer.empty() ? nullptr : logits_chunk_buffer.data();
                     bool ok = false;
-                    if (ltmp) ok = backend_matvec_strided(od, wd + off, ltmp, dim, cur, out_vocab);
+                    if (!force_scalar_outproj && ltmp) ok = backend_matvec_strided(od, wd + off, ltmp, dim, cur, out_vocab);
                     if (ok) {
                         for (size_t j = 0; j < cur; ++j) logits[off + j] = (double)ltmp[j];
                     } else {
@@ -1381,17 +1997,16 @@ int minxfmr_generate(minxfmr_context* ctx,
                 }
                 vocab_size = use_vocab;
             }
-            // Case B: Wout is [vocab x dim] (cols == dim)
-            else if (ctx->Wout->cols == dim) {
-                size_t out_vocab = ctx->Wout->rows;
+            // Case B: Wout is [vocab x dim]
+            else if (out_layout == OutProjLayout::VocabByDim) {
                 size_t use_vocab = std::min(vocab_size, out_vocab);
                 const size_t CHUNK = OUT_CHUNK;
                 for (size_t off = 0; off < use_vocab; off += CHUNK) {
                     size_t cur = std::min(CHUNK, use_vocab - off);
                     float* ltmp = logits_chunk_buffer.empty() ? nullptr : logits_chunk_buffer.data();
-                    const float* rowptr = wd + off * ctx->Wout->cols; // each row has length dim
+                    const float* rowptr = wd + off * out_proj->cols; // each row has length dim
                     bool ok = false;
-                    if (ltmp) ok = backend_vec_dot_rows(od, rowptr, ltmp, dim, cur, ctx->Wout->cols);
+                    if (!force_scalar_outproj && ltmp) ok = backend_vec_dot_rows(od, rowptr, ltmp, dim, cur, out_proj->cols);
                     if (ok) {
                         for (size_t j = 0; j < cur; ++j) logits[off + j] = (double)ltmp[j];
                     } else {
@@ -1405,16 +2020,34 @@ int minxfmr_generate(minxfmr_context* ctx,
                 }
                 vocab_size = use_vocab;
             } else {
-                for (size_t i = 0; i < vocab_size; ++i) {
-                    size_t idx = (dim == 0) ? 0 : (i % dim);
-                    logits[i] = (double)od[idx];
-                }
+                minxfmr_log("[minxfmr] invalid F32 output projection shape at step=%d (rows=%zu cols=%zu dim=%zu)\n",
+                            t,
+                            out_proj->rows,
+                            out_proj->cols,
+                            dim);
+                if (last_out_prefill) tensor_free(last_out_prefill);
+                return -3;
             }
             }
         } else {
-            for (size_t i = 0; i < vocab_size; ++i) {
-                size_t idx = (dim == 0) ? 0 : (i % dim);
-                logits[i] = (double)od[idx];
+            minxfmr_log("[minxfmr] missing output projection at step=%d\n", t);
+            if (last_out_prefill) tensor_free(last_out_prefill);
+            return -3;
+        }
+
+        if (compare_dump && t < compare_steps) {
+            compare_dump_vec_stats_f64("logits_stats", t, logits, vocab_size);
+        }
+
+        // Suppress non-EOS special/control tokens to avoid template leakage and
+        // self-reinforcing control-token loops in chat output.
+        if (!ctx->special_tokens.empty()) {
+            for (const std::string& st : ctx->special_tokens) {
+                int sid = tokenizer_token_to_id(st);
+                if (sid < 0 || (size_t)sid >= vocab_size || (size_t)sid >= logits.size()) continue;
+                const std::string raw = tokenizer_id_to_token(sid);
+                if (is_eos_token(raw)) continue;
+                logits[(size_t)sid] = -std::numeric_limits<double>::infinity();
             }
         }
 
@@ -1570,6 +2203,10 @@ int minxfmr_generate(minxfmr_context* ctx,
             fprintf(stderr, "[minxfmr] step=%d selected id=%d logit=%f sampler=%s k=%d raw_tok='%s' preview='%s' pending_bytes=%zu pending_fragments=%zu\n",
                 t, next, chosen_logit, sampler_greedy ? "greedy" : "sample", k_use, raw_tok.c_str(), preview.c_str(), pending_bytes.size(), pending_token_buf.size());
             fflush(stderr);
+        }
+
+        if (compare_dump && t < compare_steps) {
+            compare_dump_top(t, last, next, logits, vocab_size);
         }
 
         if (!raw_tok.empty() && raw_tok == last_emitted_raw_tok) {

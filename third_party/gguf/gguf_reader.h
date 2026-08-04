@@ -28,6 +28,7 @@ struct GGUF_File {
     uint64_t n_head = 0;
     uint64_t n_head_kv = 0;
     float rope_freq_base = 0.0f;
+    uint64_t rope_n_rot = 0;
     float rmsnorm_epsilon = 1e-6f;
     std::string architecture;
     // additional metadata
@@ -39,6 +40,8 @@ struct GGUF_File {
     std::string tokenizer_model;
     std::string tokenizer_pre;
     std::vector<std::string> tokenizer_merges;
+    bool tokenizer_add_bos = false;
+    int64_t tokenizer_bos_token_id = -1;
     // Optional metadata supplied by model authors
     std::string chat_template;
     std::vector<std::string> special_tokens;
@@ -59,6 +62,7 @@ struct GGUF_ModelConfig {
     uint64_t num_heads = 0;         // alias for n_head
     uint64_t vocab_size = 0;        // vocab size (if available)
     float rope_freq_base = 0.0f;    // RoPE base / theta when available
+    uint64_t rope_n_rot = 0;        // optional rotary dimension count (n_rot)
     float rmsnorm_epsilon = 1e-6f;  // RMSNorm epsilon when available
 };
 

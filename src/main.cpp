@@ -13,6 +13,8 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <unordered_map>
+#include <functional>
 #include <cctype>
 #include "transformer/attention.h"
 #ifdef _WIN32
@@ -137,8 +139,12 @@ int main(int argc, char** argv) {
     bool topp_set_by_user = false;
     bool minp_set_by_user = false;
     bool topk_set_by_user = false;
+    bool compare_logits = false;
+    int compare_top_n = 10;
+    int compare_steps = 3;
     bool run_once = false;
     bool show_help = false;
+    bool dump_chat_template = false;
         int argi = 1;
         while (argi < argc) {
             const char* a = argv[argi];
@@ -164,6 +170,9 @@ int main(int argc, char** argv) {
             if (strcmp(a, "--repeat-penalty") == 0 && argi+1 < argc) { repeat_penalty = (float)strtod(argv[argi+1], nullptr); argi += 2; continue; }
             if (strcmp(a, "--presence-penalty") == 0 && argi+1 < argc) { presence_penalty = (float)strtod(argv[argi+1], nullptr); argi += 2; continue; }
             if (strcmp(a, "--frequency-penalty") == 0 && argi+1 < argc) { frequency_penalty = (float)strtod(argv[argi+1], nullptr); argi += 2; continue; }
+            if (strcmp(a, "--compare-logits") == 0) { compare_logits = true; argi++; continue; }
+            if (strcmp(a, "--compare-top-n") == 0 && argi+1 < argc) { compare_top_n = (int)strtol(argv[argi+1], nullptr, 10); argi += 2; continue; }
+            if (strcmp(a, "--compare-steps") == 0 && argi+1 < argc) { compare_steps = (int)strtol(argv[argi+1], nullptr, 10); argi += 2; continue; }
             if (strcmp(a, "--max-gen-tokens") == 0 && argi+1 < argc) { max_gen_tokens = (int)strtol(argv[argi+1], nullptr, 10); argi += 2; continue; }
             if (strcmp(a, "--stop") == 0 && argi+1 < argc) { stop_token = argv[argi+1]; argi += 2; continue; }
             if (strcmp(a, "--log-file") == 0 && argi+1 < argc) { log_file = argv[argi+1]; argi += 2; continue; }
@@ -181,6 +190,7 @@ int main(int argc, char** argv) {
             if (strcmp(a, "--transpose-all") == 0) { transpose_square = true; transpose_wq = transpose_wk = transpose_wv = transpose_wo = true; transpose_user_override = true; argi++; continue; }
             if (strcmp(a, "--no-transpose-all") == 0) { transpose_square = false; transpose_wq = transpose_wk = transpose_wv = transpose_wo = false; transpose_user_override = true; argi++; continue; }
             if (strcmp(a, "--emit-vocab") == 0) { emit_vocab = true; argi++; continue; }
+            if (strcmp(a, "--dump-chat-template") == 0) { dump_chat_template = true; argi++; continue; }
             // Unknown or unsupported option: skip it
             argi++;
         }
@@ -200,7 +210,11 @@ int main(int argc, char** argv) {
         printf("  --repeat-penalty <n>  Repeat penalty (>1.0 stronger, 1.0=off).\n");
         printf("  --presence-penalty <n> Presence penalty (default 0.0).\n");
         printf("  --frequency-penalty <n> Frequency penalty (default 0.0).\n");
+        printf("  --compare-logits      Emit JSONL compare traces for prompt and first steps.\n");
+        printf("  --compare-top-n <n>   Number of top logits to dump per step (default 10).\n");
+        printf("  --compare-steps <n>   Number of initial steps to dump (default 3).\n");
         printf("  --max-gen-tokens <n>  Maximum tokens to generate (1-256).\n");
+        printf("  --dump-chat-template  Print tokenizer.chat_template loaded from GGUF and exit.\n");
         printf("  --help, -h            Show this help message.\n");
         printf("\nYou can also set environment variables such as MINXFMR_BACKEND, MINXFMR_GGUF_VERBOSE.\n");
         return 0;
@@ -212,7 +226,8 @@ int main(int argc, char** argv) {
         if (!temp_set_by_user) temperature = 0.7f;
         if (!topk_set_by_user) top_k = 40;
         if (!topp_set_by_user) top_p = 0.95f;
-        if (!minp_set_by_user) min_p = 0.05f;
+        // Keep min-p disabled by default to match common llama.cpp behavior.
+        if (!minp_set_by_user) min_p = 0.0f;
     }
 
     if (log_file) {
@@ -413,6 +428,18 @@ int main(int argc, char** argv) {
         minxfmr_print_weights(ctx);
     }
 
+    if (dump_chat_template) {
+        if (model_chat_template && model_chat_template[0] != '\0') {
+            const size_t n = std::strlen(model_chat_template);
+            printf("# tokenizer.chat_template (source=gguf metadata, length=%zu)\n", n);
+            printf("%s\n", model_chat_template);
+        } else {
+            printf("# tokenizer.chat_template not found in gguf metadata\n");
+        }
+        minxfmr_close(ctx);
+        return 0;
+    }
+
     if (emit_vocab) {
         size_t n = tokenizer_vocab_size();
         // simple JSON escape
@@ -464,12 +491,6 @@ int main(int argc, char** argv) {
         return out;
     };
 
-    auto looks_like_qwen_jinja_template = [](const char* tpl) {
-        if (!tpl || tpl[0] == '\0') return false;
-        return std::strstr(tpl, "<|im_start|>") != nullptr &&
-               (std::strstr(tpl, "{%-") != nullptr || std::strstr(tpl, "{{-") != nullptr || std::strstr(tpl, "messages[") != nullptr);
-    };
-
     auto build_history_blob = [&](const std::vector<std::string>& history) {
         std::string history_blob;
         size_t begin = history.size() > (size_t)max_history ? history.size() - (size_t)max_history : 0;
@@ -482,16 +503,475 @@ int main(int argc, char** argv) {
         return history_blob;
     };
 
-    auto render_template_auto = [&](const std::vector<std::string>& history, const char* template_text, const char* system_text, const char* user_text, bool* used_auto_qwen) {
-        if (used_auto_qwen) *used_auto_qwen = false;
+    auto json_escape = [](const std::string& s) {
+        std::string out;
+        out.reserve(s.size() * 2);
+        for (unsigned char c : s) {
+            if (c == '"') out += "\\\"";
+            else if (c == '\\') out += "\\\\";
+            else if (c >= 0x20 && c <= 0x7E) out.push_back((char)c);
+            else {
+                char buf[8];
+                std::snprintf(buf, sizeof(buf), "\\u%04X", (unsigned int)c);
+                out += buf;
+            }
+        }
+        return out;
+    };
 
-        auto append_qwen_message = [&](std::string& prompt_text, const char* role, const std::string& content) {
-            prompt_text += "<|im_start|>";
-            prompt_text += role;
-            prompt_text += '\n';
-            prompt_text += content;
-            prompt_text += "<|im_end|>\n";
+    struct ChatTemplateMessage {
+        std::string role;
+        std::string content;
+    };
+
+    auto render_template_auto = [&](const std::vector<std::string>& history, const char* template_text, const char* system_text, const char* user_text, std::string* generation_prompt_out) {
+        if (generation_prompt_out) generation_prompt_out->clear();
+
+        auto trim_ws = [](const std::string& s) {
+            size_t b = 0;
+            while (b < s.size() && std::isspace((unsigned char)s[b])) ++b;
+            size_t e = s.size();
+            while (e > b && std::isspace((unsigned char)s[e - 1])) --e;
+            return s.substr(b, e - b);
         };
+
+        auto build_messages = [&](const std::vector<std::string>& hist, const char* sys, const char* usr) {
+            std::vector<ChatTemplateMessage> msgs;
+            if (sys && sys[0] != '\0') {
+                msgs.push_back(ChatTemplateMessage{"system", std::string(sys)});
+            }
+            size_t begin = hist.size() > (size_t)max_history ? hist.size() - (size_t)max_history : 0;
+            for (size_t i = begin; i + 1 < hist.size(); i += 2) {
+                msgs.push_back(ChatTemplateMessage{"user", hist[i]});
+                msgs.push_back(ChatTemplateMessage{"assistant", hist[i + 1]});
+            }
+            msgs.push_back(ChatTemplateMessage{"user", usr ? std::string(usr) : std::string()});
+            return msgs;
+        };
+
+        struct ListView {
+            const std::vector<ChatTemplateMessage>* data = nullptr;
+            size_t begin = 0;
+            size_t end = 0;
+        };
+
+        struct Value {
+            enum class Kind { None, Str, Bool, Int, Message, List } kind = Kind::None;
+            std::string s;
+            bool b = false;
+            long long i = 0;
+            ChatTemplateMessage msg;
+            ListView list;
+
+            static Value from_str(const std::string& v) { Value x; x.kind = Kind::Str; x.s = v; return x; }
+            static Value from_bool(bool v) { Value x; x.kind = Kind::Bool; x.b = v; return x; }
+            static Value from_int(long long v) { Value x; x.kind = Kind::Int; x.i = v; return x; }
+            static Value from_msg(const ChatTemplateMessage& v) { Value x; x.kind = Kind::Message; x.msg = v; return x; }
+            static Value from_list(const std::vector<ChatTemplateMessage>* p, size_t begin, size_t end) {
+                Value x;
+                x.kind = Kind::List;
+                x.list.data = p;
+                x.list.begin = begin;
+                x.list.end = end;
+                return x;
+            }
+
+            bool truthy() const {
+                if (kind == Kind::Bool) return b;
+                if (kind == Kind::Int) return i != 0;
+                if (kind == Kind::Str) return !s.empty();
+                if (kind == Kind::Message) return !msg.role.empty() || !msg.content.empty();
+                if (kind == Kind::List) return list.data && list.begin < list.end;
+                return false;
+            }
+
+            std::string to_string() const {
+                if (kind == Kind::Str) return s;
+                if (kind == Kind::Bool) return b ? "true" : "false";
+                if (kind == Kind::Int) return std::to_string(i);
+                if (kind == Kind::Message) return msg.content;
+                return std::string();
+            }
+        };
+
+        auto split_top_level = [&](const std::string& s, const std::string& sep) {
+            std::vector<std::string> out;
+            size_t start = 0;
+            int bracket_depth = 0;
+            bool in_single = false;
+            bool in_double = false;
+            for (size_t i = 0; i < s.size(); ++i) {
+                char c = s[i];
+                if (c == '\\' && (in_single || in_double) && i + 1 < s.size()) {
+                    ++i;
+                    continue;
+                }
+                if (!in_double && c == '\'') in_single = !in_single;
+                else if (!in_single && c == '"') in_double = !in_double;
+                else if (!in_single && !in_double) {
+                    if (c == '[' || c == '(') ++bracket_depth;
+                    else if ((c == ']' || c == ')') && bracket_depth > 0) --bracket_depth;
+                    if (bracket_depth == 0 && i + sep.size() <= s.size() && s.compare(i, sep.size(), sep) == 0) {
+                        out.push_back(s.substr(start, i - start));
+                        i += sep.size() - 1;
+                        start = i + 1;
+                    }
+                }
+            }
+            out.push_back(s.substr(start));
+            return out;
+        };
+
+        auto parse_string_literal = [&](const std::string& expr, std::string* out) {
+            if (expr.size() < 2) return false;
+            char q = expr.front();
+            if ((q != '\'' && q != '"') || expr.back() != q) return false;
+            std::string v;
+            v.reserve(expr.size());
+            for (size_t i = 1; i + 1 < expr.size(); ++i) {
+                char c = expr[i];
+                if (c == '\\' && i + 1 < expr.size() - 1) {
+                    char n = expr[++i];
+                    if (n == 'n') v.push_back('\n');
+                    else if (n == 't') v.push_back('\t');
+                    else if (n == 'r') v.push_back('\r');
+                    else v.push_back(n);
+                } else {
+                    v.push_back(c);
+                }
+            }
+            *out = v;
+            return true;
+        };
+
+        auto unwrap_outer_parens = [&](const std::string& raw) {
+            std::string s = trim_ws(raw);
+            while (s.size() >= 2 && s.front() == '(' && s.back() == ')') {
+                int depth = 0;
+                bool in_single = false;
+                bool in_double = false;
+                bool wraps_all = true;
+                for (size_t i = 0; i < s.size(); ++i) {
+                    char c = s[i];
+                    if (c == '\\' && (in_single || in_double) && i + 1 < s.size()) {
+                        ++i;
+                        continue;
+                    }
+                    if (!in_double && c == '\'') in_single = !in_single;
+                    else if (!in_single && c == '"') in_double = !in_double;
+                    else if (!in_single && !in_double) {
+                        if (c == '(') ++depth;
+                        else if (c == ')') {
+                            --depth;
+                            if (depth == 0 && i + 1 < s.size()) {
+                                wraps_all = false;
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!wraps_all) break;
+                s = trim_ws(s.substr(1, s.size() - 2));
+            }
+            return s;
+        };
+
+        auto value_eq = [&](const Value& a, const Value& b) {
+            if (a.kind == Value::Kind::Bool || b.kind == Value::Kind::Bool) return a.truthy() == b.truthy();
+            return a.to_string() == b.to_string();
+        };
+
+        std::vector<ChatTemplateMessage> messages = build_messages(history, system_text, user_text);
+        std::unordered_map<std::string, Value> vars;
+        vars["messages"] = Value::from_list(&messages, 0, messages.size());
+        vars["loop_messages"] = Value::from_list(&messages, 0, messages.size());
+        vars["tools"] = Value::from_bool(false);
+        vars["add_generation_prompt"] = Value::from_bool(true);
+        vars["loop.first"] = Value::from_bool(false);
+        vars["loop.last"] = Value::from_bool(false);
+        vars["loop.index0"] = Value::from_int(0);
+
+        std::function<Value(const std::string&)> eval_expr;
+        std::function<bool(const std::string&)> eval_cond;
+
+        auto parse_var_path = [&](const std::string& raw) -> Value {
+            std::string s = unwrap_outer_parens(raw);
+            if (s.empty()) return Value();
+
+            if (s.rfind("loop.", 0) == 0) {
+                auto lit = vars.find(s);
+                return (lit != vars.end()) ? lit->second : Value();
+            }
+
+            size_t pos = 0;
+            auto read_ident = [&](size_t p, size_t* next) {
+                if (p >= s.size() || !(std::isalpha((unsigned char)s[p]) || s[p] == '_')) return std::string();
+                size_t i = p + 1;
+                while (i < s.size() && (std::isalnum((unsigned char)s[i]) || s[i] == '_')) ++i;
+                *next = i;
+                return s.substr(p, i - p);
+            };
+
+            size_t next = 0;
+            std::string ident = read_ident(pos, &next);
+            if (ident.empty()) return Value();
+            pos = next;
+
+            auto it = vars.find(ident);
+            Value cur = (it != vars.end()) ? it->second : Value();
+
+            while (pos < s.size()) {
+                if (s[pos] == '.') {
+                    ++pos;
+                    std::string field = read_ident(pos, &next);
+                    if (field.empty()) return Value();
+                    pos = next;
+                    if (cur.kind == Value::Kind::Message) {
+                        if (field == "role") cur = Value::from_str(cur.msg.role);
+                        else if (field == "content") cur = Value::from_str(cur.msg.content);
+                        else if (field == "tool_calls") cur = Value();
+                        else cur = Value();
+                    } else {
+                        cur = Value();
+                    }
+                    continue;
+                }
+
+                if (s[pos] == '[') {
+                    size_t close = s.find(']', pos + 1);
+                    if (close == std::string::npos) return Value();
+                    std::string inner = trim_ws(s.substr(pos + 1, close - (pos + 1)));
+
+                    if (cur.kind == Value::Kind::List && cur.list.data) {
+                        size_t list_size = cur.list.end > cur.list.begin ? (cur.list.end - cur.list.begin) : 0;
+                        size_t col = inner.find(':');
+
+                        auto parse_index_expr = [&](const std::string& idx_expr, size_t* out_idx) {
+                            std::string e = trim_ws(idx_expr);
+                            if (e.empty()) return false;
+
+                            auto parse_digits = [&](const std::string& d, long long* v) {
+                                if (d.empty()) return false;
+                                for (char ch : d) if (!std::isdigit((unsigned char)ch)) return false;
+                                *v = std::strtoll(d.c_str(), nullptr, 10);
+                                return true;
+                            };
+
+                            long long base = 0;
+                            size_t op_pos = std::string::npos;
+                            char op = 0;
+                            for (size_t ii = 0; ii < e.size(); ++ii) {
+                                if ((e[ii] == '+' || e[ii] == '-') && ii > 0) {
+                                    op_pos = ii;
+                                    op = e[ii];
+                                    break;
+                                }
+                            }
+
+                            if (op_pos != std::string::npos) {
+                                std::string left = trim_ws(e.substr(0, op_pos));
+                                std::string right = trim_ws(e.substr(op_pos + 1));
+                                long long lv = 0;
+                                long long rv = 0;
+                                if (left == "loop.index0") {
+                                    auto itl = vars.find("loop.index0");
+                                    if (itl == vars.end() || itl->second.kind != Value::Kind::Int) return false;
+                                    lv = itl->second.i;
+                                } else if (!parse_digits(left, &lv)) {
+                                    return false;
+                                }
+                                if (!parse_digits(right, &rv)) return false;
+                                base = (op == '+') ? (lv + rv) : (lv - rv);
+                            } else {
+                                if (e == "loop.index0") {
+                                    auto itl = vars.find("loop.index0");
+                                    if (itl == vars.end() || itl->second.kind != Value::Kind::Int) return false;
+                                    base = itl->second.i;
+                                } else if (!parse_digits(e, &base)) {
+                                    return false;
+                                }
+                            }
+
+                            if (base < 0) return false;
+                            *out_idx = (size_t)base;
+                            return true;
+                        };
+
+                        if (col != std::string::npos) {
+                            std::string a = trim_ws(inner.substr(0, col));
+                            std::string b = trim_ws(inner.substr(col + 1));
+                            size_t sb = 0;
+                            size_t se = list_size;
+                            if (!a.empty() && !parse_index_expr(a, &sb)) return Value();
+                            if (!b.empty() && !parse_index_expr(b, &se)) return Value();
+                            if (sb > list_size) sb = list_size;
+                            if (se > list_size) se = list_size;
+                            if (sb > se) sb = se;
+                            cur = Value::from_list(cur.list.data, cur.list.begin + sb, cur.list.begin + se);
+                        } else {
+                            size_t idx = 0;
+                            if (!parse_index_expr(inner, &idx)) return Value();
+                            if (idx >= list_size) return Value();
+                            cur = Value::from_msg((*cur.list.data)[cur.list.begin + idx]);
+                        }
+                    } else if (cur.kind == Value::Kind::Message) {
+                        std::string key;
+                        if (!parse_string_literal(inner, &key)) return Value();
+                        if (key == "role") cur = Value::from_str(cur.msg.role);
+                        else if (key == "content") cur = Value::from_str(cur.msg.content);
+                        else cur = Value();
+                    } else {
+                        return Value();
+                    }
+
+                    pos = close + 1;
+                    continue;
+                }
+
+                break;
+            }
+
+            return cur;
+        };
+
+        eval_expr = [&](const std::string& raw) -> Value {
+            std::string expr = unwrap_outer_parens(raw);
+            if (expr.empty()) return Value();
+
+            if (expr == "true") return Value::from_bool(true);
+            if (expr == "false") return Value::from_bool(false);
+
+            auto pipes = split_top_level(expr, "|");
+            Value v;
+            if (pipes.size() > 1) {
+                v = eval_expr(pipes[0]);
+                for (size_t i = 1; i < pipes.size(); ++i) {
+                    std::string f = trim_ws(pipes[i]);
+                    if (f == "trim") {
+                        std::string t = trim_ws(v.to_string());
+                        v = Value::from_str(t);
+                    } else if (f == "tojson") {
+                        if (v.kind == Value::Kind::Str) {
+                            v = Value::from_str(std::string("\"") + json_escape(v.s) + "\"");
+                        } else if (v.kind == Value::Kind::Message) {
+                            std::string obj = std::string("{\"role\":\"") + json_escape(v.msg.role) +
+                                              "\",\"content\":\"" + json_escape(v.msg.content) + "\"}";
+                            v = Value::from_str(obj);
+                        } else {
+                            v = Value::from_str(v.to_string());
+                        }
+                    }
+                }
+                return v;
+            }
+
+            auto plus = split_top_level(expr, "+");
+            if (plus.size() > 1) {
+                std::string out;
+                for (const std::string& part : plus) out += eval_expr(part).to_string();
+                return Value::from_str(out);
+            }
+
+            std::string lit;
+            if (parse_string_literal(expr, &lit)) return Value::from_str(lit);
+
+            return parse_var_path(expr);
+        };
+
+        eval_cond = [&](const std::string& raw) -> bool {
+            std::string expr = unwrap_outer_parens(raw);
+            if (expr.empty()) return false;
+
+            auto ors = split_top_level(expr, " or ");
+            if (ors.size() > 1) {
+                for (const std::string& p : ors) if (eval_cond(p)) return true;
+                return false;
+            }
+
+            auto ands = split_top_level(expr, " and ");
+            if (ands.size() > 1) {
+                for (const std::string& p : ands) if (!eval_cond(p)) return false;
+                return true;
+            }
+
+            auto pos_defined = expr.find(" is defined");
+            if (pos_defined != std::string::npos && trim_ws(expr.substr(pos_defined)) == "is defined") {
+                Value v = eval_expr(expr.substr(0, pos_defined));
+                return v.kind != Value::Kind::None;
+            }
+
+            size_t pos_ne = expr.find("!=");
+            if (pos_ne != std::string::npos) {
+                Value a = eval_expr(expr.substr(0, pos_ne));
+                Value b = eval_expr(expr.substr(pos_ne + 2));
+                return !value_eq(a, b);
+            }
+
+            size_t pos_eq = expr.find("==");
+            if (pos_eq != std::string::npos) {
+                Value a = eval_expr(expr.substr(0, pos_eq));
+                Value b = eval_expr(expr.substr(pos_eq + 2));
+                return value_eq(a, b);
+            }
+
+            if (expr.rfind("not ", 0) == 0) return !eval_cond(expr.substr(4));
+            return eval_expr(expr).truthy();
+        };
+
+        struct Segment {
+            enum class Kind { Text, Expr, Stmt } kind = Kind::Text;
+            std::string text;
+        };
+
+        std::vector<Segment> segs;
+        auto rstrip_ws = [](std::string& s) {
+            while (!s.empty() && std::isspace((unsigned char)s.back())) s.pop_back();
+        };
+
+        if (template_text && template_text[0] != '\0') {
+            std::string tpl(template_text);
+            size_t pos = 0;
+            while (pos < tpl.size()) {
+                size_t n_expr = tpl.find("{{", pos);
+                size_t n_stmt = tpl.find("{%", pos);
+                size_t n_cmt = tpl.find("{#", pos);
+                size_t n = std::string::npos;
+                if (n_expr != std::string::npos) n = n_expr;
+                if (n_stmt != std::string::npos && (n == std::string::npos || n_stmt < n)) n = n_stmt;
+                if (n_cmt != std::string::npos && (n == std::string::npos || n_cmt < n)) n = n_cmt;
+                if (n == std::string::npos) {
+                    segs.push_back(Segment{Segment::Kind::Text, tpl.substr(pos)});
+                    break;
+                }
+
+                if (n > pos) segs.push_back(Segment{Segment::Kind::Text, tpl.substr(pos, n - pos)});
+
+                if (tpl.compare(n, 2, "{#") == 0) {
+                    size_t end = tpl.find("#}", n + 2);
+                    if (end == std::string::npos) break;
+                    pos = end + 2;
+                    continue;
+                }
+
+                bool is_expr = tpl.compare(n, 2, "{{") == 0;
+                bool ltrim = (n + 2 < tpl.size() && tpl[n + 2] == '-');
+                size_t start_inner = n + (ltrim ? 3 : 2);
+                std::string close = is_expr ? "}}" : "%}";
+                size_t end = tpl.find(close, start_inner);
+                if (end == std::string::npos) break;
+                bool rtrim = (end > start_inner && tpl[end - 1] == '-');
+                size_t end_inner = rtrim ? end - 1 : end;
+                if (ltrim && !segs.empty() && segs.back().kind == Segment::Kind::Text) rstrip_ws(segs.back().text);
+
+                std::string inner = trim_ws(tpl.substr(start_inner, end_inner - start_inner));
+                segs.push_back(Segment{is_expr ? Segment::Kind::Expr : Segment::Kind::Stmt, inner});
+
+                pos = end + 2;
+                if (rtrim) {
+                    while (pos < tpl.size() && std::isspace((unsigned char)tpl[pos])) ++pos;
+                }
+            }
+        }
 
         if (template_text && template_text[0] != '\0') {
             std::string assembled = template_text;
@@ -510,23 +990,173 @@ int main(int argc, char** argv) {
                 return assembled;
             }
 
-            if (looks_like_qwen_jinja_template(template_text)) {
-                if (used_auto_qwen) *used_auto_qwen = true;
-                std::string prompt_text;
-                const char* sys = (system_text && system_text[0] != '\0')
-                    ? system_text
-                    : "You are Qwen, created by Alibaba Cloud. You are a helpful assistant. Reply in the same language as the user.";
-                append_qwen_message(prompt_text, "system", sys);
-                size_t begin = history.size() > (size_t)max_history ? history.size() - (size_t)max_history : 0;
-                for (size_t i = begin; i + 1 < history.size(); i += 2) {
-                    append_qwen_message(prompt_text, "user", history[i]);
-                    append_qwen_message(prompt_text, "assistant", history[i + 1]);
+            if (!segs.empty() && (assembled.find("{{") != std::string::npos || assembled.find("{%") != std::string::npos)) {
+                auto stmt_head = [&](const std::string& stmt) {
+                    size_t p = 0;
+                    while (p < stmt.size() && !std::isspace((unsigned char)stmt[p])) ++p;
+                    return stmt.substr(0, p);
+                };
+
+                auto starts_with = [&](const std::string& s, const char* pfx) {
+                    size_t n = std::strlen(pfx);
+                    return s.size() >= n && s.compare(0, n, pfx) == 0;
+                };
+
+                std::function<void(size_t&, const std::vector<std::string>&)> skip_until;
+                std::function<std::string(size_t&, const std::vector<std::string>&)> render_until;
+                std::function<std::string(size_t&, const std::string&)> render_if;
+
+                auto is_end_tag = [&](const std::string& kw, const std::vector<std::string>& ends) {
+                    for (const std::string& e : ends) if (kw == e) return true;
+                    return false;
+                };
+
+                skip_until = [&](size_t& idx, const std::vector<std::string>& ends) {
+                    while (idx < segs.size()) {
+                        const Segment& seg = segs[idx];
+                        if (seg.kind != Segment::Kind::Stmt) {
+                            ++idx;
+                            continue;
+                        }
+                        std::string kw = stmt_head(seg.text);
+                        if (is_end_tag(kw, ends)) return;
+                        if (kw == "if") {
+                            ++idx;
+                            skip_until(idx, {"endif"});
+                            if (idx < segs.size() && stmt_head(segs[idx].text) == "endif") ++idx;
+                            continue;
+                        }
+                        if (kw == "for") {
+                            ++idx;
+                            skip_until(idx, {"endfor"});
+                            if (idx < segs.size() && stmt_head(segs[idx].text) == "endfor") ++idx;
+                            continue;
+                        }
+                        ++idx;
+                    }
+                };
+
+                render_if = [&](size_t& idx, const std::string& first_cond) {
+                    bool taken = false;
+                    std::string out;
+                    std::string cond = first_cond;
+
+                    while (true) {
+                        bool use_branch = !taken && eval_cond(cond);
+                        if (use_branch) {
+                            out += render_until(idx, {"elif", "else", "endif"});
+                            taken = true;
+                        } else {
+                            skip_until(idx, {"elif", "else", "endif"});
+                        }
+
+                        if (idx >= segs.size()) break;
+                        const std::string stmt = segs[idx].text;
+                        const std::string kw = stmt_head(stmt);
+                        if (kw == "elif") {
+                            cond = trim_ws(stmt.substr(4));
+                            ++idx;
+                            continue;
+                        }
+                        if (kw == "else") {
+                            ++idx;
+                            if (!taken) out += render_until(idx, {"endif"});
+                            else skip_until(idx, {"endif"});
+                            if (idx < segs.size() && stmt_head(segs[idx].text) == "endif") ++idx;
+                            break;
+                        }
+                        if (kw == "endif") {
+                            ++idx;
+                            break;
+                        }
+                        break;
+                    }
+
+                    return out;
+                };
+
+                render_until = [&](size_t& idx, const std::vector<std::string>& ends) {
+                    std::string out;
+                    while (idx < segs.size()) {
+                        const Segment& seg = segs[idx];
+                        if (seg.kind == Segment::Kind::Text) {
+                            out += seg.text;
+                            ++idx;
+                            continue;
+                        }
+                        if (seg.kind == Segment::Kind::Expr) {
+                            out += eval_expr(seg.text).to_string();
+                            ++idx;
+                            continue;
+                        }
+
+                        const std::string kw = stmt_head(seg.text);
+                        if (is_end_tag(kw, ends)) break;
+
+                        if (kw == "set") {
+                            std::string body = trim_ws(seg.text.substr(3));
+                            size_t eq = body.find('=');
+                            if (eq != std::string::npos) {
+                                std::string name = trim_ws(body.substr(0, eq));
+                                std::string expr = trim_ws(body.substr(eq + 1));
+                                vars[name] = eval_expr(expr);
+                            }
+                            ++idx;
+                            continue;
+                        }
+
+                        if (kw == "if") {
+                            std::string cond = trim_ws(seg.text.substr(2));
+                            ++idx;
+                            out += render_if(idx, cond);
+                            continue;
+                        }
+
+                        if (kw == "for") {
+                            std::string body = trim_ws(seg.text.substr(3));
+                            size_t in_pos = body.find(" in ");
+                            if (in_pos == std::string::npos) {
+                                ++idx;
+                                continue;
+                            }
+                            std::string var_name = trim_ws(body.substr(0, in_pos));
+                            std::string list_expr = trim_ws(body.substr(in_pos + 4));
+                            Value list_val = eval_expr(list_expr);
+                            ++idx;
+                            size_t block_start = idx;
+
+                            if (list_val.kind == Value::Kind::List && list_val.list.data) {
+                                const size_t total = list_val.list.end - list_val.list.begin;
+                                for (size_t i = list_val.list.begin; i < list_val.list.end; ++i) {
+                                    vars[var_name] = Value::from_msg((*list_val.list.data)[i]);
+                                    size_t rel = i - list_val.list.begin;
+                                    vars["loop.first"] = Value::from_bool(rel == 0);
+                                    vars["loop.last"] = Value::from_bool(rel + 1 == total);
+                                    vars["loop.index0"] = Value::from_int((long long)rel);
+                                    size_t local = block_start;
+                                    out += render_until(local, {"endfor"});
+                                }
+                            }
+
+                            skip_until(idx, {"endfor"});
+                            if (idx < segs.size() && stmt_head(segs[idx].text) == "endfor") ++idx;
+                            continue;
+                        }
+
+                        ++idx;
+                    }
+                    return out;
+                };
+
+                size_t idx = 0;
+                std::string rendered = render_until(idx, {});
+                if (generation_prompt_out && rendered.size() >= 22) {
+                    const std::string tail = "<|im_start|>assistant\n";
+                    if (rendered.compare(rendered.size() - tail.size(), tail.size(), tail) == 0) {
+                        *generation_prompt_out = tail;
+                    }
                 }
-                prompt_text += "<|im_start|>user\n";
-                prompt_text += (user_text ? user_text : "");
-                prompt_text += "<|im_end|>\n";
-                prompt_text += "<|im_start|>assistant\n";
-                return prompt_text;
+                return rendered;
             }
 
             return assembled;
@@ -552,9 +1182,32 @@ int main(int argc, char** argv) {
     };
 
             if (run_once && !chat_mode) {
+                std::string assembled = prompt;
+                std::string generation_prompt;
+                if (model_chat_template && model_chat_template[0] != '\0') {
+                    assembled = render_template_auto({}, model_chat_template, system_prompt, prompt.c_str(), &generation_prompt);
+                }
+                if (compare_logits && !generation_prompt.empty()) {
+                    fprintf(stderr, "{\"phase\":\"chat_prompt\",\"prompt\":\"%s\",\"generation_prompt\":\"%s\"}\n",
+                            json_escape(assembled).c_str(),
+                            json_escape(generation_prompt).c_str());
+                    fflush(stderr);
+                }
+                if (chat_debug_enabled()) {
+                    std::vector<int> dbg_ids = tokenizer_encode(assembled);
+                    fprintf(stderr, "[main] assembled prompt token count=%zu\n", dbg_ids.size());
+                    if (!dbg_ids.empty()) {
+                        fprintf(stderr, "[main] token ids:");
+                        for (size_t ii = 0; ii < dbg_ids.size(); ++ii) fprintf(stderr, " %d", dbg_ids[ii]);
+                        fprintf(stderr, "\n");
+                        std::string dbg_dec = tokenizer_decode(dbg_ids);
+                        fprintf(stderr, "[main] decoded assembled prompt: %s\n", dbg_dec.c_str());
+                    }
+                }
                 if (debug_attn_once) attention_set_debug_once(true);
-                minxfmr_generate(ctx, prompt.c_str(), print_callback, temperature, top_k, top_p, min_p,
-                         repeat_last_n, repeat_penalty, frequency_penalty, presence_penalty);
+                minxfmr_generate(ctx, assembled.c_str(), print_callback, temperature, top_k, top_p, min_p,
+                         repeat_last_n, repeat_penalty, frequency_penalty, presence_penalty,
+                         compare_logits, compare_top_n, compare_steps);
                 printf("\n");
         } else if (chat_mode) {
             printf("Entering chat mode. Type 'reset' to clear history, 'exit' to quit.\n");
@@ -573,10 +1226,13 @@ int main(int argc, char** argv) {
                     }
                     history.pop_back();
                 }
-                bool used_auto_qwen = false;
-                std::string assembled = render_template_auto(history, model_chat_template, system_prompt, line.c_str(), &used_auto_qwen);
-                if (used_auto_qwen && chat_debug_enabled()) {
-                    fprintf(stderr, "[main] auto-detected qwen-style chat template\n");
+                std::string generation_prompt;
+                std::string assembled = render_template_auto(history, model_chat_template, system_prompt, line.c_str(), &generation_prompt);
+                if (compare_logits) {
+                    fprintf(stderr, "{\"phase\":\"chat_prompt\",\"prompt\":\"%s\",\"generation_prompt\":\"%s\"}\n",
+                            json_escape(assembled).c_str(),
+                            json_escape(generation_prompt).c_str());
+                    fflush(stderr);
                 }
                 if (chat_debug_enabled()) {
                     std::vector<int> dbg_ids = tokenizer_encode(assembled);
@@ -594,7 +1250,8 @@ int main(int argc, char** argv) {
                 if (debug_attn_once) attention_set_debug_once(true);
                 minxfmr_reset(ctx);
                 minxfmr_generate(ctx, assembled.c_str(), gen_collect_callback, temperature, top_k, top_p, min_p,
-                                 repeat_last_n, repeat_penalty, frequency_penalty, presence_penalty);
+                                 repeat_last_n, repeat_penalty, frequency_penalty, presence_penalty,
+                                 compare_logits, compare_top_n, compare_steps);
                 printf("\n");
 
                 std::string sanitized = sanitize_assistant_text(gen_outbuf_global);
@@ -620,7 +1277,8 @@ int main(int argc, char** argv) {
                 if (line == "reset") { minxfmr_reset(ctx); printf("context reset\n"); continue; }
                 if (line.empty()) continue;
                 minxfmr_generate(ctx, line.c_str(), print_callback, temperature, top_k, top_p, min_p,
-                                 repeat_last_n, repeat_penalty, frequency_penalty, presence_penalty);
+                                 repeat_last_n, repeat_penalty, frequency_penalty, presence_penalty,
+                                 compare_logits, compare_top_n, compare_steps);
                 printf("\n");
             }
         }

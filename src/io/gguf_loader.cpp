@@ -426,7 +426,7 @@ bool gguf_try_load_ffn_for_layer(const char* path, int layer, Tensor*& outWgate,
 }
 
 bool gguf_try_read_model_config(const char* path, GGUFLoaderModelConfig& out) {
-    out = GGUFLoaderModelConfig{0,0,0,0,0,0,0.0f,1e-6f};
+    out = GGUFLoaderModelConfig{0,0,0,0,0,0,0.0f,0,1e-6f};
     GGUF_ModelConfig cfg;
     if (!gguf_read_model_config(path, cfg)) return false;
     out.n_layer = cfg.n_layer;
@@ -436,6 +436,7 @@ bool gguf_try_read_model_config(const char* path, GGUFLoaderModelConfig& out) {
     out.n_head_kv = cfg.n_head_kv;
     out.n_intermediate = cfg.intermediate_size;
     out.rope_freq_base = cfg.rope_freq_base;
+    out.rope_n_rot = cfg.rope_n_rot;
     out.rmsnorm_epsilon = cfg.rmsnorm_epsilon;
     return true;
 }
@@ -484,6 +485,18 @@ bool gguf_try_load_token_embedding(const char* path, Tensor*& outWemb) {
 
 bool gguf_try_read_vocab(const char* path, std::vector<std::string>& out_tokens) {
     return gguf_read_vocab(path, out_tokens);
+}
+
+bool gguf_try_read_tokenizer_config(const char* path, GGUFLoaderTokenizerConfig& out) {
+    out = GGUFLoaderTokenizerConfig{false, -1};
+    GGUF_File gf;
+    if (!gguf_open(path, gf)) return false;
+    out.add_bos_token = gf.tokenizer_add_bos;
+    if (gf.tokenizer_bos_token_id >= 0 && gf.tokenizer_bos_token_id <= (int64_t)std::numeric_limits<int>::max()) {
+        out.bos_token_id = (int)gf.tokenizer_bos_token_id;
+    }
+    gguf_close(gf);
+    return true;
 }
 
 bool gguf_try_read_chat_template(const char* path, std::string& out_template) {

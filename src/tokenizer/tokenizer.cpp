@@ -38,8 +38,10 @@ static BpePretokenizerMode g_bpe_pretokenizer = BpePretokenizerMode::Generic;
 static std::unordered_map<std::string, int> g_bpe_ranks;
 static size_t g_max_token_len = 0;
 static const std::string kSpmMarker("\xE2\x96\x81");
-static const std::string kGptSpaceMarker("\xC3\x84\xC2\xA0");
-static const std::string kGptNewlineMarker("\xC3\x84\xC2\x8A");
+// GPT byte-level markers use single Unicode code points U+0120 / U+010A.
+// Keep explicit UTF-8 byte escapes to avoid source-encoding corruption.
+static const std::string kGptSpaceMarker("\xC4\xA0");
+static const std::string kGptNewlineMarker("\xC4\x8A");
 static std::string g_word_marker = kSpmMarker;
 static std::string g_newline_token = "\n";
 
@@ -481,6 +483,17 @@ static bool is_special_like_token_text(const std::string& tok) {
     if (tok.empty()) return false;
     if (tok == "<unk>" || tok == "</s>" || tok == "<s>" || tok == "<pad>") return true;
     if (tok == "[INST]" || tok == "[/INST]" || tok == "[SYS]" || tok == "[/SYS]") return true;
+    // Qwen-style vocabularies can contain longer control tokens such as
+    // "<|im_start|>assistant\n" or "<|im_end|>\n<|im_start|>user\n".
+    // Treat any token that starts with a known control marker as special-like
+    // so the BPE fast path can take the longest exact raw-token match instead
+    // of prematurely splitting at "<|im_start|>".
+    if (tok.rfind("<|im_start|>", 0) == 0) return true;
+    if (tok.rfind("<|im_end|>", 0) == 0) return true;
+    if (tok.rfind("<|assistant|>", 0) == 0) return true;
+    if (tok.rfind("<|user|>", 0) == 0) return true;
+    if (tok.rfind("[INST]", 0) == 0) return true;
+    if (tok.rfind("[/INST]", 0) == 0) return true;
     if (tok.rfind("<|", 0) == 0 && tok.size() >= 4 && tok.back() == '>') return true;
     if (tok.front() == '<' && tok.back() == '>' && (tok.find('|') != std::string::npos || tok.find("assistant") != std::string::npos || tok.find("user") != std::string::npos || tok.find("tool") != std::string::npos)) return true;
     if (tok.front() == '[' && tok.back() == ']' && (tok.find("INST") != std::string::npos || tok.find("SYS") != std::string::npos || tok.find("ASSISTANT") != std::string::npos || tok.find("USER") != std::string::npos)) return true;

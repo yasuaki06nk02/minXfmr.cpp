@@ -12,7 +12,13 @@ struct GGUFLoaderModelConfig {
 	uint64_t n_head_kv;
 	uint64_t n_intermediate;
 	float rope_freq_base;
+	uint64_t rope_n_rot;
 	float rmsnorm_epsilon;
+};
+
+struct GGUFLoaderTokenizerConfig {
+	bool add_bos_token;
+	int bos_token_id;
 };
 
 // Heuristic GGUF loader: best-effort search for int dim followed by 3*d*d floats.
@@ -28,6 +34,7 @@ bool gguf_try_load_token_embedding(const char* path, Tensor*& outWemb);
 bool gguf_try_load_final_norm(const char* path, Tensor*& outWnorm);
 bool gguf_try_load_lm_head(const char* path, Tensor*& outWout);
 bool gguf_try_read_vocab(const char* path, std::vector<std::string>& out_tokens);
+bool gguf_try_read_tokenizer_config(const char* path, GGUFLoaderTokenizerConfig& out);
 
 // Read optional chat template and special tokens from GGUF metadata
 bool gguf_try_read_chat_template(const char* path, std::string& out_template);

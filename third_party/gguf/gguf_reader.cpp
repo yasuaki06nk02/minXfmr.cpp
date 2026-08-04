@@ -232,6 +232,8 @@ bool gguf_open(const char* path, GGUF_File& out) {
     out.tokenizer_model.clear();
     out.tokenizer_pre.clear();
     out.tokenizer_merges.clear();
+    out.tokenizer_add_bos = false;
+    out.tokenizer_bos_token_id = -1;
     out.n_layer = 0;
     out.n_ctx = 0;
     out.n_embd = 0;
@@ -468,12 +470,17 @@ bool gguf_open(const char* path, GGUF_File& out) {
                     std::memcpy(&dv, &mv, sizeof(dv));
                     out.rope_freq_base = (float)dv;
                 }
+            } else if ( key_matches_meta(key, "n_rot") || key_matches_meta(key, "rotary_dim") || key_matches_meta(key, "rotary.n") || key_matches_meta(key, "rotary.dim") || key_matches_meta(key, "rope.dim") || key_matches_meta(key, "rope.n_rot") || key_matches_meta(key, "rotary.n_rot") ) {
+                // rotary/rot count stored as integer metadata
+                out.rope_n_rot = mv;
             }
         }
         double mf = 0.0;
         if (read_meta_f64(t, before, mf)) {
             if (key_matches_meta(key, "rope.freq_base") || key == "rope_theta") {
                 out.rope_freq_base = (float)mf;
+            } else if ( key_matches_meta(key, "n_rot") || key_matches_meta(key, "rotary_dim") || key_matches_meta(key, "rotary.n") || key_matches_meta(key, "rotary.dim") || key_matches_meta(key, "rope.dim") || key_matches_meta(key, "rope.n_rot") || key_matches_meta(key, "rotary.n_rot") ) {
+                out.rope_n_rot = (uint64_t)mf;
             } else if (key_matches_meta(key, "attention.layer_norm_rms_epsilon") || key_matches_meta(key, "layer_norm_rms_epsilon") || key == "rms_norm_eps") {
                 out.rmsnorm_epsilon = (float)mf;
             }
@@ -504,6 +511,17 @@ bool gguf_open(const char* path, GGUF_File& out) {
             std::string tmp;
             if (rd_str(out.data, tmp_p, tmp)) {
                 out.architecture = tmp;
+            }
+        }
+        if ((key == "tokenizer.ggml.add_bos_token" || key == "tokenizer.add_bos_token") && t == 7) {
+            if (before + 1 <= out.data.size()) {
+                out.tokenizer_add_bos = out.data[before] != 0;
+            }
+        }
+        if (key == "tokenizer.ggml.bos_token_id" || key == "tokenizer.bos_token_id") {
+            uint64_t bos_id_u64 = 0;
+            if (read_meta_u64(t, before, bos_id_u64)) {
+                out.tokenizer_bos_token_id = (int64_t)bos_id_u64;
             }
         }
         if ((key == "tokenizer.ggml.model" || key == "tokenizer.model") && t == 8) {
@@ -666,6 +684,8 @@ void gguf_close(GGUF_File& f) {
     f.tokenizer_model.clear();
     f.tokenizer_pre.clear();
     f.tokenizer_merges.clear();
+    f.tokenizer_add_bos = false;
+    f.tokenizer_bos_token_id = -1;
     f.chat_template.clear();
     f.special_tokens.clear();
 }
@@ -689,6 +709,7 @@ bool gguf_read_model_config(const char* path, GGUF_ModelConfig& out) {
     out.num_heads = f.n_head;
     out.vocab_size = f.vocab_size;
     out.rope_freq_base = f.rope_freq_base;
+    out.rope_n_rot = f.rope_n_rot;
     out.rmsnorm_epsilon = f.rmsnorm_epsilon;
     gguf_close(f);
     return true;

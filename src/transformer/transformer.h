@@ -30,6 +30,7 @@ bool transformer_forward_single_layer(
 	float* scores_workspace = nullptr,
 	size_t scores_workspace_len = 0,
 	float rope_theta = 10000.0f,
+	uint64_t rope_n_rot = 0,
 	float rmsnorm_epsilon = 1e-6f);
 
 // If enabled, square projection matrices (rows == cols == d_in) are treated as transposed.
@@ -37,4 +38,11 @@ void transformer_set_transpose_square_weights(bool enabled);
 
 // Fine-grained control for square projection orientation.
 // Each flag applies only when the weight matrix is square.
-void transformer_set_transpose_square_weights_for_all(bool wq, bool wk, bool wv, bool wo);
+void transformer_set_transpose_square_weights_for_all(
+	bool wq,
+	bool wk,
+	bool wv,
+	bool wo,
+	bool ffn_gate = false,
+	bool ffn_up = false,
+	bool ffn_down = false);

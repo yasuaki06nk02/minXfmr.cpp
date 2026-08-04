@@ -50,6 +50,14 @@ std::atomic<int>& quant_parity_mode_override() {
     return mode;
 }
 
+void warn_quant_direct_disabled_using_parity_once() {
+    static std::atomic<int> warned{0};
+    if (warned.exchange(1, std::memory_order_relaxed) == 0) {
+        std::fprintf(stderr,
+            "[cuda] direct quant kernels disabled by config; using staged host-dequant + CUDA F32 path (no CPU fallback)\n");
+    }
+}
+
 bool cuda_quant_kernels_enabled() {
     static int mode = -1;
     if (mode >= 0) return mode == 1;
@@ -1040,14 +1048,18 @@ bool cuda_backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
         return ok;
     }
 
-    if (!cuda_quant_kernels_enabled()) return false;
-
     if (B->type != DataType::Q4_K && B->type != DataType::Q5_0 && B->type != DataType::Q8_0) return false;
+
+    const bool quant_direct_enabled = cuda_quant_kernels_enabled();
+    const bool use_parity_path = (!quant_direct_enabled) || cuda_quant_parity_mode_enabled();
+    if (!quant_direct_enabled) {
+        warn_quant_direct_disabled_using_parity_once();
+    }
 
     const size_t block_elems = quant_block_elems(B->type);
     if (k == 0 || n == 0 || block_elems == 0 || (k % block_elems) != 0 || (n % block_elems) != 0) return false;
 
-    if (cuda_quant_parity_mode_enabled()) {
+    if (use_parity_path) {
         void* dA = nullptr;
         float* dBf = nullptr;
         void* dC = nullptr;
@@ -1179,11 +1191,12 @@ bool cuda_backend_matmul(const Tensor* A, const Tensor* B, Tensor* out) {
 }
 
 bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out) {
-    if (!ensure_ready()) return false;
-    if (!A || !B || !out) return false;
-    if (A->type != DataType::F32 || out->type != DataType::F32) return false;
-    if (A->cols != B->cols) return false;
-    if (out->rows != A->rows || out->cols != B->rows) return false;
+    CudaState& s = state();
+    if (!ensure_ready()) { s.last_error = "cuda_backend_matmul_rhs_transposed: ensure_ready failed"; return false; }
+    if (!A || !B || !out) { s.last_error = "cuda_backend_matmul_rhs_transposed: null tensor argument"; return false; }
+    if (A->type != DataType::F32 || out->type != DataType::F32) { s.last_error = "cuda_backend_matmul_rhs_transposed: A and out must be F32"; return false; }
+    if (A->cols != B->cols) { s.last_error = "cuda_backend_matmul_rhs_transposed: A->cols != B->cols"; return false; }
+    if (out->rows != A->rows || out->cols != B->rows) { s.last_error = "cuda_backend_matmul_rhs_transposed: out shape mismatch"; return false; }
 
     const size_t m = A->rows;
     const size_t k = A->cols;
@@ -1214,28 +1227,55 @@ bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor
             n,
             k);
 
-        bool ok = (cudaGetLastError() == cudaSuccess) &&
-                  (cudaDeviceSynchronize() == cudaSuccess) &&
-                  copy_to_host(out->data, dC, m * n * sizeof(float));
+        cudaError_t err_launch = cudaGetLastError();
+        cudaError_t err_sync = cudaDeviceSynchronize();
+        bool copy_ok = copy_to_host(out->data, dC, m * n * sizeof(float));
+        bool ok = (err_launch == cudaSuccess) && (err_sync == cudaSuccess) && copy_ok;
+
+        if (!ok) {
+            if (err_launch != cudaSuccess) {
+                s.last_error = std::string("cuda kernel launch error: ") + cudaGetErrorString(err_launch);
+            } else if (err_sync != cudaSuccess) {
+                s.last_error = std::string("cudaDeviceSynchronize failed: ") + cudaGetErrorString(err_sync);
+            } else if (!copy_ok) {
+                s.last_error = std::string("cuda_backend_matmul_rhs_transposed: copy_to_host failed");
+            } else {
+                s.last_error = std::string("cuda_backend_matmul_rhs_transposed: unknown failure");
+            }
+        }
 
         cudaFree(dA);
         cudaFree(dC);
         return ok;
     }
 
-    if (!cuda_quant_kernels_enabled()) return false;
+    if (B->type != DataType::Q4_K && B->type != DataType::Q5_0 && B->type != DataType::Q8_0) {
+        state().last_error = "cuda_backend_matmul_rhs_transposed: unsupported B type for quant kernels";
+        return false;
+    }
 
-    if (B->type != DataType::Q4_K && B->type != DataType::Q5_0 && B->type != DataType::Q8_0) return false;
+    const bool quant_direct_enabled = cuda_quant_kernels_enabled();
+    const bool use_parity_path = (!quant_direct_enabled) || cuda_quant_parity_mode_enabled();
+    if (!quant_direct_enabled) {
+        warn_quant_direct_disabled_using_parity_once();
+    }
 
     const size_t block_elems = quant_block_elems(B->type);
-    if (k == 0 || n == 0 || block_elems == 0 || (k % block_elems) != 0) return false;
+    if (k == 0 || n == 0 || block_elems == 0 || (k % block_elems) != 0) {
+        state().last_error = "cuda_backend_matmul_rhs_transposed: invalid dims or unaligned quant blocks";
+        return false;
+    }
 
-    if (cuda_quant_parity_mode_enabled()) {
+    if (use_parity_path) {
         void* dA = nullptr;
         float* dBf = nullptr;
         void* dC = nullptr;
-        if (!alloc_copy_to_device(A->data, A->bytes, &dA)) return false;
+        if (!alloc_copy_to_device(A->data, A->bytes, &dA)) {
+            state().last_error = "cuda_backend_matmul_rhs_transposed: alloc_copy_to_device(A) failed";
+            return false;
+        }
         if (!get_or_build_persistent_dequant_f32(B, &dBf)) {
+            state().last_error = "cuda_backend_matmul_rhs_transposed: get_or_build_persistent_dequant_f32 failed";
             cudaFree(dA);
             return false;
         }
@@ -1255,9 +1295,15 @@ bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor
             n,
             k);
 
-        bool ok = (cudaGetLastError() == cudaSuccess) &&
-                  (cudaDeviceSynchronize() == cudaSuccess) &&
-                  copy_to_host(out->data, dC, m * n * sizeof(float));
+        cudaError_t err_launch = cudaGetLastError();
+        cudaError_t err_sync = cudaDeviceSynchronize();
+        bool copy_ok = copy_to_host(out->data, dC, m * n * sizeof(float));
+        bool ok = (err_launch == cudaSuccess) && (err_sync == cudaSuccess) && copy_ok;
+        if (!ok) {
+            if (err_launch != cudaSuccess) s.last_error = std::string("cuda kernel launch error: ") + cudaGetErrorString(err_launch);
+            else if (err_sync != cudaSuccess) s.last_error = std::string("cudaDeviceSynchronize failed: ") + cudaGetErrorString(err_sync);
+            else if (!copy_ok) s.last_error = std::string("cuda_backend_matmul_rhs_transposed: copy_to_host failed");
+        }
 
         cudaFree(dA);
         cudaFree(dC);
@@ -1348,9 +1394,15 @@ bool cuda_backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor
         }
     }
 
-    bool ok = (cudaGetLastError() == cudaSuccess) &&
-              (cudaDeviceSynchronize() == cudaSuccess) &&
-              copy_to_host(out->data, dC, m * n * sizeof(float));
+    cudaError_t err_launch = cudaGetLastError();
+    cudaError_t err_sync = cudaDeviceSynchronize();
+    bool copy_ok = copy_to_host(out->data, dC, m * n * sizeof(float));
+    bool ok = (err_launch == cudaSuccess) && (err_sync == cudaSuccess) && copy_ok;
+    if (!ok) {
+        if (err_launch != cudaSuccess) s.last_error = std::string("cuda kernel launch error: ") + cudaGetErrorString(err_launch);
+        else if (err_sync != cudaSuccess) s.last_error = std::string("cudaDeviceSynchronize failed: ") + cudaGetErrorString(err_sync);
+        else if (!copy_ok) s.last_error = std::string("cuda_backend_matmul_rhs_transposed: copy_to_host failed");
+    }
 
     cudaFree(dA);
     cudaFree(dC);

@@ -19,7 +19,10 @@ int minxfmr_generate(minxfmr_context* ctx,
 					 int repeat_last_n,
 					 double repeat_penalty,
 					 double frequency_penalty,
-					 double presence_penalty);
+						 double presence_penalty,
+						 bool compare_logits,
+						 int compare_top_n,
+						 int compare_steps);
 
 void minxfmr_reset(minxfmr_context* ctx);
 

@@ -18,6 +18,9 @@ public:
     bool verbose_cache() const { return getBool("MINXFMR_VERBOSE_CACHE"); }
     bool chat_debug() const { return getBool("MINXFMR_CHAT_DEBUG"); }
     bool gen_verbose() const { return getBool("MINXFMR_VERBOSE_GEN"); }
+    bool compare_logits() const { return getBool("MINXFMR_COMPARE_LOGITS"); }
+    int compare_top_n() const { return getInt("MINXFMR_COMPARE_TOP_N", 10); }
+    int compare_steps() const { return getInt("MINXFMR_COMPARE_STEPS", 3); }
     bool cuda_quant_parity_set() const { return has("MINXFMR_CUDA_QUANT_PARITY"); }
     bool cuda_quant_parity() const { return getBool("MINXFMR_CUDA_QUANT_PARITY"); }
     bool cuda_quant_atomic_safe() const { return getBool("MINXFMR_CUDA_QUANT_ATOMIC_SAFE"); }
