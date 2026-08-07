@@ -144,23 +144,28 @@ void clear_persistent_buffers_locked(CudaState& s) {
 }
 
 static float fp16_to_fp32_host(uint16_t h) {
-    uint32_t s = (h >> 15) & 1;
-    uint32_t e = (h >> 10) & 0x1f;
-    uint32_t f = h & 0x3ff;
+    const uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+    int exp = (h >> 10) & 0x1f;
+    uint32_t frac = (uint32_t)h & 0x3ffu;
+
     uint32_t out;
-    if (e == 0) {
-        if (f == 0) {
-            out = s << 31;
+    if (exp == 0) {
+        if (frac == 0) {
+            out = sign;
         } else {
-            e = 1;
-            while ((f & 0x400) == 0) { f <<= 1; --e; }
-            f &= 0x3ff;
-            out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+            // Normalize subnormal half values with a signed exponent to avoid underflow.
+            exp = -14;
+            while ((frac & 0x400u) == 0) {
+                frac <<= 1;
+                --exp;
+            }
+            frac &= 0x3ffu;
+            out = sign | ((uint32_t)(exp + 127) << 23) | (frac << 13);
         }
-    } else if (e == 31) {
-        out = (s << 31) | 0x7f800000 | (f << 13);
+    } else if (exp == 31) {
+        out = sign | 0x7f800000u | (frac << 13);
     } else {
-        out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+        out = sign | ((uint32_t)(exp + 112) << 23) | (frac << 13);
     }
     float v;
     std::memcpy(&v, &out, sizeof(v));
@@ -172,8 +177,8 @@ static inline void get_scale_min_k4_host(int j, const uint8_t* q, uint8_t& d, ui
         d = q[j] & 63;
         m = q[j + 4] & 63;
     } else {
-        d = (q[j + 4] & 0xF) | ((q[j] >> 6) << 4);
-        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
     }
 }
 
@@ -279,8 +284,8 @@ __device__ __forceinline__ void get_scale_min_k4_device(int j, const uint8_t* q,
         m = q[j + 4] & 63u;
     } else {
         // Match host: low 4 bits from q[j+4], top-2 bits from q[j] >> 6
-        d = (q[j + 4] & 0xFu) | ((q[j] >> 6) << 4);
-        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+        d = (q[j + 4] & 0xFu) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
     }
 }
 

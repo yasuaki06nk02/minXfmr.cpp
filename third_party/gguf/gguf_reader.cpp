@@ -189,23 +189,28 @@ static const char* type_name(uint32_t t) {
 }
 
 static float fp16_to_fp32(uint16_t h) {
-    uint32_t s = (h >> 15) & 1;
-    uint32_t e = (h >> 10) & 0x1f;
-    uint32_t f = h & 0x3ff;
+    const uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+    int exp = (h >> 10) & 0x1f;
+    uint32_t frac = (uint32_t)h & 0x3ffu;
+
     uint32_t out;
-    if (e == 0) {
-        if (f == 0) {
-            out = s << 31;
+    if (exp == 0) {
+        if (frac == 0) {
+            out = sign;
         } else {
-            e = 1;
-            while ((f & 0x400) == 0) { f <<= 1; --e; }
-            f &= 0x3ff;
-            out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+            // Normalize subnormal half values with a signed exponent to avoid underflow.
+            exp = -14;
+            while ((frac & 0x400u) == 0) {
+                frac <<= 1;
+                --exp;
+            }
+            frac &= 0x3ffu;
+            out = sign | ((uint32_t)(exp + 127) << 23) | (frac << 13);
         }
-    } else if (e == 31) {
-        out = (s << 31) | 0x7f800000 | (f << 13);
+    } else if (exp == 31) {
+        out = sign | 0x7f800000u | (frac << 13);
     } else {
-        out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+        out = sign | ((uint32_t)(exp + 112) << 23) | (frac << 13);
     }
     float v;
     memcpy(&v, &out, sizeof(v));
@@ -755,7 +760,7 @@ bool gguf_read_f32_tensor(const GGUF_File& f, const GGUF_TensorInfo& info, Tenso
     out = nullptr;
     if (info.offset >= f.data.size()) return false;
     const size_t n = (size_t)info.rows * info.cols;
-    out = tensor_create_f32(info.rows, info.cols);
+    out = tensor_create_f32_persistent(info.rows, info.cols);
     if (!out) return false;
 
     if (info.ggml_type == 0) {
@@ -843,6 +848,56 @@ bool gguf_dequant_q4_k_m(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor
         return false;
     }
 
+    // Optional debug: force Q4_K to be dequantized to persistent F32 at load-time.
+    // Controlled by MINXFMR_FORCE_Q4_K_F32 (or global MINXFMR_FORCE_ALL_F32).
+    const bool force_q4_f32 = RuntimeConfig::Instance().getBool("MINXFMR_FORCE_Q4_K_F32") || RuntimeConfig::Instance().getBool("MINXFMR_FORCE_ALL_F32");
+    if (force_q4_f32) {
+        out = tensor_create_f32_persistent(rows, cols);
+        if (!out) return false;
+
+        const uint8_t* src = f.data.data() + info.offset;
+        float* dst = (float*)out->data;
+
+        const size_t blocks_per_row = cols / TENSOR_Q4_K_QK_K;
+
+        unsigned int hw = std::thread::hardware_concurrency();
+        size_t nthreads = gguf_choose_thread_count(rows);
+        if (gguf_verbose_meta()) {
+            std::fprintf(stderr, "[gguf] dequant_q4_k rows=%u hw=%u threads=%zu force_f32=1\n", rows, hw, nthreads);
+        }
+
+        auto worker = [&](uint32_t r0, uint32_t r1) {
+            for (uint32_t r = r0; r < r1; ++r) {
+                const uint8_t* row_src = src + (size_t)r * row_bytes;
+                float* row_dst = dst + (size_t)r * cols;
+                for (size_t b = 0; b < blocks_per_row; ++b) {
+                    tensor_dequant_q4_k_block(row_src + b * TENSOR_Q4_K_BLOCK_SIZE, row_dst + b * TENSOR_Q4_K_QK_K);
+                }
+            }
+        };
+
+        if (nthreads <= 1) {
+            worker(0, rows);
+        } else {
+            std::vector<std::thread> threads;
+            threads.reserve(nthreads);
+            uint32_t base = rows / (uint32_t)nthreads;
+            uint32_t rem = rows % (uint32_t)nthreads;
+            uint32_t cur = 0;
+            for (size_t ti = 0; ti < nthreads; ++ti) {
+                uint32_t take = base + (ti < rem ? 1 : 0);
+                uint32_t start = cur;
+                uint32_t end = cur + take;
+                threads.emplace_back([worker, start, end]() { worker(start, end); });
+                cur = end;
+            }
+            for (auto& th : threads) th.join();
+        }
+
+        return true;
+    }
+
+    // Default behavior: keep packed Q4_K representation in memory.
     out = tensor_create_q4_k_from_bytes(rows, cols, f.data.data() + info.offset, need);
     return out != nullptr;
 }
@@ -871,7 +926,7 @@ bool gguf_dequant_q6_k(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*&
         return false;
     }
 
-    out = tensor_create_f32(rows, cols);
+    out = tensor_create_f32_persistent(rows, cols);
     if (!out) return false;
 
     auto rd_f16_at = [&](const uint8_t* p) -> float {
@@ -971,7 +1026,7 @@ bool gguf_dequant_q1_0(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*&
         if (rows > 0 && need % rows == 0) {
             size_t bytes_per_row = need / rows;
             if (bytes_per_row >= cols && bytes_per_row <= cols + 256) {
-                out = tensor_create_f32(rows, cols);
+                out = tensor_create_f32_persistent(rows, cols);
                 if (!out) return false;
                 float* dst = (float*)out->data;
                 size_t nthreads = gguf_choose_thread_count(rows);
@@ -1007,7 +1062,7 @@ bool gguf_dequant_q1_0(const GGUF_File& f, const GGUF_TensorInfo& info, Tensor*&
     if (need >= (size_t)rows * bits_per_row_bytes) {
         size_t bytes_per_row = (rows > 0 && need % rows == 0) ? (need / rows) : bits_per_row_bytes;
         if (bytes_per_row >= bits_per_row_bytes && bytes_per_row <= bits_per_row_bytes + 256) {
-            out = tensor_create_f32(rows, cols);
+            out = tensor_create_f32_persistent(rows, cols);
             if (!out) return false;
             float* dst = (float*)out->data;
             auto worker = [&](uint32_t r0, uint32_t r1){

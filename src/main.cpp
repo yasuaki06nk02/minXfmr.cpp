@@ -9,6 +9,7 @@
 #include "transformer/transformer.h"
 #include "tokenizer/tokenizer.h"
 #include "cache/kv_cache.h"
+#include "io/gguf_loader.h"
 #include <cstdlib>
 #include <cstring>
 #include <string>
@@ -413,6 +414,23 @@ int main(int argc, char** argv) {
 
     // retrieve optional chat template and special tokens from model
     const char* model_chat_template = minxfmr_get_chat_template(ctx);
+    bool qwen_chat_fallback = false;
+    {
+        std::string arch;
+        if (gguf_try_read_architecture(model.c_str(), arch)) {
+            std::string arch_lc = arch;
+            for (char& ch : arch_lc) ch = (char)std::tolower((unsigned char)ch);
+            qwen_chat_fallback = (arch_lc.rfind("qwen", 0) == 0);
+        }
+        if (!qwen_chat_fallback) {
+            std::string model_lc = model;
+            for (char& ch : model_lc) ch = (char)std::tolower((unsigned char)ch);
+            qwen_chat_fallback = (model_lc.find("qwen") != std::string::npos);
+        }
+        if ((model_chat_template == nullptr || model_chat_template[0] == '\0') && qwen_chat_fallback) {
+            fprintf(stderr, "[main] chat_template missing in GGUF; using built-in Qwen fallback format\n");
+        }
+    }
     std::vector<std::string> model_specials;
     size_t scnt = minxfmr_get_special_tokens_count(ctx);
     for (size_t i = 0; i < scnt; ++i) {
@@ -1159,6 +1177,31 @@ int main(int argc, char** argv) {
                 return rendered;
             }
 
+            return assembled;
+        }
+
+        if (qwen_chat_fallback) {
+            std::string assembled;
+            const char* sys = (system_text && system_text[0] != '\0') ? system_text : "You are a helpful assistant.";
+            assembled += "<|im_start|>system\n";
+            assembled += sys;
+            assembled += "<|im_end|>\n";
+
+            size_t begin = history.size() > (size_t)max_history ? history.size() - (size_t)max_history : 0;
+            for (size_t i = begin; i + 1 < history.size(); i += 2) {
+                assembled += "<|im_start|>user\n";
+                assembled += history[i];
+                assembled += "<|im_end|>\n";
+                assembled += "<|im_start|>assistant\n";
+                assembled += history[i + 1];
+                assembled += "<|im_end|>\n";
+            }
+
+            assembled += "<|im_start|>user\n";
+            assembled += (user_text ? user_text : "");
+            assembled += "<|im_end|>\n";
+            assembled += "<|im_start|>assistant\n";
+            if (generation_prompt_out) *generation_prompt_out = "<|im_start|>assistant\n";
             return assembled;
         }
 

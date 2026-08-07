@@ -382,6 +382,8 @@ bool transformer_forward_single_layer(
 
     if (!rmsnorm_forward(input, norm, rmsnorm_epsilon)) { tensor_free(norm); return false; }
     if (Wattn_norm_in) apply_norm_scale(norm, Wattn_norm_in);
+    compare_dump_tensor_stats("layer_attn_norm", layer, norm);
+    if (backend_context().compare_trace_step < 0) compare_dump_tensor_last_row_stats("prefill_last_layer_attn_norm", layer, norm);
 
     // Stage 2: linear projections to Q/K/V.
     // We accept either [din x dout] or [dout x din] weight layout.
@@ -405,14 +407,31 @@ bool transformer_forward_single_layer(
     bool k_ok = Wk_in ? project_with_weight(norm, Wk_in, Kraw, backend_context().transpose_square_wk) : false;
     bool v_ok = Wv_in ? project_with_weight(norm, Wv_in, Vraw, backend_context().transpose_square_wv) : false;
 
+    compare_dump_tensor_stats("layer_v_prebias", layer, Vraw);
+    if (backend_context().compare_trace_step < 0) compare_dump_tensor_last_row_stats("prefill_last_layer_v_prebias", layer, Vraw);
+
     if (debug_proj) {
-        fprintf(stderr, "[transformer] layer=%zu proj results q_ok=%d k_ok=%d v_ok=%d Qraw=%p Kraw=%p Vraw=%p\n",
-            layer, q_ok ? 1 : 0, k_ok ? 1 : 0, v_ok ? 1 : 0, (const void*)Qraw, (const void*)Kraw, (const void*)Vraw);
+        fprintf(
+            stderr,
+            "[transformer] layer=%zu proj results q_ok=%d k_ok=%d v_ok=%d Qraw=%p Qdata=%p Kraw=%p Kdata=%p Vraw=%p Vdata=%p\n",
+            layer,
+            q_ok ? 1 : 0,
+            k_ok ? 1 : 0,
+            v_ok ? 1 : 0,
+            (const void*)Qraw,
+            (Qraw ? Qraw->data : nullptr),
+            (const void*)Kraw,
+            (Kraw ? Kraw->data : nullptr),
+            (const void*)Vraw,
+            (Vraw ? Vraw->data : nullptr));
     }
 
     if (q_ok && Qraw && Bq_in) add_bias_inplace(Qraw, Bq_in);
     if (k_ok && Kraw && Bk_in) add_bias_inplace(Kraw, Bk_in);
     if (v_ok && Vraw && Bv_in) add_bias_inplace(Vraw, Bv_in);
+
+    compare_dump_tensor_stats("layer_v_postbias", layer, Vraw);
+    if (backend_context().compare_trace_step < 0) compare_dump_tensor_last_row_stats("prefill_last_layer_v_postbias", layer, Vraw);
 
     if (!q_ok || !k_ok || !v_ok) {
         fprintf(stderr,
@@ -497,6 +516,15 @@ bool transformer_forward_single_layer(
     Tensor* Q = Qraw;
     Tensor* K = Kraw;
     Tensor* V = Vraw;
+
+    compare_dump_tensor_stats("layer_q", layer, Q);
+    compare_dump_tensor_stats("layer_k", layer, K);
+    compare_dump_tensor_stats("layer_v", layer, V);
+    if (backend_context().compare_trace_step < 0) {
+        compare_dump_tensor_last_row_stats("prefill_last_layer_q", layer, Q);
+        compare_dump_tensor_last_row_stats("prefill_last_layer_k", layer, K);
+        compare_dump_tensor_last_row_stats("prefill_last_layer_v", layer, V);
+    }
 
     size_t cached_rows = 0;
     size_t cache_head = 0;
@@ -599,6 +627,9 @@ bool transformer_forward_single_layer(
             }
         }
     }
+
+    compare_dump_tensor_stats("layer_attn_out", layer, attn_out);
+    if (backend_context().compare_trace_step < 0) compare_dump_tensor_last_row_stats("prefill_last_layer_attn_out", layer, attn_out);
 
     // Attention output projection (Wo)
     Tensor* attn_proj = nullptr;

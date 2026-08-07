@@ -45,23 +45,28 @@ static bool ieq(const char* a, const char* b) {
 }
 
 static float fp16_to_fp32_local(uint16_t h) {
-    uint32_t s = (h >> 15) & 1;
-    uint32_t e = (h >> 10) & 0x1f;
-    uint32_t f = h & 0x3ff;
+    const uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
+    int exp = (h >> 10) & 0x1f;
+    uint32_t frac = (uint32_t)h & 0x3ffu;
+
     uint32_t out;
-    if (e == 0) {
-        if (f == 0) {
-            out = s << 31;
+    if (exp == 0) {
+        if (frac == 0) {
+            out = sign;
         } else {
-            e = 1;
-            while ((f & 0x400) == 0) { f <<= 1; --e; }
-            f &= 0x3ff;
-            out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+            // Normalize subnormal half values with a signed exponent to avoid underflow.
+            exp = -14;
+            while ((frac & 0x400u) == 0) {
+                frac <<= 1;
+                --exp;
+            }
+            frac &= 0x3ffu;
+            out = sign | ((uint32_t)(exp + 127) << 23) | (frac << 13);
         }
-    } else if (e == 31) {
-        out = (s << 31) | 0x7f800000 | (f << 13);
+    } else if (exp == 31) {
+        out = sign | 0x7f800000u | (frac << 13);
     } else {
-        out = (s << 31) | ((e + (127 - 15)) << 23) | (f << 13);
+        out = sign | ((uint32_t)(exp + 112) << 23) | (frac << 13);
     }
     float v;
     std::memcpy(&v, &out, sizeof(v));
@@ -73,44 +78,20 @@ static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t
         d = q[j] & 63;
         m = q[j + 4] & 63;
     } else {
-        d = (q[j + 4] & 0xF) | ((q[j] >> 6) << 4);
-        m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+        d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+        m = (q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4);
     }
 }
 
 static float dot_q4_k_block(const uint8_t* blk, const float* x256) {
-    // Decode one GGUF Q4_K block on the fly and compute dot with 256 F32 values.
-    uint16_t hd = 0;
-    uint16_t hm = 0;
-    std::memcpy(&hd, blk + 0, sizeof(hd));
-    std::memcpy(&hm, blk + 2, sizeof(hm));
-    const float d = fp16_to_fp32_local(hd);
-    const float dmin = fp16_to_fp32_local(hm);
+    float tmp[TENSOR_Q4_K_QK_K];
+    tensor_dequant_q4_k_block(blk, tmp);
 
-    const uint8_t* scales = blk + 4;
-    const uint8_t* q = blk + 16;
-
-    float acc = 0.0f;
-    int is = 0;
-    for (int j = 0; j < (int)TENSOR_Q4_K_QK_K; j += 64) {
-        uint8_t sc = 0;
-        uint8_t m = 0;
-
-        get_scale_min_k4(is + 0, scales, sc, m);
-        const float d1 = d * sc;
-        const float m1 = dmin * m;
-
-        get_scale_min_k4(is + 1, scales, sc, m);
-        const float d2 = d * sc;
-        const float m2 = dmin * m;
-
-        for (int l = 0; l < 32; ++l) acc += x256[j + l] * (d1 * (q[l] & 0xF) - m1);
-        for (int l = 0; l < 32; ++l) acc += x256[j + 32 + l] * (d2 * (q[l] >> 4) - m2);
-
-        q += 32;
-        is += 2;
+    double acc = 0.0;
+    for (size_t i = 0; i < TENSOR_Q4_K_QK_K; ++i) {
+        acc += (double)tmp[i] * (double)x256[i];
     }
-    return acc;
+    return (float)acc;
 }
 
 static float dot_q5_0_block(const uint8_t* blk, const float* x32) {
@@ -396,6 +377,39 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
 
     const float* bd = (const float*)B->data;
 
+    if (RuntimeConfig::Instance().getBool("MINXFMR_CHAT_DEBUG")) {
+        static bool logged_f32_rhs_probe = false;
+        if (!logged_f32_rhs_probe && m > 0 && n > 0) {
+            logged_f32_rhs_probe = true;
+            const float* a0 = ad;
+            const size_t ju = 0;
+            double row_major = 0.0;
+            double col_major = 0.0;
+            double sum_abs_a = 0.0;
+            double max_abs_b_row = 0.0;
+            for (size_t kk = 0; kk < k; ++kk) {
+                const double av = (double)a0[kk];
+                const double b_row = (double)bd[ju * k + kk];
+                const double b_col = (double)bd[kk * n + ju];
+                row_major += av * b_row;
+                col_major += av * b_col;
+                sum_abs_a += std::fabs(av);
+                max_abs_b_row = std::max(max_abs_b_row, std::fabs(b_row));
+            }
+            std::fprintf(
+                stderr,
+                "[backend][f32-rhs-probe] m=%zu n=%zu k=%zu row_major_col0=%g col_major_col0=%g sum_abs_a=%g max_abs_b_row0=%g bound_row0=%g\n",
+                m,
+                n,
+                k,
+                row_major,
+                col_major,
+                sum_abs_a,
+                max_abs_b_row,
+                sum_abs_a * max_abs_b_row);
+        }
+    }
+
     const long long work = (long long)(m * n);
 #if defined(_OPENMP)
     #pragma omp parallel for
@@ -404,13 +418,49 @@ bool backend_matmul_rhs_transposed(const Tensor* A, const Tensor* B, Tensor* out
             const size_t iu = (size_t)(idx / (long long)n);
             const size_t ju = (size_t)(idx % (long long)n);
             const float* arow = ad + iu * k;
-            const float* brow = bd + ju * k;
             float s = 0.0f;
 #if defined(_OPENMP) && !defined(_MSC_VER)
             #pragma omp simd reduction(+:s)
 #endif
-            for (size_t kk = 0; kk < k; ++kk) s += arow[kk] * brow[kk];
+            for (size_t kk = 0; kk < k; ++kk) s += arow[kk] * bd[kk * n + ju];
             od[iu * n + ju] = s;
+    }
+
+    if (RuntimeConfig::Instance().getBool("MINXFMR_CHAT_DEBUG")) {
+            static int logged_f32_rhs_out = 0;
+            if (m == 1 && n == 256 && logged_f32_rhs_out < 64) {
+                ++logged_f32_rhs_out;
+            float mn = od[0];
+            float mx = od[0];
+            double sum = 0.0;
+            double sum_abs_a = 0.0;
+            double max_abs_b_row0 = 0.0;
+            const float* a0 = ad;
+            for (size_t kk = 0; kk < k; ++kk) {
+                const double av = std::fabs((double)a0[kk]);
+                const double bv = std::fabs((double)bd[kk]);
+                sum_abs_a += av;
+                if (bv > max_abs_b_row0) max_abs_b_row0 = bv;
+            }
+            for (size_t j = 0; j < n; ++j) {
+                const float v = od[j];
+                if (v < mn) mn = v;
+                if (v > mx) mx = v;
+                sum += (double)v;
+            }
+                std::fprintf(
+                    stderr,
+                "[backend][f32-rhs-out] call=%d out=%p n=%zu min=%g max=%g mean=%g sum_abs_a=%g max_abs_b_row0=%g bound0=%g\n",
+                    logged_f32_rhs_out,
+                    (const void*)od,
+                    n,
+                    mn,
+                    mx,
+                sum / (double)n,
+                sum_abs_a,
+                max_abs_b_row0,
+                sum_abs_a * max_abs_b_row0);
+        }
     }
     return true;
 }
