@@ -124,7 +124,7 @@ int main(int argc, char** argv) {
     float repeat_penalty = 1.0f;
     float presence_penalty = 0.0f;
     float frequency_penalty = 0.0f;
-    int max_gen_tokens = 128;
+    int max_gen_tokens = 256;
     const char* stop_token = nullptr;
     const char* log_file = nullptr;
     bool run_selftest = false;
@@ -140,6 +140,8 @@ int main(int argc, char** argv) {
     bool topp_set_by_user = false;
     bool minp_set_by_user = false;
     bool topk_set_by_user = false;
+    bool repeat_penalty_set_by_user = false;
+    bool frequency_penalty_set_by_user = false;
     bool compare_logits = false;
     int compare_top_n = 10;
     int compare_steps = 3;
@@ -229,6 +231,8 @@ int main(int argc, char** argv) {
         if (!topp_set_by_user) top_p = 0.95f;
         // Keep min-p disabled by default to match common llama.cpp behavior.
         if (!minp_set_by_user) min_p = 0.0f;
+        if (!repeat_penalty_set_by_user) repeat_penalty = 1.1f;
+        if (!frequency_penalty_set_by_user) frequency_penalty = 0.3f;
     }
 
     if (log_file) {
@@ -247,7 +251,7 @@ int main(int argc, char** argv) {
 
     const bool env_transpose_override = RuntimeConfig::Instance().transpose_user_override();
     if (max_gen_tokens < 1) max_gen_tokens = 1;
-    if (max_gen_tokens > 256) max_gen_tokens = 256;
+    if (max_gen_tokens > 1024) max_gen_tokens = 1024;
 #ifdef _WIN32
     {
         char buf[16];
@@ -1299,7 +1303,7 @@ int main(int argc, char** argv) {
 
                 std::string sanitized = sanitize_assistant_text(gen_outbuf_global);
                 if (!sanitized.empty()) {
-                    sanitized = utf8_truncate_for_history(sanitized, 320);
+                    sanitized = utf8_truncate_for_history(sanitized, 2000);
                     history.push_back(line);
                     history.push_back(sanitized);
                 } else {

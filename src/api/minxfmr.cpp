@@ -482,9 +482,14 @@ static bool arch_prefers_ggml_mul_mat_layout(const std::string& arch_lc) {
 
 static bool arch_prefers_cuda_quant_parity(const std::string& arch_lc) {
     (void)arch_lc;
-    // Keep direct quant kernels as the default for CUDA performance.
-    // Parity is still available via MINXFMR_CUDA_QUANT_PARITY=1.
-    return false;
+    // Default to the numerically-safe staged host-side dequant path for all
+    // architectures. The direct device-side quant kernels are faster but have
+    // known numerical instability (see cuda_backend.cu) that can quietly
+    // degrade output quality (repetition loops, incoherent generations)
+    // without any error being raised. Users who have verified the direct
+    // kernels are stable for their model/GPU can opt back in explicitly via
+    // MINXFMR_CUDA_QUANT_PARITY=0 (or MINXFMR_CUDA_QUANT=1).
+    return true;
 }
 
 static bool apply_norm_scale_local(Tensor* x, const Tensor* w) {
